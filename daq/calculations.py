@@ -34,7 +34,7 @@ from typing import Optional
 
 
 # ============================================================
-# 1. THERMOCOUPLE CONVERSION (Type-K)
+# THERMOCOUPLE CONVERSION (Type-K)
 # ============================================================
 # NIST Monograph 175, Table 10.5
 # Inverse polynomial: T(°C) = c0 + c1*E + c2*E^2 + ... + c9*E^9
@@ -92,7 +92,7 @@ def type_k_uv_to_celsius(emf_uv: float) -> float:
 
 
 # ============================================================
-# 2. COLD JUNCTION COMPENSATION (CJC)
+# COLD JUNCTION COMPENSATION (CJC)
 # ============================================================
 # CJC sensor: LM34 temperature sensor on AIN58 (single-ended).
 # LM34 output characteristic: 10 mV per degree Fahrenheit, 0 V = 0 °F.
@@ -150,7 +150,7 @@ def software_seebeck_type_k(diff_volts: float, cjc_celsius: float) -> float:
 
 
 # ============================================================
-# 3. LINEAR CALIBRATION (PTs and Load Cells)
+# LINEAR CALIBRATION (PTs and Load Cells)
 # ============================================================
 # General linear model: output = slope * voltage + intercept
 # Calibration coefficients come from config.yaml / calibration.json
@@ -193,7 +193,7 @@ def load_cell_voltage_to_force(
 
 
 # ============================================================
-# 4. LOX SATURATION DENSITY
+# LOX SATURATION DENSITY
 # ============================================================
 # NIST SRD 69: Oxygen saturation density table
 # Table: temperature [Rankine] -> density [lbm/ft³]
@@ -295,7 +295,7 @@ def lox_density_from_celsius(temp_celsius: float) -> Optional[float]:
 
 
 # ============================================================
-# 5. MASS FLOW RATES (Orifice Model)
+# MASS FLOW RATES (Orifice Model)
 # ============================================================
 # m = Cd * A * sqrt(2 * ρ * ΔP)
 #
@@ -354,7 +354,7 @@ def lox_mass_flow_rate(
 
 
 # ============================================================
-# 6. FUEL (IPA) MASS FLOW RATE
+# FUEL (IPA) MASS FLOW RATE
 # ============================================================
 # Same orifice model as LOX, but with fixed IPA density and
 # different injector geometry.
@@ -399,7 +399,7 @@ def fuel_mass_flow_rate(pfo_psi: float, pc_psi: float) -> Optional[float]:
 
 
 # ============================================================
-# 7. MIXTURE RATIO (O/F)
+# MIXTURE RATIO (O/F)
 # ============================================================
 # O/F = ṁ_oxidizer / ṁ_fuel
 # Source: Sutton, Eq. 2.7
@@ -431,7 +431,7 @@ def mixture_ratio(
 
 
 # ============================================================
-# 8. TOTAL IMPULSE
+# TOTAL IMPULSE
 # ============================================================
 # Two supported methods per SR 3.2.8.3:
 #
@@ -510,7 +510,7 @@ def impulse_step_estimate(
 
 
 # ============================================================
-# 9. LOX SATURATION PRESSURE (Antoine Equation)
+# LOX SATURATION PRESSURE (Antoine Equation)
 # ============================================================
 # SR 3.2.9.2: Alert when tank pressure is below LOX saturation pressure.
 #
