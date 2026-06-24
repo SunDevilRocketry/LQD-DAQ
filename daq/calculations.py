@@ -1,0 +1,582 @@
+"""
+daq/calculations.py
+
+Physics calculations for the liquids DAQ system.
+Pure math with no hardware dependencies.
+
+Functions:
+    type_k_uv_to_celsius()          - Type-K thermocouple conversion
+    lm34_voltage_to_celsius()       - LM34 temperature sensor
+    software_seebeck_type_k()       - Cold junction compensation
+    pt_voltage_to_psi()             - Pressure transducer linear cal
+    load_cell_voltage_to_force()    - Load cell with tare offset
+    lox_density_from_celsius()      - LOX saturation density lookup
+    lox_mass_flow_rate()            - LOX injector mass flow
+    fuel_mass_flow_rate()           - Fuel injector mass flow
+    mixture_ratio()                 - Oxidizer/fuel ratio
+    impulse_step_load_cell()        - Total impulse from load cells
+    impulse_step_estimate()         - Total impulse estimate
+    lox_saturation_pressure_psia()  - LOX vapor pressure (Antoine)
+    lox_below_saturation()          - Boiling alert check
+
+References:
+    [NIST-M175] NIST Monograph 175, Table 10.5 (Type-K TC)
+    [NIST-SRD69] NIST Chemistry WebBook, SRD 69 (LOX properties)
+    [Sutton] Sutton & Biblarz, "Rocket Propulsion Elements", 9th Ed.
+    [LM34] Texas Instruments LM34 Datasheet (SNIS155B)
+    [SR-3.2.9.2] System Requirement 3.2.9.2 (Saturation Alert)
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional
+
+
+# ============================================================
+# 1. THERMOCOUPLE CONVERSION (Type-K)
+# ============================================================
+# NIST Monograph 175, Table 10.5
+# Inverse polynomial: T(°C) = c0 + c1*E + c2*E^2 + ... + c9*E^9
+# E = EMF in microvolts (µV)
+# ============================================================
+
+# Coefficients for positive EMF (0 to 54,886 µV)
+_TYPE_K_COEFFS_POS: tuple[float, ...] = (
+    0.0,               # c0
+    2.508355e-02,      # c1
+    7.860106e-08,      # c2
+    -2.503131e-10,     # c3
+    8.315270e-14,      # c4
+    -1.228034e-17,     # c5
+    9.804036e-22,      # c6
+    -4.413030e-26,     # c7
+    1.057734e-30,      # c8
+    -1.052755e-35,     # c9
+)
+
+# Coefficients for negative EMF (-5,891 to 0 µV)
+_TYPE_K_COEFFS_NEG: tuple[float, ...] = (
+    0.0,               # c0
+    2.5173462e-02,     # c1
+    -1.1662878e-06,    # c2
+    -1.0833638e-09,    # c3
+    -8.9773540e-13,    # c4
+    -3.7342377e-16,    # c5
+    -8.6632643e-20,    # c6
+    -1.0450598e-23,    # c7
+    -5.1920577e-28,    # c8
+)
+
+
+def type_k_uv_to_celsius(emf_uv: float) -> float:
+    """
+    Convert a Type-K thermocouple EMF to temperature.
+
+    Args:
+        emf_uv: Thermocouple EMF in microvolts (µV).
+
+    Returns:
+        Hot-junction temperature in degrees Celsius.
+
+    Source:
+        NIST Monograph 175, Table 10.5
+    """
+    coeffs = _TYPE_K_COEFFS_POS if emf_uv >= 0.0 else _TYPE_K_COEFFS_NEG
+    result = 0.0
+    power = 1.0
+    for coeff in coeffs:
+        result += coeff * power
+        power *= emf_uv
+    return result
+
+
+# ============================================================
+# 2. COLD JUNCTION COMPENSATION (CJC)
+# ============================================================
+# CJC sensor: LM34 temperature sensor on AIN58 (single-ended).
+# LM34 output characteristic: 10 mV per degree Fahrenheit, 0 V = 0 °F.
+#
+# V_lm34 [volts] -> T_fahrenheit = V * 100  (10 mV/°F -> °F)
+# T_celsius = (T_fahrenheit - 32) * 5/9
+#
+# Type-K Seebeck coefficient at 25°C ≈ 40.7 µV/°C (used for CJC correction).
+# Source: NIST Monograph 175 Table 2.1
+# ============================================================
+
+_TYPE_K_SEEBECK_UV_PER_C = 40.7  # µV/°C - linear approximation for CJC
+
+
+def lm34_voltage_to_celsius(voltage_v: float) -> float:
+    """
+    Convert an LM34 sensor output voltage to degrees Celsius.
+
+    Args:
+        voltage_v: Raw voltage from the LM34 sensor in volts.
+
+    Returns:
+        Ambient (cold junction) temperature in degrees Celsius.
+
+    Source:
+        Texas Instruments LM34 Datasheet (SNIS155B)
+    """
+    fahrenheit = voltage_v * 100.0          # 10 mV/°F -> °F
+    return (fahrenheit - 32.0) * (5.0 / 9.0)
+
+
+def software_seebeck_type_k(diff_volts: float, cjc_celsius: float) -> float:
+    """
+    Apply cold junction compensation to a Type-K differential voltage
+    and return the hot-junction temperature.
+
+    Software Seebeck correction process:
+      1. Convert the CJC temperature to an equivalent EMF using the
+         linear Seebeck coefficient.
+      2. Add that to the measured differential EMF.
+      3. Apply the NIST inverse polynomial to get hot-junction °C.
+
+    Args:
+        diff_volts: Differential voltage across the thermocouple in volts
+                    (positive terminal minus negative terminal).
+        cjc_celsius: Cold junction (ambient) temperature in degrees Celsius,
+                     typically from lm34_voltage_to_celsius().
+
+    Returns:
+        Hot-junction temperature in degrees Celsius.
+    """
+    cjc_uv = cjc_celsius * _TYPE_K_SEEBECK_UV_PER_C   # CJC contribution in µV
+    total_uv = diff_volts * 1e6 + cjc_uv               # Total EMF in µV
+    return type_k_uv_to_celsius(total_uv)
+
+
+# ============================================================
+# 3. LINEAR CALIBRATION (PTs and Load Cells)
+# ============================================================
+# General linear model: output = slope * voltage + intercept
+# Calibration coefficients come from config.yaml / calibration.json
+# ============================================================
+
+def pt_voltage_to_psi(voltage_v: float, slope: float, intercept: float) -> float:
+    """
+    Convert a raw PT voltage to psi via a linear calibration.
+
+    Args:
+        voltage_v: Raw voltage in volts.
+        slope: Calibration slope in psi/V.
+        intercept: Calibration intercept in psi.
+
+    Returns:
+        Pressure in psi.
+    """
+    return slope * voltage_v + intercept
+
+
+def load_cell_voltage_to_force(
+    voltage_v: float,
+    slope: float,
+    intercept: float,
+    tare: float = 0.0,
+) -> float:
+    """
+    Convert a raw load cell voltage to force in lbf.
+
+    Args:
+        voltage_v: Raw voltage in volts.
+        slope: Calibration slope in lbf/V.
+        intercept: Calibration intercept in lbf.
+        tare: Tare offset in lbf (subtracted from result).
+
+    Returns:
+        Force in lbf (tare-corrected).
+    """
+    return slope * voltage_v + intercept - tare
+
+
+# ============================================================
+# 4. LOX SATURATION DENSITY
+# ============================================================
+# NIST SRD 69: Oxygen saturation density table
+# Table: temperature [Rankine] -> density [lbm/ft³]
+# Loaded from LOX_table_100_0-260_99R.csv at startup
+# ============================================================
+
+# Populated by _load_lox_table()
+# Module-level storage (loaded once)
+_lox_T_rankine: list[float] = []
+_lox_density_lbm_ft3: list[float] = []
+
+
+def load_lox_table(csv_path: str) -> tuple[int, float, float]:
+    """
+    Load LOX saturation density table from CSV.
+
+    Expected CSV format (with header row):
+        temperature_R, density_lbm_ft3
+        100.0, 71.05
+        ...
+
+    Should be called once at application startup (e.g. from __main__.py).
+    Subsequent calls replace the previously loaded table.
+
+    Args:
+        csv_path: Absolute or relative path to the CSV file.
+
+    Returns:
+        Tuple of (num_points, min_temp_R, max_temp_R).
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the file cannot be parsed.
+
+    Source:
+        NIST SRD 69, Oxygen Saturation Density
+    """
+    global _lox_T_rankine, _lox_density_lbm_ft3
+
+    import csv
+
+    temps: list[float] = []
+    densities: list[float] = []
+
+    with open(csv_path, newline="") as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        for row in reader:
+            if len(row) >= 2:
+                temps.append(float(row[0]))
+                densities.append(float(row[1]))
+
+    if not temps:
+        raise ValueError(f"LOX table at '{csv_path}' contained no data rows.")
+
+    _lox_T_rankine = temps
+    _lox_density_lbm_ft3 = densities
+    return len(temps), temps[0], temps[-1]
+
+
+def lox_density_from_celsius(temp_celsius: float) -> Optional[float]:
+    """
+    Get LOX saturation density at given temperature via linear
+    interpolation of the loaded saturation table.
+
+    Args:
+        temp_celsius: LOX inlet temperature in degrees Celsius (from TOI TC).
+
+    Returns:
+        Density in lbm/ft³, or None if the table is not loaded or the
+        temperature is outside the table's range.
+
+    Source:
+        NIST SRD 69, Oxygen Saturation Density
+    """
+    if not _lox_T_rankine:
+        return None
+
+    # Convert °C -> Rankine: T_R = (T_C + 273.15) * 9/5
+    t_r = (temp_celsius + 273.15) * (9.0 / 5.0)
+
+    if t_r < _lox_T_rankine[0] or t_r > _lox_T_rankine[-1]:
+        return None
+
+    # Binary search for the surrounding bracket
+    lo, hi = 0, len(_lox_T_rankine) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if _lox_T_rankine[mid] <= t_r:
+            lo = mid
+        else:
+            hi = mid
+
+    # Linear interpolation
+    t0, t1 = _lox_T_rankine[lo], _lox_T_rankine[hi]
+    d0, d1 = _lox_density_lbm_ft3[lo], _lox_density_lbm_ft3[hi]
+    frac = (t_r - t0) / (t1 - t0)
+    return d0 + frac * (d1 - d0)
+
+
+# ============================================================
+# 5. MASS FLOW RATES (Orifice Model)
+# ============================================================
+# m = Cd * A * sqrt(2 * ρ * ΔP)
+#
+# Constants (from injector design):
+#   Cd  = 0.6
+#   A   = 0.02922466566 in²
+#
+# Unit conversions applied internally so all inputs are in
+# practical engineering units and the output is SI (kg/s).
+# Source: Sutton, Eq. 6.15
+# ============================================================
+
+_LOX_Cd = 0.6
+_LOX_A_IN2 = 0.02922466566                         # in²
+_LOX_A_M2 = _LOX_A_IN2 * 6.4516e-4                # in² -> m²
+
+
+def lox_mass_flow_rate(
+    toi_celsius: float,
+    poi_psi: float,
+    pc_psi: float,
+) -> Optional[float]:
+    """
+    Calculate LOX mass flow rate through the injector orifice.
+
+    Uses the saturated liquid density at the measured inlet temperature
+    (TOI), and the differential pressure between the LOX inlet (POI)
+    and the chamber (PC).
+
+    Args:
+        toi_celsius: LOX inlet temperature in °C (from TOI thermocouple).
+        poi_psi: LOX inlet pressure in psi (from POI transducer).
+        pc_psi: Chamber pressure in psi (from PC transducer).
+
+    Returns:
+        Mass flow rate in kg/s, or None if:
+            - The LOX density table is not loaded.
+            - toi_celsius is outside the table's valid range.
+            - The differential pressure (poi_psi - pc_psi) is <= 0.
+
+    Source:
+        Sutton, "Rocket Propulsion Elements", Eq. 6.15
+    """
+    rho_lbm_ft3 = lox_density_from_celsius(toi_celsius)
+    if rho_lbm_ft3 is None:
+        return None
+
+    dp_psi = poi_psi - pc_psi
+    if dp_psi <= 0.0:
+        return None
+
+    rho_kg_m3 = rho_lbm_ft3 * 16.0185          # lbm/ft³ -> kg/m³
+    dp_pa = dp_psi * 6894.76                    # psi -> Pa
+
+    return _LOX_Cd * _LOX_A_M2 * math.sqrt(2.0 * rho_kg_m3 * dp_pa)
+
+
+# ============================================================
+# 6. FUEL (IPA) MASS FLOW RATE
+# ============================================================
+# Same orifice model as LOX, but with fixed IPA density and
+# different injector geometry.
+#
+# Constants (from injector design):
+#   Cd  = 0.67
+#   A   = 0.04526 in²
+#   ρ   = 800 kg/m³  (fixed; IPA at room temperature)
+# ============================================================
+
+_FUEL_Cd = 0.67
+_FUEL_A_IN2 = 0.04526                               # in²
+_FUEL_A_M2 = _FUEL_A_IN2 * 6.4516e-4                # in² -> m²
+_FUEL_RHO_KG_M3 = 800.0                             # kg/m³
+
+
+def fuel_mass_flow_rate(pfo_psi: float, pc_psi: float) -> Optional[float]:
+    """
+    Calculate fuel (IPA) mass flow rate through the injector orifice.
+
+    Uses the fuel channel outlet pressure (PFO) and chamber pressure (PC)
+    to determine differential pressure across the injector.
+
+    Args:
+        pfo_psi: Fuel channel outlet pressure in psi (from PFO transducer).
+        pc_psi: Chamber pressure in psi (from PC transducer).
+
+    Returns:
+        Mass flow rate in kg/s, or None if the differential pressure
+        (pfo_psi - pc_psi) is <= 0.
+
+    Source:
+        Sutton, "Rocket Propulsion Elements", Eq. 6.15
+    """
+    dp_psi = pfo_psi - pc_psi
+    if dp_psi <= 0.0:
+        return None
+
+    dp_pa = dp_psi * 6894.76                          # psi -> Pa
+
+    return _FUEL_Cd * _FUEL_A_M2 * math.sqrt(2.0 * _FUEL_RHO_KG_M3 * dp_pa)
+
+
+# ============================================================
+# 7. MIXTURE RATIO (O/F)
+# ============================================================
+# O/F = ṁ_oxidizer / ṁ_fuel
+# Source: Sutton, Eq. 2.7
+# ============================================================
+
+def mixture_ratio(
+    lox_mdot_kg_s: Optional[float],
+    fuel_mdot_kg_s: Optional[float],
+) -> Optional[float]:
+    """
+    Calculate the oxidizer-to-fuel mixture ratio (O/F).
+
+    Args:
+        lox_mdot_kg_s: LOX mass flow rate in kg/s.
+        fuel_mdot_kg_s: Fuel mass flow rate in kg/s.
+
+    Returns:
+        O/F ratio (dimensionless), or None if either flow rate is
+        None or fuel flow rate is zero (division guard).
+
+    Source:
+        Sutton, "Rocket Propulsion Elements", Eq. 2.7
+    """
+    if lox_mdot_kg_s is None or fuel_mdot_kg_s is None:
+        return None
+    if fuel_mdot_kg_s <= 0.0:
+        return None
+    return lox_mdot_kg_s / fuel_mdot_kg_s
+
+
+# ============================================================
+# 8. TOTAL IMPULSE
+# ============================================================
+# Two supported methods per SR 3.2.8.3:
+#
+#   1. Load-cell integration (primary):
+#      I_total = ∫ F(t) dt  ≈  Σ F_i * Δt   (trapezoidal rule)
+#      Accumulated externally sample-by-sample; this function
+#      computes one trapezoidal step to be summed by the caller.
+#
+#   2. Mass-flow estimate (fallback when no load cells):
+#      Estimate thrust:   F ≈ (ṁ_lox + ṁ_fuel) * Isp * g0
+#      Then:             I = F * Δt
+#      Isp is a design constant; this is explicitly an estimate.
+# Source: Sutton, Eq. 2.1
+# ============================================================
+
+_G0_M_S2 = 9.80665          # standard gravity [m/s²]
+_ISP_ESTIMATE_S = 220.0     # rough Isp estimate for LOX/IPA [seconds]
+                             # — update with actual design value before hot fire
+
+
+def impulse_step_load_cell(
+    force_lbf_prev: float,
+    force_lbf_curr: float,
+    dt_seconds: float,
+) -> float:
+    """
+    Compute one trapezoidal integration step for total impulse from load cells.
+
+    The caller accumulates these steps over the burn duration.
+
+    Args:
+        force_lbf_prev: Thrust force at the previous sample in lbf.
+        force_lbf_curr: Thrust force at the current sample in lbf.
+        dt_seconds: Time elapsed since the previous sample in seconds.
+
+    Returns:
+        Incremental impulse in lbf·s for this step.
+        Convert to N·s by multiplying by 4.44822.
+
+    Source:
+        Sutton, "Rocket Propulsion Elements", Eq. 2.1
+    """
+    return 0.5 * (force_lbf_prev + force_lbf_curr) * dt_seconds
+
+
+def impulse_step_estimate(
+    lox_mdot_kg_s: Optional[float],
+    fuel_mdot_kg_s: Optional[float],
+    dt_seconds: float,
+    isp_seconds: float = _ISP_ESTIMATE_S,
+) -> Optional[float]:
+    """
+    Estimate one impulse step from mass flow rates when load cells are absent.
+
+    Uses F ≈ (ṁ_total) * Isp * g0  then I_step = F * dt.
+
+    Args:
+        lox_mdot_kg_s: LOX mass flow rate in kg/s (or None).
+        fuel_mdot_kg_s: Fuel mass flow rate in kg/s (or None).
+        dt_seconds: Time elapsed since previous sample in seconds.
+        isp_seconds: Specific impulse estimate in seconds.
+                     Defaults to _ISP_ESTIMATE_S; override per test.
+
+    Returns:
+        Incremental impulse in N·s, or None if either flow rate is None.
+
+    Source:
+        Sutton, "Rocket Propulsion Elements", Eq. 2.1
+    """
+    if lox_mdot_kg_s is None or fuel_mdot_kg_s is None:
+        return None
+
+    total_mdot = lox_mdot_kg_s + fuel_mdot_kg_s
+    thrust_n = total_mdot * isp_seconds * _G0_M_S2
+    return thrust_n * dt_seconds
+
+
+# ============================================================
+# 9. LOX SATURATION PRESSURE (Antoine Equation)
+# ============================================================
+# SR 3.2.9.2: Alert when tank pressure is below LOX saturation pressure.
+#
+# log10(P_sat [bar]) = A - B / (T [K] + C)
+#
+# Antoine constants for oxygen (NIST Webbook):
+#   A = 3.9523,  B = 340.024,  C = -4.144
+#   Valid range: 54.361 K to 154.58 K  (-218.8 °C to -118.6 °C)
+# Source: NIST SRD 69, Oxygen Antoine Constants
+# ============================================================
+
+_ANTOINE_A = 3.9523
+_ANTOINE_B = 340.024
+_ANTOINE_C = -4.144
+
+
+def lox_saturation_pressure_psia(temp_celsius: float) -> Optional[float]:
+    """
+    Estimate LOX saturation pressure using the Antoine equation.
+
+    Args:
+        temp_celsius: LOX temperature in degrees Celsius.
+
+    Returns:
+        Saturation pressure in psia, or None if the temperature is
+        outside the valid range (approx. -219 °C to -119 °C).
+
+    Source:
+        NIST SRD 69, Oxygen Antoine Equation Constants
+    """
+    temp_k = temp_celsius + 273.15
+
+    # Antoine equation valid range: 54.361 K to 154.58 K
+    if not (54.361 <= temp_k <= 154.58):
+        return None
+
+    log_p_bar = _ANTOINE_A - _ANTOINE_B / (temp_k + _ANTOINE_C)
+    p_bar = 10.0 ** log_p_bar
+    p_psia = p_bar * 14.5038             # bar -> psia
+
+    return p_psia
+
+
+def lox_below_saturation(
+    tank_pressure_psia: float,
+    toi_celsius: float,
+) -> Optional[bool]:
+    """
+    Check whether the LOX tank pressure is below the saturation pressure
+    at the measured inlet temperature.
+
+    Per SR 3.2.9.2, the interface shall display an alert when this is True.
+
+    Args:
+        tank_pressure_psia: Measured LOX tank pressure in psia (from POT).
+        toi_celsius: LOX inlet temperature in °C (from TOI).
+
+    Returns:
+        True: tank pressure is below saturation (alert condition).
+        False: tank pressure is above saturation (normal).
+        None: saturation pressure could not be computed (temp out of range).
+
+    Source:
+        System Requirement 3.2.9.2 (Saturation Pressure Alert)
+    """
+    p_sat = lox_saturation_pressure_psia(toi_celsius)
+    if p_sat is None:
+        return None
+    return tank_pressure_psia < p_sat
