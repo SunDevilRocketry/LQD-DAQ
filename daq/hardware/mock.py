@@ -1,9 +1,9 @@
 """
 daq/hardware/mock.py
 
-Simulated LabJack T7 for development and testing without physical hardware.
+Simulated LabJack T7 for dev/test
 
-Implements the same interface as hardware/interface.py so engine.py
+Should have same interfrace w/ hardware/interface.py so engine.py
 can use either interchangeably. Swap at startup based on LJM availability.
 
 Sensor simulation:
@@ -34,7 +34,7 @@ from typing import Any
 # ============================================================
 
 # PT calibration defaults (slope=252, intercept=-119.5) used to back-calculate
-# base voltages from target pressures. See calculations.py.
+# base voltages from target pressures.
 #   V = (P_psi + 119.5) / 252.0
 
 _PT_SENSORS: dict[str, tuple[float, float, float, float]] = {
@@ -86,7 +86,7 @@ _ACTUATOR_NAMES: tuple[str, ...] = (
 )
 
 # How long stream_read() blocks to simulate one batch at 500 Hz
-# with SCANS_PER_READ=50 (matches engine.py expectation)
+# with SCANS_PER_READ=50
 _STREAM_HZ         = 500
 _SCANS_PER_READ    = 50
 _BATCH_DURATION_S  = _SCANS_PER_READ / _STREAM_HZ   # 0.1 s
@@ -346,13 +346,13 @@ class MockLabJack:
         Approximate time when the fire sequence started.
         Used only for load cell ramp shaping; not safety-critical.
         """
-        # Simple heuristic: return a fixed offset before now.
-        # Engine sets actuators sequentially so this is close enough.
+        # return a fixed offset before now.
+        # Engine sets actuators sequentially ~ BS-y enough
         return time.perf_counter() - self._stream_start - 0.1
 
     def _noise(self) -> float:
         """
-        Fast, deterministic gaussian-ish noise in [-1, 1].
+        Gaussian-ish noise in [-1, 1].
         Uses a xorshift32 PRNG so output is reproducible given the same seed.
         Sum of 4 uniform samples approximates gaussian by CLT.
         """
