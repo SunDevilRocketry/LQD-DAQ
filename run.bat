@@ -1,0 +1,1 @@
+:: Windows: Activates venv and starts the DAQ

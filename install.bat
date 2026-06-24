@@ -1,0 +1,1 @@
+:: Windows: Installs Python dependencies and LJ

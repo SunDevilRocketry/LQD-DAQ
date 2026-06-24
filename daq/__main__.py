@@ -1,0 +1,1 @@
+# Entry point: python -m daq

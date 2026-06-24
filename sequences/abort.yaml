@@ -1,0 +1,24 @@
+# sequences/abort.yaml
+#
+# Abort / emergency shutdown sequence.
+# Executes immediately when ABORT is commanded, interrupting any
+# running fire sequence. Reaches safe state ASAP w/ considering
+# water hammer.
+#
+# Format is as follows: [elapsed_seconds, actuator_name, state]
+# Sourced from prior DAQ ABORT_SEQUENCE.
+
+post_record_seconds: 5.0
+
+steps:
+  - [0.00, "Ignition",   0]
+  - [0.00, "LOx Main",   0]
+  - [0.00, "Fuel Main",  0]
+  - [0.00, "LOx Press",  0]
+  - [0.00, "Fuel Press", 0]
+  - [0.05, "LOx Purge",  1]
+  - [0.05, "Fuel Purge", 1]
+  - [0.10, "LOx Vent",   0]
+  - [0.10, "Fuel Vent",  0]
+  - [5.00, "LOx Purge",  0]
+  - [5.00, "Fuel Purge", 0]
