@@ -11,7 +11,7 @@
 # Times are relative to T=0 (moment FIRE is confirmed).
 #
 # Format is as follows: [elapsed_seconds, actuator_name, state]
-# Sourced from prior FIRE_SEQUENCE.
+# Sourced from prior DAQ FIRE_SEQUENCE.
 
 post_record_seconds: 5.0
 

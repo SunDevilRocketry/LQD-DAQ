@@ -1,3 +1,16 @@
 {
-    "_comment": "Dynamic calibration (written at runtime)"
+  "PT": {
+    "POT": {"slope": 252.0, "intercept": -106.0},
+    "PFT": {"slope": 252.0, "intercept": -121.0},
+    "POI": {"slope": 252.0, "intercept": -119.5},
+    "PFI": {"slope": 252.0, "intercept": -119.5},
+    "PFO": {"slope": 252.0, "intercept": -119.5},
+    "PC":  {"slope": 128.0, "intercept": -62.8},
+    "PNS": {"slope": 252.0, "intercept": -116.5},
+    "PNP": {"slope": 252.0, "intercept": -104.5}
+  },
+  "LC": {
+    "LC_1": {"slope": 100.0, "intercept": 0.0},
+    "LC_2": {"slope": 100.0, "intercept": 0.0}
+  }
 }
