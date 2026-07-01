@@ -1,7 +1,7 @@
 """
 daq/__main__.py
 
-Application entrypoint. Run with:
+Run with:
     python -m daq
     python -m daq --config path/to/custom_config.yaml
     python -m daq --mock          (force mock hardware regardless of LJM)
@@ -15,12 +15,7 @@ Startup sequence:
     5. Register API engine reference
     6. Start engine (connects to hardware, starts stream thread)
     7. Start uvicorn (serves API; blocks until Ctrl-C)
-    8. On shutdown: stop engine, flush logger
-
-Simple to deploy:
-    The install scripts (install.sh / install.bat) handle Python and
-    dependency installation. Operators run this via run.sh / run.bat,
-    which activate the venv and call python -m daq.
+    8. On shutdown: stop engine, flush logger.
 """
 
 from __future__ import annotations
@@ -36,13 +31,9 @@ import uvicorn
 
 from daq.calculations import load_lox_table
 from daq.logger import Logger
-from daq.engine import Engine
-from daq import api as api_module
 
 
-# --------------------------------------------------------
-# Defaults (overridden by config.yaml)
-# --------------------------------------------------------
+# -- Defaults (overridden by config.yaml) --------------------
 
 _DEFAULT_CONFIG = {
     "server":  {"host": "0.0.0.0", "port": 8000, "log_level": "warning"},
@@ -64,16 +55,11 @@ def _load_config(path: str) -> dict:
     with open(path) as f:
         user = yaml.safe_load(f) or {}
     
-    # Start with a copy of defaults
     cfg = dict(_DEFAULT_CONFIG)
-    
-    # Merge sections dynamically to prevent losing keys like thresholds
     for section, content in user.items():
         if section in cfg and isinstance(cfg[section], dict) and isinstance(content, dict):
-            # Safe merge for nested dictionaries
             cfg[section] = {**cfg[section], **content}
         else:
-            # Direct assignment for new or non-dictionary sections
             cfg[section] = content
             
     return cfg
@@ -103,27 +89,25 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # --------------------------------------------------------
-    # 1. Config
-    # --------------------------------------------------------
+    # -- 1. Load Configurations ------------------------------
     cfg     = _load_config(args.config)
     paths   = cfg["paths"]
     server  = cfg["server"]
 
-    # --------------------------------------------------------
-    # 2. Force mock if requested
-    # --------------------------------------------------------
+    # -- 2. Hardware Mock Configuration ----------------------
     if args.mock:
-        # Modify hardware selector before anything imports it
+        # Override the hardware classes before other modules import them
         import daq.hardware as _hw
         from daq.hardware.mock import MockLabJack
         _hw.Device     = MockLabJack
         _hw.USING_MOCK = True
         print("[MAIN] Forced mock hardware")
 
-    # --------------------------------------------------------
-    # 3. LOX saturation table
-    # --------------------------------------------------------
+    # Now safe to import Engine and API after hardware references are resolved
+    from daq.engine import Engine
+    from daq import api as api_module
+
+    # -- 3. LOX Saturation Table Initialization --------------
     lox_table_path = _resolve(paths["lox_table"])
     if os.path.exists(lox_table_path):
         try:
@@ -135,18 +119,14 @@ def main() -> None:
     else:
         print(f"[MAIN] WARNING: LOX table not found at {lox_table_path}")
         print("[MAIN] lox_mdot and lox_below_sat will return None")
-
-    # --------------------------------------------------------
-    # 4. Logger
-    # --------------------------------------------------------
+    
+    # -- 4. Initialize CSV Logger ----------------------------
     output_dir = _resolve(paths["output_dir"])
     logger = Logger(output_dir=output_dir)
     logger.open()
     print(f"[MAIN] Logger ready -> {output_dir}")
 
-    # --------------------------------------------------------
-    # 5. Engine
-    # --------------------------------------------------------
+    # -- 5. Initialize Engine --------------------------------
     cal_path     = _resolve(paths["cal_file"])
     sequence_dir = _resolve(paths["sequence_dir"])
 
@@ -157,36 +137,26 @@ def main() -> None:
         thresholds=cfg.get("thresholds"),  # Ingest thresholds from custom_config.yaml / config.yaml
     )
 
-    # --------------------------------------------------------
-    # 6. API wiring
-    # --------------------------------------------------------
+    # -- 6. Bind API References ------------------------------
     api_module.set_engine(engine, logger)
 
-    # --------------------------------------------------------
-    # 7. Graceful shutdown handler (SIGTERM fallback)
-    # --------------------------------------------------------
+    # -- 7. Signal Interruption Handlers ---------------------
     _shutdown_requested = [False]
 
     def _shutdown(sig, frame):
         if _shutdown_requested[0]:
-            sys.exit(1)   # second signal: force exit
+            sys.exit(1)         # Force termination on consecutive signals
         _shutdown_requested[0] = True
-        # Move to try...finally block below to 
-        # handle the cleanup consistently (ctrl+C handling)
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    # --------------------------------------------------------
-    # 8. Start engine
-    # --------------------------------------------------------
+    # -- 8. Launch Engine Acquisition ------------------------
     engine.start()
     print(f"[MAIN] Engine running (mock={api_module._engine.snapshot.using_mock})")
 
-    # --------------------------------------------------------
-    # 9. HTTP server or headless loop
-    # --------------------------------------------------------
+    # -- 9. Run HTTP API Server or Headless Loop -------------
     try:
         if args.no_server:
             print("[MAIN] Running headless (no HTTP server). Ctrl+C to stop.")
@@ -215,7 +185,6 @@ def main() -> None:
         engine.stop()
         logger.close()
         print("[MAIN] Clean shutdown complete.")
-
 
 if __name__ == "__main__":
     main()
