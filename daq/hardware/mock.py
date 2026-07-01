@@ -1,21 +1,16 @@
 """
 daq/hardware/mock.py
 
-Simulated LabJack T7 for dev/test
+Simulated LabJack T7 for development and hardware-free testing.
 
-Should have same interfrace w/ hardware/interface.py so engine.py
-can use either interchangeably. Swap at startup based on LJM availability.
+Provides mathematical models of pressures, temperatures, and load cells
+to produce realistic, responsive signals matching real test physics.
 
 Sensor simulation:
   - Pressure transducers: slow sine-wave drift around realistic setpoints
   - Thermocouples: stable with small noise, LOX TC near -160 C
   - Load cells: zero until a "fire" state is active, then ramp up
   - CJC (LM34): fixed room temperature with minor drift
-  - All values chosen so calculations.py produces physically valid outputs
-
-Thread safety:
-  - Actuator state is protected by a threading.Lock
-  - stream_read() blocks to simulate 500 Hz hardware timing
 """
 
 from __future__ import annotations
@@ -26,53 +21,38 @@ import threading
 from typing import Any
 
 
-# ============================================================
-# SENSOR CHANNEL DEFINITIONS
-# Must match the channel layout expected by engine.py.
-# Each entry: tag -> (base_voltage, amplitude, period_s, noise_scale)
-# Voltage drifts as: V = base + amplitude * sin(2pi * t / period) + noise
-# ============================================================
-
-# PT calibration defaults (slope=252, intercept=-119.5) used to back-calculate
-# base voltages from target pressures.
-#   V = (P_psi + 119.5) / 252.0
-
+# -- Sensor Simulation Parameters -----------------------------
+# tag -> (base_voltage, amplitude, period_s, noise_scale)
+# Voltage formula: V = base + amplitude * sin(2pi * t / period) + noise
 _PT_SENSORS: dict[str, tuple[float, float, float, float]] = {
-    # tag:       base_V   amp_V  period_s  noise_V
-    "POT":   (1.4663, 0.030, 18.0, 0.002),  # LOX tank      ~250 psi
-    "PFT":   (1.4663, 0.025, 20.0, 0.002),  # Fuel tank     ~250 psi
-    "POI":   (1.2679, 0.020, 15.0, 0.002),  # LOX inlet     ~200 psi
-    "PFI":   (1.2679, 0.020, 15.0, 0.002),  # Fuel inlet    ~200 psi
-    "PFO":   (1.1885, 0.018, 14.0, 0.002),  # Fuel outlet   ~180 psi
-    "PC":    (1.0694, 0.040, 10.0, 0.003),  # Chamber       ~150 psi
-    "PNS":   (1.4663, 0.010, 30.0, 0.001),  # System GN2    ~250 psi
+    # tag:   base_V  amp_V  period_s  noise_V
+    "POT":   (1.4663, 0.030, 18.0, 0.002),  # LOX tank       ~250 psi
+    "PFT":   (1.4663, 0.025, 20.0, 0.002),  # Fuel tank      ~250 psi
+    "POI":   (1.2679, 0.020, 15.0, 0.002),  # LOX inlet      ~200 psi
+    "PFI":   (1.2679, 0.020, 15.0, 0.002),  # Fuel inlet     ~200 psi
+    "PFO":   (1.1885, 0.018, 14.0, 0.002),  # Fuel outlet    ~180 psi
+    "PC":    (1.0694, 0.040, 10.0, 0.003),  # Chamber        ~150 psi
+    "PNS":   (1.4663, 0.010, 30.0, 0.001),  # System GN2     ~250 psi
     "PNP":   (1.1885, 0.008, 25.0, 0.001),  # Pneumatics GN2 ~180 psi
 }
 
-# TC differential voltages that produce realistic temperatures after CJC.
-# At CJC=25 C, diff=-0.0062 V -> ~-162 C (LOX inlet region)
-# At CJC=25 C, diff=+0.0008 V -> ~+45 C (fuel channel, warm side)
 _TC_SENSORS: dict[str, tuple[float, float, float, float]] = {
-    # tag:       base_V     amp_V   period_s  noise_V
+    # tag:      base_V   amp_V   period_s  noise_V
     "TOI":   (-0.006200, 0.000050, 25.0, 0.000005),  # LOX inlet TC  ~-160 C
     "TFI":   ( 0.000800, 0.000100, 20.0, 0.000008),  # Fuel inlet TC ~+45 C
     "TFO":   ( 0.001200, 0.000120, 18.0, 0.000010),  # Fuel outlet TC ~+55 C
 }
 
-# Load cell base voltage: slope=100, intercept=0
-# At rest (no thrust): ~0 lbf -> 0.0 V
-# During fire simulation: ramps toward ~500 lbf -> 5.0 V
 _LC_SENSORS: dict[str, tuple[float, float, float, float]] = {
     "LC_1":  (0.0, 0.0, 1.0, 0.002),
     "LC_2":  (0.0, 0.0, 1.0, 0.002),
 }
 
-# LM34 CJC sensor on AIN58
-# 25 C room temp -> 0.770 V  (10 mV/°F, 77°F = 25°C)
 _CJC_BASE_V  = 0.770
-_CJC_DRIFT_V = 0.001   # very slow drift, ~0.1°C equivalent
+_CJC_DRIFT_V = 0.001
 
-# Actuator names — must match the sequence files and engine expectations
+# -- Actuator Definitions -------------------------------------
+
 _ACTUATOR_NAMES: tuple[str, ...] = (
     "LOx Press",
     "Fuel Press",
@@ -85,8 +65,8 @@ _ACTUATOR_NAMES: tuple[str, ...] = (
     "Ignition",
 )
 
-# How long stream_read() blocks to simulate one batch at 500 Hz
-# with SCANS_PER_READ=50
+# -- Timing Parameters ----------------------------------------
+
 _STREAM_HZ         = 500
 _SCANS_PER_READ    = 50
 _BATCH_DURATION_S  = _SCANS_PER_READ / _STREAM_HZ   # 0.1 s
@@ -120,16 +100,14 @@ class MockLabJack:
         self._connected      = False
         self._streaming      = False
 
-        # Monotonic time reference — zero at stream start
         self._stream_start: float = 0.0
-        # Tracks when the next batch should be delivered
         self._next_batch_time: float = 0.0
 
-        # Simple PRNG state for reproducible noise (xorshift32)
+        # Uniform seed for reproducible noise generations
         self._rng_state: int = 0xDEADBEEF
 
     # --------------------------------------------------------
-    # Lifecycle
+    # Lifecycle Management
     # --------------------------------------------------------
 
     def open(self) -> None:
@@ -168,10 +146,7 @@ class MockLabJack:
 
     def stream_read(self) -> dict[str, list[float]]:
         """
-        Block until the next batch is due, then return simulated scan data.
-
-        Mirrors the timing behaviour of a real eStreamRead call so that
-        engine.py's processing loop runs at the correct rate in mock mode.
+        Blocks to simulate 500 Hz clock, then generates mock scan values.
 
         Returns:
             Dict mapping sensor tag -> list of raw voltages, one per scan.
@@ -190,7 +165,6 @@ class MockLabJack:
             time.sleep(sleep_duration)
         self._next_batch_time += self._batch_duration
 
-        # Generate one batch of scans
         t_elapsed = time.perf_counter() - self._stream_start
         batch: dict[str, list[float]] = {tag: [] for tag in self.sensor_tags}
         batch["scan_times"] = []
@@ -214,9 +188,7 @@ class MockLabJack:
 
     def read_cjc(self) -> float:
         """
-        Return the simulated LM34 cold junction voltage.
-
-        Called periodically by engine.py between stream batches.
+        Simulates LM34 cold junction ambient reference voltage.
 
         Returns:
             Voltage in volts. At 25 °C room temp this is ~0.770 V.
@@ -268,12 +240,12 @@ class MockLabJack:
         print("[MOCK] All actuators -> SAFE/CLOSED")
 
     def actuator_states(self) -> dict[str, int]:
-        """Return a snapshot of all actuator states."""
+        """Returns a copy of all current mock actuator states."""
         with self._lock:
             return dict(self._actuators)
 
     # --------------------------------------------------------
-    # Device info (mirrors interface.py)
+    # Device info
     # --------------------------------------------------------
 
     @property
@@ -298,7 +270,7 @@ class MockLabJack:
         return list(_PT_SENSORS) + list(_TC_SENSORS) + list(_LC_SENSORS)
 
     # --------------------------------------------------------
-    # Private helpers
+    # Private Simulation Helpers
     # --------------------------------------------------------
 
     def _sine_sample(
@@ -325,7 +297,6 @@ class MockLabJack:
         if not fire_active:
             return self._noise() * 0.003
 
-        # Ramp: rises over first 0.5 s of fire, then oscillates around 5.0 V
         fire_elapsed = t - self._fire_start_time()
         ramp = min(1.0, fire_elapsed / 0.5)
         thrust_v = 5.0 * ramp
@@ -342,12 +313,7 @@ class MockLabJack:
             )
 
     def _fire_start_time(self) -> float:
-        """
-        Approximate time when the fire sequence started.
-        Used only for load cell ramp shaping; not safety-critical.
-        """
-        # return a fixed offset before now.
-        # Engine sets actuators sequentially ~ BS-y enough
+        """Simulates sequential valve movement during autosequence startup."""
         return time.perf_counter() - self._stream_start - 0.1
 
     def _noise(self) -> float:
