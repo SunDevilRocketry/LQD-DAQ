@@ -1,1 +1,88 @@
-# Hardware configurations, pinouts, warning thresholds
+# config.yaml
+#
+# Liquids DAQ system configuration.
+# Edit here for hardware-specific tuning and safety boundaries.
+
+# -- SERVER CONFIGURATION ------------------------------------
+
+server:
+  host: "0.0.0.0"       # Bind to all network interfaces for multi-console access
+  port: 8000
+  log_level: "warning"  # Uvicorn logging verbosity: debug | info | warning | error
+
+# -- FILESYSTEM PATHS ----------------------------------------
+
+paths:
+  output_dir:    "data"                             # Target directory for CSV telemetry logs
+  sequence_dir:  "sequences"                        # Directory containing fire.yaml and abort.yaml
+  cal_file:      "daq/calibration.json"             # Active calibration coefficients file
+  lox_table:     "daq/LOX_table_100_0-260_99R.csv"  # NIST saturation density lookup table
+
+# -- DATA ACQUISITION STREAM ---------------------------------
+stream:
+  target_hz: 500       # Requested hardware sampling rate (negotiated at start)
+
+# -- SAFETY THRESHOLDS (SR 3.2.2 / SR 3.2.3.1) ---------------
+#
+# Bounds represent calibrated units: pressures (psig), temperatures (°C), forces (lbf).
+# GUI State Mapping:
+#   - Within [normal]: Green (nominal)
+#   - Outside [normal] but within [warning]: Yellow (cautionary alert)
+#   - Outside [warning]: Orange (interlock hazard; triggers abort flag)
+#
+thresholds:
+  # Pressures (psig)
+  POT:
+    normal:  [200, 350]
+    warning: [150, 400]
+  PFT:
+    normal:  [200, 350]
+    warning: [150, 400]
+  POI:
+    normal:  [150, 300]
+    warning: [100, 350]
+  PFI:
+    normal:  [150, 300]
+    warning: [100, 350]
+  PFO:
+    normal:  [100, 280]
+    warning: [80,  320]
+  PC:
+    normal:  [100, 250]
+    warning: [50,  300]
+  PNS:
+    normal:  [200, 350]
+    warning: [150, 400]
+  PNP:
+    normal:  [100, 200]
+    warning: [80,  220]
+  
+  # Temperatures (°C)
+  TOI:
+    normal:  [-200, -140]
+    warning: [-210, -130]
+  TFI:
+    normal:  [10, 60]
+    warning: [0,  80]
+  TFO:
+    normal:  [10, 80]
+    warning: [0,  100]
+  
+  # Thrust Forces (lbf)
+  LC_1:
+    normal:  [0, 800]
+    warning: [-50, 900]
+  LC_2:
+    normal:  [0, 800]
+    warning: [-50, 900]
+
+  # Derived Channel Thresholds (Mass Flows in kg/s, O/F ratio dimensionless)
+  lox_mdot:
+    normal:  [0.0, 1.5]
+    warning: [0.0, 2.0]
+  fuel_mdot:
+    normal:  [0.0, 0.8]
+    warning: [0.0, 1.0]
+  mixture_ratio:
+    normal:  [1.8, 3.0]
+    warning: [1.2, 3.5]
