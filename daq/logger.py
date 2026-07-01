@@ -1,3 +1,14 @@
+"""
+daq/logger.py
+
+Non-blocking background CSV logging engine for real-time telemetry.
+
+Design Constraints:
+  - Disk I/O runs entirely on a dedicated writer thread to prevent stream stalling.
+  - Thread-safe queue (deque) drops the oldest rows if disk latency spikes.
+"""
+
+
 from __future__ import annotations
 
 import csv
@@ -9,12 +20,10 @@ from datetime import datetime
 from typing import Optional
 
 
-# Drain the write buffer every this many seconds
-_FLUSH_INTERVAL_S  = 0.05    # 20 Hz drain rate
-# fsync every N drain cycles (~1 s)
-_FSYNC_EVERY_N     = 20
-# Maximum buffered rows before we start dropping
-_MAX_BUFFER        = 250_000
+# Buffer polling and disk flushing intervals
+_FLUSH_INTERVAL_S  = 0.05     # Thread sleep duration (20 Hz drain rate)
+_FSYNC_EVERY_N     = 20       # Frequency of file system syncs (~1 second interval)
+_MAX_BUFFER        = 250_000  # Thread-safe ring buffer maximum capacity
 
 
 class Logger:
@@ -31,6 +40,10 @@ class Logger:
         logger.stop_recording()                # flush + close file
 
         logger.close()                         # stops writer thread
+
+    Lifecycle contract:
+        open() and close() are managed by the application owner (__main__.py).
+        start_recording() and stop_recording() are driven dynamically by the engine.
     """
 
     def __init__(self, output_dir: str = ".") -> None:
@@ -44,21 +57,23 @@ class Logger:
         self._running  = False
         self._recording = False
 
-        self._csv_file:   Optional[object] = None   # file handle
+        self._csv_file:   Optional[object] = None
         self._csv_writer: Optional[csv.writer] = None
         self._current_path: str = ""
         self._flush_count  = 0
 
-        # Stats exposed to API
+        # Operational metrics
         self._rows_written  = 0
         self._rows_dropped  = 0
 
     # --------------------------------------------------------
-    # Lifecycle
+    # Lifecycle Management
     # --------------------------------------------------------
 
     def open(self) -> None:
         """Start the background writer thread. Call once at startup."""
+        if self._running:
+            return
         self._running = True
         self._writer_thread = threading.Thread(
             target=self._writer_loop,
@@ -68,10 +83,7 @@ class Logger:
         self._writer_thread.start()
 
     def close(self) -> None:
-        """
-        Stop the writer thread, flushing any remaining buffered rows first.
-        Blocks until the writer exits (max ~1 s).
-        """
+        """Flushes the remaining queue and stops the background writer thread."""
         if self._recording:
             self.stop_recording()
         self._running = False
@@ -79,14 +91,14 @@ class Logger:
             self._writer_thread.join(timeout=2.0)
 
     # --------------------------------------------------------
-    # Recording control (called by engine.py)
+    # Recording Control
     # --------------------------------------------------------
 
     def start_recording(self, prefix: str = "data") -> str:
         """
-        Open a new CSV file and begin recording.
+        Initializes a new CSV file and starts logging telemetry.
 
-        If a recording is already active it is stopped first.
+        If a recording is active, it is stopped and flushed first.
 
         Args:
             prefix: Filename prefix (e.g. "hotfire", "manual_log").
@@ -106,9 +118,7 @@ class Logger:
         writer.writerow(self._header())
 
         with self._lock:
-            # Clear any stale/leftover data from previous sessions
             self._buffer.clear()
-            
             self._csv_file    = fh
             self._csv_writer  = writer
             self._current_path = path
@@ -121,11 +131,10 @@ class Logger:
         return path
 
     def stop_recording(self) -> None:
-        """Flush remaining buffer rows, fsync, and close the current file."""
+        """Flushes all remaining buffered rows, fsyncs, and closes the file."""
         with self._lock:
             self._recording = False
 
-        # Give the writer thread one drain cycle to flush the buffer
         time.sleep(_FLUSH_INTERVAL_S * 2)
 
         with self._lock:
@@ -144,30 +153,29 @@ class Logger:
               f"{self._current_path}")
 
     # --------------------------------------------------------
-    # Hot path (called from stream thread at 500 Hz)
+    # Hot Path (High-Frequency Input)
     # --------------------------------------------------------
 
     def write_row(self, row: list) -> None:
         """
-        Enqueue a row for writing. Returns immediately - never blocks.
+        Enqueues a data row for non-blocking background writing.
 
         If the buffer is full (disk stall), the oldest row is silently
-        dropped.
-        
+        dropped (deque maxlen handles this automatically).
+
         Args:
             row: List of values matching the CSV column order.
         """
         if not self._recording:
             return
-        
-        # Track dropped rows before append (atomic operations in CPython)
+
         if len(self._buffer) >= _MAX_BUFFER:
             self._rows_dropped += 1
-            
+
         self._buffer.append(row)
 
     # --------------------------------------------------------
-    # Status (read by api.py)
+    # Status & Metrics API
     # --------------------------------------------------------
 
     @property
@@ -209,10 +217,7 @@ class Logger:
             self._drain_locked()
 
     def _drain_locked(self) -> None:
-        """
-        Write all buffered rows to the CSV file.
-        Must be called with self._lock held.
-        """
+        """Drains the queue and writes buffered rows to the active file handle."""
         if not self._csv_writer or not self._buffer:
             return
 
@@ -235,18 +240,22 @@ class Logger:
             if self._flush_count % _FSYNC_EVERY_N == 0:
                 self._csv_file.flush()
         except OSError as exc:
-            print(f"[LOGGER] Write error: {exc}")
+            print(f"[LOGGER] Write error: {exc} - closing file handle")
+            try:
+                self._csv_file.close()
+            except OSError:
+                pass
+            self._csv_file   = None
+            self._csv_writer = None
+            self._recording  = False
 
     # --------------------------------------------------------
-    # CSV header
+    # CSV Schema Definition
     # --------------------------------------------------------
 
     @staticmethod
     def _header() -> list[str]:
-        """
-        Column headers matching the row layout produced by engine.py.
-        Order must stay in sync with _process_batch in engine.py.
-        """
+        """Returns the list of column headers matching the telemetry row schema."""
         cols = ["time_s"]
 
         pt_tags = ["POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP"]
