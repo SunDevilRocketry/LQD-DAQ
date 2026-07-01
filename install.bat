@@ -3,6 +3,8 @@ REM install.bat
 REM Windows setup for the Liquids DAQ system.
 REM Run once from the repo root: install.bat
 
+cd /d "%~dp0"
+
 echo === Liquids DAQ - Install ===
 
 REM --- Python check ---
@@ -25,6 +27,11 @@ REM --- Python packages ---
 echo Installing Python dependencies...
 pip install --upgrade pip -q
 pip install -r requirements.txt -q
+if errorlevel 1 (
+    echo ERROR: Failed to install Python dependencies. See output above.
+    pause
+    exit /b 1
+)
 
 REM --- LabJack LJM driver check & optional install ---
 echo.
@@ -43,31 +50,48 @@ echo [INFO] LabJack LJM driver was not found on this system.
 set "install_ljm="
 set /p install_ljm="Would you like to download and install the LJM driver now? (y/n): "
 
-if /i "%install_ljm%"=="y" (
-    echo Downloading LJM driver installer...
-    set "INSTALLER_URL=https://files.labjack.com/installers/LJM/Windows/x86_64/beta/LabJackBasic_2025-02-12.exe"
-    set "INSTALLER_EXE=LabJackM_Installer.exe"
-    
-    curl -L -o "%TEMP%\%INSTALLER_EXE%" "%INSTALLER_URL%"
-    
-    if exist "%TEMP%\%INSTALLER_EXE%" (
-        echo.
-        echo Launching LJM Installer...
-        echo Please approve the Windows Administrator prompt to complete installation.
-        
-        REM Run the installer without silent mode so the user sees the installation progress and prompts.
-        start /wait "" "%TEMP%\%INSTALLER_EXE%"
-        
-        del "%TEMP%\%INSTALLER_EXE%"
-        echo Driver installer finished.
-    ) else (
-        echo [WARNING] Failed to download the driver installer automatically.
-        goto driver_fallback
-    )
-) else (
+set "INSTALLER_URL=https://files.labjack.com/installers/LJM/Windows/x86_64/beta/LabJackBasic_2025-02-12.exe"
+set "INSTALLER_EXE=LabJackM_Installer.exe"
+
+if /i "%install_ljm%"=="y" goto do_install_ljm
+goto driver_fallback
+
+:do_install_ljm
+echo Downloading LJM driver installer...
+curl -fL -o "%TEMP%\%INSTALLER_EXE%" "%INSTALLER_URL%"
+
+if errorlevel 1 (
+    echo [WARNING] Download failed ^(bad URL, network issue, or HTTP error^).
+    if exist "%TEMP%\%INSTALLER_EXE%" del "%TEMP%\%INSTALLER_EXE%"
     goto driver_fallback
 )
 
+if not exist "%TEMP%\%INSTALLER_EXE%" (
+    echo [WARNING] Failed to download the driver installer automatically.
+    goto driver_fallback
+)
+
+echo Verifying installer signature...
+powershell -NoProfile -Command ^
+    "$sig = Get-AuthenticodeSignature -FilePath '%TEMP%\%INSTALLER_EXE%'; " ^
+    "if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'LabJack') { exit 1 } else { exit 0 }"
+
+if errorlevel 1 (
+    echo [WARNING] Installer signature is missing, invalid, or not from LabJack.
+    echo For safety, this file will NOT be run automatically.
+    del "%TEMP%\%INSTALLER_EXE%"
+    goto driver_fallback
+)
+
+echo Signature verified - signed by LabJack.
+echo.
+echo Launching LJM Installer...
+echo Please approve the Windows Administrator prompt to complete installation.
+
+start /wait "" "%TEMP%\%INSTALLER_EXE%"
+
+del "%TEMP%\%INSTALLER_EXE%"
+echo Driver installer finished.
 goto create_data_dir
 
 :driver_fallback
