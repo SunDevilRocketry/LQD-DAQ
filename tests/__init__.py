@@ -1,1 +1,3 @@
-# Test suite setup
+"""
+LQD-DAQ test suite package.
+"""

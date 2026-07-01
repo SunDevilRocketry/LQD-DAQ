@@ -35,13 +35,10 @@ from daq.calculations import (
     lox_below_saturation,
 )
 
-
-# ============================================================
-# HELPERS
-# ============================================================
+# -- Helper Utilities ----------------------------------------
 
 def _write_lox_table(rows: list[tuple[float, float]]) -> str:
-    """Write a minimal LOX table CSV to a temp file and return the path."""
+    """Writes a temporary minimal LOX density table to disk and returns the path."""
     content = "temperature_R,density_lbm_ft3\n"
     for t, d in rows:
         content += f"{t},{d}\n"
@@ -53,16 +50,10 @@ def _write_lox_table(rows: list[tuple[float, float]]) -> str:
     return f.name
 
 
-# ============================================================
-# TYPE-K THERMOCOUPLE  (NIST ITS-90)
-# ============================================================
+# -- Type-K Thermocouple Polynomial (NIST ITS-90) ------------
 
 class TestTypeKInversePolynomial:
-    """
-    Reference values computed from the NIST ITS-90 tables.
-    At 0 µV the output should be exactly 0 °C (room temp reference).
-    Other values verified against the NIST online converter.
-    """
+    """NIST Monograph 175, Table 10.5 polynomial conversions."""
 
     def test_zero_emf_gives_zero_celsius(self):
         result = type_k_uv_to_celsius(0.0)
@@ -91,15 +82,10 @@ class TestTypeKInversePolynomial:
         assert abs(pos - neg) < 0.01
 
 
-# ============================================================
-# LM34 CJC SENSOR
-# ============================================================
+# -- LM34 CJC Temperature Sensor ------------------------------
 
 class TestLM34VoltageToCelsius:
-    """
-    LM34 outputs 10 mV per °F, 0 V = 0 °F.
-    Room temperature (77 °F = 25 °C) => 0.770 V.
-    """
+    """LM34 sensor output conversions (10 mV/°F, 0 V = 0 °F)."""
 
     def test_room_temperature(self):
         # 77 °F = 25 °C; LM34 outputs 10 mV/°F -> 770 mV = 0.770 V
@@ -125,17 +111,10 @@ class TestLM34VoltageToCelsius:
         assert abs(t2 - 37.78) < 0.1
 
 
-# ============================================================
-# SOFTWARE SEEBECK (CJC + Type-K)
-# ============================================================
+# -- Cold Junction Compensation (Seebeck) ---------------------
 
 class TestSoftwareSeebeck:
-    """
-    With a CJC of 25 °C and a differential voltage that corresponds to
-    25 °C worth of EMF, the total should indicate ~50 °C.
-
-    At 0 V differential and 0 °C CJC, the hot junction should read 0 °C.
-    """
+    """CJC offset and differential TC math integrations."""
 
     def test_zero_differential_zero_cjc_gives_zero(self):
         result = software_seebeck_type_k(0.0, 0.0)
@@ -143,7 +122,7 @@ class TestSoftwareSeebeck:
 
     def test_cjc_offset_adds_correctly(self):
         # With 0 V differential and 25 °C CJC, hot junction = CJC temp
-        # because the TC adds nothing
+        # b/c the TC adds nothing
         result = software_seebeck_type_k(0.0, 25.0)
         # 25 °C * 40.7 µV/°C = 1017.5 µV -> type_k_uv_to_celsius(1017.5) ≈ 25.3 °C
         assert abs(result - 25.3) < 0.5, f"Expected ~25 °C, got {result}"
@@ -174,11 +153,11 @@ class TestSoftwareSeebeck:
         )
 
 
-# ============================================================
-# PRESSURE TRANSDUCER
-# ============================================================
+# -- Pressure Transducers -------------------------------------
 
 class TestPTConversion:
+    """Linear pressure transducer calibrations."""
+
     def test_default_calibration_midpoint(self):
         # slope=252, intercept=-119.5 -> at 0.5 V: 252*0.5 - 119.5 = 6.5 psi
         result = pt_voltage_to_psi(0.5, slope=252.0, intercept=-119.5)
@@ -195,9 +174,7 @@ class TestPTConversion:
         assert abs((r2 - r1) - s) < 1e-6, "Delta should equal slope"
 
 
-# ============================================================
-# LOAD CELL
-# ============================================================
+# -- Load Cells -----------------------------------------------
 
 class TestLoadCellConversion:
     def test_basic_conversion(self):
@@ -218,15 +195,13 @@ class TestLoadCellConversion:
         assert abs(result) < 1e-9
 
 
-# ============================================================
-# LOX DENSITY TABLE
-# ============================================================
+# -- LOX Saturation Density Lookup Table ----------------------
 
 class TestLOXDensityTable:
 
     @pytest.fixture(autouse=True)
     def minimal_table(self, tmp_path):
-        """Linear ramp 100–200 R, 71–61 lbm/ft³."""
+        """Linear ramp 100-200 R, 71-61 lbm/ft³."""
         rows = [(100.0 + i * 10.0, 71.0 - i * 1.0) for i in range(11)]
         path = _write_lox_table(rows)
         load_lox_table(path)
@@ -272,24 +247,13 @@ class TestLOXDensityTable:
         assert abs(result - 66.5) < 0.05
 
 
-# ============================================================
-# LOX MASS FLOW RATE
-# ============================================================
+# -- LOX Mass Flow Rate ---------------------------------------
 
 class TestLOXMassFlowRate:
-    """
-    Cross-validated against the GoonDAQ lox_mdot() function.
-    Reference: lox_mdot(toi_c=-160, poi_psi=250, pc_psi=150)
-    """
 
     @pytest.fixture(autouse=True)
     def real_table(self):
-        """
-        Use a synthetic table that mimics the real LOX range.
-        Real LOX at -160 °C -> T_R = ((-160 + 273.15) * 9/5) = 203.67 R
-        Density at -160 °C: approximately 68 lbm/ft³ (near saturation).
-        """
-        # Span table across 180–240 R to cover -160 °C (≈203.67 R)
+        # Span table across 180-240 R to cover -160 °C (≈203.67 R)
         rows = [(180.0 + i * 5.0, 70.0 - i * 0.2) for i in range(13)]
         path = _write_lox_table(rows)
         load_lox_table(path)
@@ -316,7 +280,6 @@ class TestLOXMassFlowRate:
         assert hi > lo
 
     def test_sqrt_scaling(self):
-        """Mass flow ∝ sqrt(ΔP). Quadrupling ΔP should double the flow."""
         base = lox_mass_flow_rate(-160.0, poi_psi=250.0, pc_psi=150.0)  # ΔP=100
         quad = lox_mass_flow_rate(-160.0, poi_psi=550.0, pc_psi=150.0)  # ΔP=400
         assert base is not None and quad is not None
@@ -343,9 +306,7 @@ class TestLOXMassFlowRate:
         assert abs(result - expected) < 1e-9
 
 
-# ============================================================
-# FUEL MASS FLOW RATE
-# ============================================================
+# -- Fuel Mass Flow Rate --------------------------------------
 
 class TestFuelMassFlowRate:
 
@@ -383,10 +344,7 @@ class TestFuelMassFlowRate:
         assert abs(result - expected) < 1e-9
 
 
-# ============================================================
-# MIXTURE RATIO
-# ============================================================
-
+# -- Oxidizer / Fuel Mixture Ratio ----------------------------
 class TestMixtureRatio:
 
     def test_basic_ratio(self):
@@ -411,9 +369,7 @@ class TestMixtureRatio:
         assert mixture_ratio(None, None) is None
 
 
-# ============================================================
-# TOTAL IMPULSE — LOAD CELL METHOD
-# ============================================================
+# -- Total Impulse (Load Cell Method) -------------------------
 
 class TestImpulseLoadCell:
 
@@ -439,9 +395,7 @@ class TestImpulseLoadCell:
         assert result == 0.0
 
 
-# ============================================================
-# TOTAL IMPULSE — FLOW RATE ESTIMATE METHOD
-# ============================================================
+# -- Total Impulse (Mass Flow Method) -------------------------
 
 class TestImpulseEstimate:
 
@@ -478,9 +432,7 @@ class TestImpulseEstimate:
         assert hi > lo
 
 
-# ============================================================
-# LOX SATURATION PRESSURE (Antoine)
-# ============================================================
+# -- LOX Saturation Pressure (Antoine Fit) --------------------
 
 class TestLOXSaturationPressure:
 
@@ -513,9 +465,7 @@ class TestLOXSaturationPressure:
         assert p_warm > p_cold
 
 
-# ============================================================
-# LOX BELOW SATURATION CHECK  (SR 3.2.9.2)
-# ============================================================
+# -- LOX Saturation Alert Checking ----------------------------
 
 class TestLOXBelowSaturation:
 
