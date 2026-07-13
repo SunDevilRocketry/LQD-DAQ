@@ -8,17 +8,26 @@ cd /d "%~dp0"
 echo === Liquids DAQ - Install ===
 
 REM --- Python check ---
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: python not found. Install Python 3.10+ and add to PATH.
+REM Prefer 'python' if it resolves; some installs (esp. the official
+REM python.org installer) only register the 'py' launcher on PATH instead.
+set "PYEXE="
+python --version >nul 2>&1 && set "PYEXE=python"
+if not defined PYEXE (
+    py -3 --version >nul 2>&1 && set "PYEXE=py -3"
+)
+if not defined PYEXE (
+    echo ERROR: no Python interpreter found ^(tried 'python' and 'py -3'^).
+    echo Install Python 3.10+ from https://www.python.org/downloads/
+    echo and make sure to check "Add python.exe to PATH" during setup.
     pause
     exit /b 1
 )
+echo [INFO] Using interpreter: %PYEXE%
 
 REM --- Virtual environment ---
 if not exist ".venv\" (
     echo Creating virtual environment...
-    python -m venv .venv
+    %PYEXE% -m venv .venv
 )
 
 call .venv\Scripts\activate.bat

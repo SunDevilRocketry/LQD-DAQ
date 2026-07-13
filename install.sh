@@ -7,18 +7,28 @@ set -e
 echo "=== Liquids DAQ — Install ==="
 
 # --- Python check ---
-if ! command -v python3 &>/dev/null; then
-    echo "ERROR: python3 not found. Install Python 3.10+ and re-run."
+# Prefer python3 (the correct convention on macOS/Linux); fall back to
+# bare 'python' for systems where only that name is on PATH.
+PYEXE=""
+if command -v python3 &>/dev/null; then
+    PYEXE="python3"
+elif command -v python &>/dev/null; then
+    PYEXE="python"
+fi
+
+if [ -z "$PYEXE" ]; then
+    echo "ERROR: no Python interpreter found (tried 'python3' and 'python')."
+    echo "Install Python 3.10+ and re-run."
     exit 1
 fi
 
-PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-echo "Python $PY_VERSION found."
+PY_VERSION=$("$PYEXE" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+echo "Python $PY_VERSION found ($PYEXE)."
 
 # --- Virtual environment ---
 if [ ! -d ".venv" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv .venv
+    "$PYEXE" -m venv .venv
 fi
 
 source .venv/bin/activate

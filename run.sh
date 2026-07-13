@@ -14,11 +14,24 @@ if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
 fi
 
+# Resolve a working interpreter. If the venv is active, 'python' inside it
+# takes priority automatically since it's first on PATH after activation.
+PYEXE=""
+if command -v python3 &>/dev/null; then
+    PYEXE="python3"
+elif command -v python &>/dev/null; then
+    PYEXE="python"
+else
+    echo "ERROR: no Python interpreter found (tried 'python3' and 'python')."
+    echo "Run 'bash install.sh' first, or install Python 3.10+."
+    exit 1
+fi
+
 if [ "$1" = "--test" ]; then
     echo "=== Running test suite ==="
-    python -m pytest tests/ -v
+    "$PYEXE" -m pytest tests/ -v
     exit $?
 fi
 
 echo "=== Liquids DAQ ==="
-python -m daq "$@"
+"$PYEXE" -m daq "$@"
