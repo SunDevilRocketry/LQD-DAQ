@@ -132,6 +132,10 @@ class Engine:
         logger=None,
         thresholds:   Optional[dict] = None,
     ) -> None:
+        self._lock = threading.RLock()
+        self._event_log: deque[str] = deque(maxlen=500)  # Rolling debug log console (SR 3.5)
+        self._snapshot = EngineState()
+
         self._device        = Device()
         self._logger        = logger
         self._sequence_dir  = sequence_dir
@@ -145,9 +149,6 @@ class Engine:
 
         # Tare offsets for load cells (set by caller via tare())
         self._lc_tare: dict[str, float] = {"LC_1": 0.0, "LC_2": 0.0}
-
-        self._lock = threading.RLock()
-        self._snapshot = EngineState()
 
         # CJC polling state (thermocouple cold junction reference)
         self._cjc_celsius: float = 25.0
@@ -168,9 +169,6 @@ class Engine:
         # Hardware streaming thread state
         self._stream_thread: Optional[threading.Thread] = None
         self._running = False
-
-        # Rolling debug log console (SR 3.5)
-        self._event_log: deque[str] = deque(maxlen=500)
 
     # --------------------------------------------------------
     # Public API (thread-safe)
@@ -269,13 +267,9 @@ class Engine:
 
     def fire(self) -> None:
         """Spawns the fire autosequence thread if the system is idle."""
-        with self._lock:
-            if self._sequence_active:
-                self._log("Fire command ignored: autosequence already active")
-                return
-
         seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        self._start_sequence("fire", seq_path, is_fire=True)
+        if not self._start_sequence("fire", seq_path, is_fire=True):
+            self._log("Fire command ignored: autosequence already active")
 
     def abort(self) -> None:
         """
@@ -287,14 +281,31 @@ class Engine:
         self._abort_flag.set()
 
         # Wait for the running sequence thread to notice the flag and exit.
-        if self._sequence_thread and self._sequence_thread.is_alive():
-            self._sequence_thread.join(timeout=0.5)
+        old_thread = self._sequence_thread
+        if old_thread and old_thread.is_alive():
+            old_thread.join(timeout=0.5)
+            if old_thread.is_alive():
+                # It didn't exit in time (don't clear flag yet)
+		# Give it a bit longer.
+                self._log(
+                    f"WARNING: '{old_thread.name}' did not exit within 0.5s "
+                    f"of abort - waiting longer before starting abort.yaml"
+                )
+                old_thread.join(timeout=2.0)
+                if old_thread.is_alive():
+                    self._log(
+                        f"WARNING: '{old_thread.name}' still alive after 2.5s "
+                        f"total - force-starting abort sequence anyway. "
+                        f"Actuator states may be contested by both threads."
+                    )
 
         self._abort_flag.clear()
 
         seq_path = os.path.join(self._sequence_dir, "abort.yaml")
         if os.path.exists(seq_path):
-            self._start_sequence("abort", seq_path, is_fire=False)
+            # force=True: abort must always be able to preempt, even if the
+            # previous sequence thread is (unexpectedly) still marked alive.
+            self._start_sequence("abort", seq_path, is_fire=False, force=True)
         else:
             self._device.all_safe()
             self._log("ABORT: no abort.yaml found, hardware -> all safe")
@@ -387,7 +398,14 @@ class Engine:
                         pass
                     self._last_cjc_read = now
 
-                self._process_batch(batch)
+                try:
+                    self._process_batch(batch)
+                except Exception as exc:
+                    self._log(
+                        f"Batch processing error (scan dropped, stream continues): "
+                        f"{exc}\n{traceback.format_exc()}"
+                    )
+                    continue
 
         except Exception as exc:
             self._log(f"Stream loop fatal: {exc}\n{traceback.format_exc()}")
@@ -574,15 +592,35 @@ class Engine:
     # Sequence control
     # --------------------------------------------------------
 
-    def _start_sequence(self, name: str, path: str, is_fire: bool) -> None:
-        """Spawns a new background thread to execute an autosequence."""
-        if self._sequence_thread and self._sequence_thread.is_alive():
-            self._log(
-                f"WARNING: starting '{name}' sequence while previous thread "
-                f"'{self._sequence_thread.name}' is still alive."
-            )
+    def _start_sequence(
+        self, name: str, path: str, is_fire: bool, force: bool = False
+    ) -> bool:
+        """
+        Spawns a new background thread to execute an autosequence.
 
+        Args:
+            force: If True, starts even if a sequence thread object is still
+                   marked alive (used by abort(), which must always be able
+                   to preempt). If False (default), refuses to start a second
+                   sequence on top of a live one - callers should check the
+                   return value rather than assuming success.
+
+        Returns:
+            True if the sequence thread was started, False if refused
+            because another sequence is already active.
+        """
         with self._lock:
+            thread_alive = (
+                self._sequence_thread is not None
+                and self._sequence_thread.is_alive()
+            )
+            if thread_alive and not force:
+                return False
+            if thread_alive:
+                self._log(
+                    f"WARNING: force-starting '{name}' while previous thread "
+                    f"'{self._sequence_thread.name}' is still alive."
+                )
             self._sequence_active = True
             self._sequence_name   = name
 
@@ -594,6 +632,7 @@ class Engine:
             daemon=True,
         )
         self._sequence_thread.start()
+        return True
 
     def _run_sequence(self, name: str, path: str, is_fire: bool) -> None:
         """Executes a YAML-defined autosequence step-by-step."""
