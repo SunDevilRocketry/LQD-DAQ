@@ -7,16 +7,18 @@ Functions:
     type_k_uv_to_celsius()          - Type-K thermocouple conversion
     lm34_voltage_to_celsius()       - LM34 temperature sensor
     software_seebeck_type_k()       - Cold junction compensation
-    pt_voltage_to_psi()             - Pressure transducer linear cal
+    psi_to_pa() / pa_to_psi()       - SI <-> psi conversion helpers
+    pt_voltage_to_psi()             - Pressure transducer linear cal (psi, calibration domain)
+    pt_voltage_to_pa()              - Pressure transducer linear cal (Pa, internal/SI)
     load_cell_voltage_to_force()    - Load cell with tare offset
     lox_density_from_celsius()      - LOX saturation density lookup
-    lox_mass_flow_rate()            - LOX injector mass flow
-    fuel_mass_flow_rate()           - Fuel injector mass flow
+    lox_mass_flow_rate()            - LOX injector mass flow (Pa inputs)
+    fuel_mass_flow_rate()           - Fuel injector mass flow (Pa inputs)
     mixture_ratio()                 - Oxidizer/fuel ratio
     impulse_step_load_cell()        - Total impulse from load cells
     impulse_step_estimate()         - Total impulse estimate
-    lox_saturation_pressure_psia()  - LOX vapor pressure (Antoine)
-    lox_below_saturation()          - Boiling alert check
+    lox_saturation_pressure_pa()    - LOX vapor pressure (Antoine, Pa)
+    lox_below_saturation()          - Boiling alert check (Pa inputs)
 
 References:
   - NIST Monograph 175, Table 10.5 (Type-K TC)
@@ -126,6 +128,18 @@ def software_seebeck_type_k(diff_volts: float, cjc_celsius: float) -> float:
     total_uv = diff_volts * 1e6 + cjc_uv               # Total EMF in µV
     return type_k_uv_to_celsius(total_uv)
 
+PSI_TO_PA = 6894.757293168361   # NIST-exact: 1 psi = 6894.757293168361 Pa
+
+
+def psi_to_pa(psi: float) -> float:
+    """Convert psi to pascals (SI)."""
+    return psi * PSI_TO_PA
+
+
+def pa_to_psi(pa: float) -> float:
+    """Convert pascals to psi. Display-layer helper only"""
+    return pa / PSI_TO_PA
+
 
 # -- LINEAR CALIBRATION (PTs and Load Cells) ------------------
 # Standard scaling: output = slope * voltage + intercept
@@ -143,6 +157,21 @@ def pt_voltage_to_psi(voltage_v: float, slope: float, intercept: float) -> float
         Pressure in psi.
     """
     return slope * voltage_v + intercept
+
+
+def pt_voltage_to_pa(voltage_v: float, slope: float, intercept: float) -> float:
+    """
+    Convert a raw PT voltage directly to pascals (SI)
+
+    Args:
+        voltage_v:  Raw voltage in volts.
+        slope:      Calibration slope in psi/V (calibration domain).
+        intercept:  Calibration intercept in psi (calibration domain).
+
+    Returns:
+        Pressure in Pa.
+    """
+    return psi_to_pa(pt_voltage_to_psi(voltage_v, slope, intercept))
 
 
 def load_cell_voltage_to_force(
@@ -256,22 +285,22 @@ _LOX_A_M2 = _LOX_A_IN2 * 6.4516e-4
 
 def lox_mass_flow_rate(
     toi_celsius: float,
-    poi_psi: float,
-    pc_psi: float,
+    poi_pa: float,
+    pc_pa: float,
 ) -> Optional[float]:
     """
     Calculate LOX mass flow rate through the injector orifice.
 
     Args:
         toi_celsius:    LOX inlet temperature in °C.
-        poi_psi:        LOX inlet pressure in psi.
-        pc_psi:         Chamber pressure in psi.
+        poi_pa:         LOX inlet pressure in Pa.
+        pc_pa:          Chamber pressure in Pa.
 
     Returns:
         Mass flow rate in kg/s, or None if:
             - The LOX density table is not loaded.
             - toi_celsius is outside the table's valid range.
-            - The differential pressure (poi_psi - pc_psi) is <= 0.
+            - The differential pressure (poi_pa - pc_pa) is <= 0.
 
     Source:
         Sutton, "Rocket Propulsion Elements", Eq. 6.15
@@ -280,12 +309,11 @@ def lox_mass_flow_rate(
     if rho_lbm_ft3 is None:
         return None
 
-    dp_psi = poi_psi - pc_psi
-    if dp_psi <= 0.0:
+    dp_pa = poi_pa - pc_pa
+    if dp_pa <= 0.0:
         return None
 
-    rho_kg_m3 = rho_lbm_ft3 * 16.0185          
-    dp_pa = dp_psi * 6894.76                    
+    rho_kg_m3 = rho_lbm_ft3 * 16.0185
 
     return _LOX_Cd * _LOX_A_M2 * math.sqrt(2.0 * rho_kg_m3 * dp_pa)
 
@@ -299,13 +327,13 @@ _FUEL_A_M2 = _FUEL_A_IN2 * 6.4516e-4
 _FUEL_RHO_KG_M3 = 800.0
 
 
-def fuel_mass_flow_rate(pfo_psi: float, pc_psi: float) -> Optional[float]:
+def fuel_mass_flow_rate(pfo_pa: float, pc_pa: float) -> Optional[float]:
     """
     Calculate fuel (IPA) mass flow rate through the injector orifice.
 
     Args:
-        pfo_psi:    Fuel channel outlet pressure in psi.
-        pc_psi:     Chamber pressure in psi.
+        pfo_pa:     Fuel channel outlet pressure in Pa.
+        pc_pa:      Chamber pressure in Pa.
 
     Returns:
         Mass flow rate in kg/s, or None if the differential pressure is <= 0.
@@ -313,11 +341,9 @@ def fuel_mass_flow_rate(pfo_psi: float, pc_psi: float) -> Optional[float]:
     Source:
         Sutton, "Rocket Propulsion Elements", Eq. 6.15
     """
-    dp_psi = pfo_psi - pc_psi
-    if dp_psi <= 0.0:
+    dp_pa = pfo_pa - pc_pa
+    if dp_pa <= 0.0:
         return None
-
-    dp_pa = dp_psi * 6894.76
 
     return _FUEL_Cd * _FUEL_A_M2 * math.sqrt(2.0 * _FUEL_RHO_KG_M3 * dp_pa)
 
@@ -417,7 +443,10 @@ _ANTOINE_B = 340.024
 _ANTOINE_C = -4.144
 
 
-def lox_saturation_pressure_psia(temp_celsius: float) -> Optional[float]:
+_BAR_TO_PA = 100_000.0   # 1 bar = 100,000 Pa
+
+
+def lox_saturation_pressure_pa(temp_celsius: float) -> Optional[float]:
     """
     Estimate LOX saturation pressure using the Antoine equation.
 
@@ -425,7 +454,8 @@ def lox_saturation_pressure_psia(temp_celsius: float) -> Optional[float]:
         temp_celsius: LOX temperature in degrees Celsius.
 
     Returns:
-        Saturation pressure in psia, or None if temperature is out of range.
+        Saturation pressure in Pa (absolute), or None if temperature is
+        out of range.
 
     Source:
         NIST SRD 69, Oxygen Antoine Equation Constants
@@ -437,21 +467,20 @@ def lox_saturation_pressure_psia(temp_celsius: float) -> Optional[float]:
 
     log_p_bar = _ANTOINE_A - _ANTOINE_B / (temp_k + _ANTOINE_C)
     p_bar = 10.0 ** log_p_bar
-    p_psia = p_bar * 14.5038
 
-    return p_psia
+    return p_bar * _BAR_TO_PA
 
 
 def lox_below_saturation(
-    tank_pressure_psia: float,
+    tank_pressure_pa: float,
     toi_celsius: float,
 ) -> Optional[bool]:
     """
     Check whether the LOX tank pressure is below the saturation pressure.
 
     Args:
-        tank_pressure_psia: Measured LOX tank pressure in psia (from POT).
-        toi_celsius:        LOX inlet temperature in °C (from TOI).
+        tank_pressure_pa: Measured LOX tank pressure in Pa, absolute (from POT).
+        toi_celsius:       LOX inlet temperature in °C (from TOI).
 
     Returns:
         True:   tank pressure is below saturation.
@@ -461,7 +490,7 @@ def lox_below_saturation(
     Source:
         System Requirement 3.2.9.2 (Saturation Pressure Alert)
     """
-    p_sat = lox_saturation_pressure_psia(toi_celsius)
+    p_sat = lox_saturation_pressure_pa(toi_celsius)
     if p_sat is None:
         return None
-    return tank_pressure_psia < p_sat
+    return tank_pressure_pa < p_sat

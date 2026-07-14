@@ -31,7 +31,7 @@ stream:
 #   - Outside [warning]: Orange (interlock hazard; triggers abort flag)
 #
 thresholds:
-  # Pressures (psig)
+  # Pressures (psi, gauge)
   POT:
     normal:  [200, 350]
     warning: [150, 400]

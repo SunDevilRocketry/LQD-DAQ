@@ -29,6 +29,7 @@ from fastapi.testclient import TestClient
 from daq.hardware.mock import MockLabJack
 from daq.engine import Engine
 from daq.logger import Logger
+from daq.calculations import psi_to_pa
 import daq.api as api_module
 from daq.api import app
 
@@ -188,9 +189,9 @@ class TestEngine:
 
     def test_snapshot_pressures_in_engineering_range(self):
         snap = self.engine.snapshot
-        # Default mock + default cal → should be 100–400 psi range
-        assert 50 < snap.PC  < 500, f"PC={snap.PC}"
-        assert 50 < snap.POT < 500, f"POT={snap.POT}"
+        # Default mock + default cal -> should be roughly 100-400 psi equivalent.
+        assert psi_to_pa(50) < snap.PC  < psi_to_pa(500), f"PC={snap.PC}"
+        assert psi_to_pa(50) < snap.POT < psi_to_pa(500), f"POT={snap.POT}"
 
     def test_snapshot_has_tc_values(self):
         snap = self.engine.snapshot
@@ -293,6 +294,231 @@ class TestEngine:
         # Recreate so teardown doesn't fail
         self.engine = _make_engine(tmp_path=".")
         self.engine.start()
+
+
+# -- Reconnection After Comms Loss -----------------------------
+
+class TestEngineReconnect:
+    """
+    Covers the reconnect-on-repeated-failure behavior added to
+    Engine._stream_loop (mitigates FC.NLFS.LJ.2 / FC.NLFS.LQDDAQ.1):
+    after _MAX_CONSECUTIVE_READ_ERRORS consecutive stream_read() failures,
+    the engine should cycle close()/open()/start_stream() and resume
+    streaming rather than silently dying.
+    """
+
+    def test_reconnects_after_repeated_read_failures(self):
+        engine = _make_engine(tmp_path=".")
+        engine.start()
+        time.sleep(0.3)
+        assert engine.snapshot.streaming is True, "Engine never started streaming"
+
+        device = engine._device
+        original_stream_read  = device.stream_read
+        original_open         = device.open
+        original_start_stream = device.start_stream
+
+        state = {"fail_count": 0, "reopened": False, "restarted": False}
+
+        def flaky_stream_read():
+            if state["fail_count"] < 3:
+                state["fail_count"] += 1
+                raise RuntimeError("simulated comms loss")
+            return original_stream_read()
+
+        def tracking_open():
+            state["reopened"] = True
+            return original_open()
+
+        def tracking_start_stream():
+            state["restarted"] = True
+            return original_start_stream()
+
+        device.stream_read  = flaky_stream_read
+        device.open         = tracking_open
+        device.start_stream = tracking_start_stream
+
+        # Give the engine time to notice the failures, reconnect (with its
+        # backoff sleep), and resume streaming.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if state["reopened"] and state["restarted"] and engine.snapshot.streaming:
+                break
+            time.sleep(0.2)
+
+        assert state["reopened"], "Engine never called device.open() to reconnect"
+        assert state["restarted"], "Engine never called device.start_stream() to resume"
+        assert engine.snapshot.streaming is True, (
+            "Engine did not resume streaming after reconnect"
+        )
+
+        engine.stop()
+
+    def test_stream_flag_goes_false_during_outage(self):
+        """streaming should flip False as soon as reads start failing, not
+        stay stale True while the connection is actually down."""
+        engine = _make_engine(tmp_path=".")
+        engine.start()
+        time.sleep(0.3)
+
+        device = engine._device
+
+        def always_fail():
+            raise RuntimeError("simulated comms loss")
+
+        device.stream_read = always_fail
+
+        deadline = time.time() + 2.0
+        saw_false = False
+        while time.time() < deadline:
+            if engine.snapshot.streaming is False:
+                saw_false = True
+                break
+            time.sleep(0.05)
+
+        assert saw_false, "streaming flag never went False during the outage"
+        engine.stop()
+
+
+# -- Threshold Config Conversion (psi input -> Pa internal) -----
+
+class TestThresholdConversion:
+    """
+    config.yaml is authored in psi for pressure tags (matches
+    calibration.json's convention); Engine.thresholds should expose Pa
+    so it's unit-consistent with /snapshot. Non-pressure entries pass
+    through untouched.
+    """
+
+    def test_pressure_tag_converted_to_pa(self):
+        raw = {"PC": {"normal": [100, 250], "warning": [50, 300]}}
+        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
+        pc = engine.thresholds["PC"]
+        assert abs(pc["normal"][0]  - psi_to_pa(100)) < 1e-6
+        assert abs(pc["normal"][1]  - psi_to_pa(250)) < 1e-6
+        assert abs(pc["warning"][0] - psi_to_pa(50))  < 1e-6
+        assert abs(pc["warning"][1] - psi_to_pa(300)) < 1e-6
+
+    def test_all_eight_pressure_tags_convert(self):
+        raw = {
+            tag: {"normal": [10, 20], "warning": [5, 25]}
+            for tag in ["POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP"]
+        }
+        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
+        for tag in raw:
+            assert abs(engine.thresholds[tag]["normal"][0] - psi_to_pa(10)) < 1e-6
+
+    def test_temperature_tag_passthrough(self):
+        raw = {"TOI": {"normal": [-200, -140], "warning": [-210, -130]}}
+        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
+        assert engine.thresholds["TOI"] == raw["TOI"], "Temp thresholds should not be converted"
+
+    def test_load_cell_tag_passthrough(self):
+        raw = {"LC_1": {"normal": [0, 800], "warning": [-50, 900]}}
+        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
+        assert engine.thresholds["LC_1"] == raw["LC_1"], "Load cell thresholds (lbf) should not be converted"
+
+    def test_derived_channel_tag_passthrough(self):
+        raw = {"mixture_ratio": {"normal": [1.8, 3.0], "warning": [1.2, 3.5]}}
+        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
+        assert engine.thresholds["mixture_ratio"] == raw["mixture_ratio"]
+
+    def test_empty_thresholds_ok(self):
+        engine = Engine(cal_path=None, sequence_dir=".", thresholds=None)
+        assert engine.thresholds == {}
+
+
+# -- Data Freshness (FC.NLFS.LQDDAQ.1) --------------------------
+
+class TestDataFreshness:
+    """Engine-level stale-data detection."""
+
+    def test_fresh_engine_reports_not_stale(self):
+        engine = _make_engine(tmp_path=".")
+        engine.start()
+        time.sleep(0.3)
+        assert engine.is_data_stale is False
+        assert engine.data_age_seconds < 1.0
+        engine.stop()
+
+    def test_never_streamed_engine_is_infinitely_stale(self):
+        engine = _make_engine(tmp_path=".")
+        # Before start(), no batch has ever landed - definitionally stale.
+        assert engine.data_age_seconds == float("inf")
+        assert engine.is_data_stale is True
+
+    def test_data_age_grows_during_outage(self):
+        engine = _make_engine(tmp_path=".")
+        engine.start()
+        time.sleep(0.3)
+
+        device = engine._device
+
+        def always_fail():
+            raise RuntimeError("simulated comms loss")
+
+        device.stream_read = always_fail
+
+        time.sleep(1.3)   # > _DATA_STALE_THRESHOLD_S (1.0s)
+        assert engine.is_data_stale is True
+        assert engine.data_age_seconds > 1.0
+        engine.stop()
+
+
+class TestDataFreshnessAPI:
+    """API-level stale-data behavior: soft signal on /status, hard 500 on /snapshot."""
+
+    def test_status_has_freshness_fields_when_fresh(self, api_client):
+        r = api_client.get("/status")
+        assert r.status_code == 200
+        data = r.json()
+        assert "stale" in data
+        assert "data_age_s" in data
+        assert data["stale"] is False
+
+    def test_snapshot_has_data_age_when_fresh(self, api_client):
+        r = api_client.get("/snapshot")
+        assert r.status_code == 200
+        assert "data_age_s" in r.json()
+
+    def test_snapshot_returns_500_when_stale(self):
+        """Uses its own engine/client (not the shared api_client fixture)
+        so breaking the device doesn't affect other API tests. api.py's
+        _engine/_logger are module-level singletons shared with whatever
+        else is using `app` (e.g. the api_client fixture), so we must
+        save and restore them - otherwise this test leaves a dead engine
+        wired into the global app for every test that runs after it."""
+        prev_engine, prev_logger = api_module._engine, api_module._logger
+
+        engine = _make_engine(tmp_path=".")
+        logger = Logger(output_dir=tempfile.mkdtemp())
+        logger.open()
+        engine.start()
+        api_module.set_engine(engine, logger)
+        time.sleep(0.3)
+
+        try:
+            device = engine._device
+
+            def always_fail():
+                raise RuntimeError("simulated comms loss")
+
+            device.stream_read = always_fail
+            time.sleep(1.3)   # > _DATA_STALE_THRESHOLD_S (1.0s)
+
+            client = TestClient(app)
+
+            r_snap = client.get("/snapshot")
+            assert r_snap.status_code == 500
+
+            # /status must still succeed and report the staleness, never error.
+            r_status = client.get("/status")
+            assert r_status.status_code == 200
+            assert r_status.json()["stale"] is True
+        finally:
+            engine.stop()
+            logger.close()
+            api_module.set_engine(prev_engine, prev_logger)
 
 
 # -- Queue File I/O Integration -------------------------------

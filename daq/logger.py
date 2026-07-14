@@ -262,9 +262,15 @@ class Logger:
         tc_tags = ["TOI", "TFI", "TFO"]
         lc_tags = ["LC_1", "LC_2"]
 
-        for tag in pt_tags + tc_tags + lc_tags:
+        for tag in pt_tags:
             cols.append(f"{tag}_raw_V")
-            cols.append(f"{tag}_eng")
+            cols.append(f"{tag}_eng_Pa")
+        for tag in tc_tags:
+            cols.append(f"{tag}_raw_V")
+            cols.append(f"{tag}_eng_C")
+        for tag in lc_tags:
+            cols.append(f"{tag}_raw_V")
+            cols.append(f"{tag}_eng_lbf")
 
         cols.append("impulse_ns")
         cols.append("lox_mdot_kg_s")

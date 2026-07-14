@@ -22,7 +22,11 @@ from daq.calculations import (
     type_k_uv_to_celsius,
     lm34_voltage_to_celsius,
     software_seebeck_type_k,
+    psi_to_pa,
+    pa_to_psi,
+    PSI_TO_PA,
     pt_voltage_to_psi,
+    pt_voltage_to_pa,
     load_cell_voltage_to_force,
     load_lox_table,
     lox_density_from_celsius,
@@ -31,7 +35,7 @@ from daq.calculations import (
     mixture_ratio,
     impulse_step_load_cell,
     impulse_step_estimate,
-    lox_saturation_pressure_psia,
+    lox_saturation_pressure_pa,
     lox_below_saturation,
 )
 
@@ -153,10 +157,31 @@ class TestSoftwareSeebeck:
         )
 
 
+# -- SI Unit Conversion Helpers --------------------------------
+
+class TestUnitConversion:
+    """psi <-> Pa conversion (team convention: internal SI, Jul 2026)."""
+
+    def test_one_psi_in_pa(self):
+        assert abs(psi_to_pa(1.0) - 6894.757293168361) < 1e-6
+
+    def test_round_trip(self):
+        assert abs(pa_to_psi(psi_to_pa(37.2)) - 37.2) < 1e-9
+
+    def test_zero(self):
+        assert psi_to_pa(0.0) == 0.0
+        assert pa_to_psi(0.0) == 0.0
+
+    def test_one_atmosphere_sanity_check(self):
+        # 14.696 psia is ~1 standard atmosphere (101325 Pa) - a good
+        # sanity check that the conversion factor is right.
+        assert abs(psi_to_pa(14.696) - 101325.0) < 1.0
+
+
 # -- Pressure Transducers -------------------------------------
 
 class TestPTConversion:
-    """Linear pressure transducer calibrations."""
+    """Linear pressure transducer calibrations (raw psi calibration)."""
 
     def test_default_calibration_midpoint(self):
         # slope=252, intercept=-119.5 -> at 0.5 V: 252*0.5 - 119.5 = 6.5 psi
@@ -172,6 +197,26 @@ class TestPTConversion:
         r1 = pt_voltage_to_psi(1.0, s, i)
         r2 = pt_voltage_to_psi(2.0, s, i)
         assert abs((r2 - r1) - s) < 1e-6, "Delta should equal slope"
+
+
+class TestPTConversionPa:
+    """Pa-native PT conversion"""
+
+    def test_matches_psi_conversion_times_factor(self):
+        v, s, i = 0.5, 252.0, -119.5
+        psi_result = pt_voltage_to_psi(v, s, i)
+        pa_result  = pt_voltage_to_pa(v, s, i)
+        assert abs(pa_result - psi_result * PSI_TO_PA) < 1e-6
+
+    def test_zero_volts(self):
+        result = pt_voltage_to_pa(0.0, slope=252.0, intercept=-119.5)
+        assert abs(result - psi_to_pa(-119.5)) < 1e-6
+
+    def test_linearity(self):
+        s, i = 128.0, -62.8
+        r1 = pt_voltage_to_pa(1.0, s, i)
+        r2 = pt_voltage_to_pa(2.0, s, i)
+        assert abs((r2 - r1) - psi_to_pa(s)) < 1e-6, "Delta should equal slope in Pa"
 
 
 # -- Load Cells -----------------------------------------------
@@ -261,27 +306,27 @@ class TestLOXMassFlowRate:
         os.unlink(path)
 
     def test_returns_positive_value_for_valid_inputs(self):
-        result = lox_mass_flow_rate(-160.0, poi_psi=250.0, pc_psi=150.0)
+        result = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(250.0), pc_pa=psi_to_pa(150.0))
         assert result is not None
         assert result > 0.0
 
     def test_zero_dp_returns_none(self):
-        result = lox_mass_flow_rate(-160.0, poi_psi=200.0, pc_psi=200.0)
+        result = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(200.0), pc_pa=psi_to_pa(200.0))
         assert result is None
 
     def test_negative_dp_returns_none(self):
-        result = lox_mass_flow_rate(-160.0, poi_psi=150.0, pc_psi=200.0)
+        result = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(150.0), pc_pa=psi_to_pa(200.0))
         assert result is None
 
     def test_higher_dp_gives_higher_flow(self):
-        lo = lox_mass_flow_rate(-160.0, poi_psi=200.0, pc_psi=150.0)
-        hi = lox_mass_flow_rate(-160.0, poi_psi=300.0, pc_psi=150.0)
+        lo = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(200.0), pc_pa=psi_to_pa(150.0))
+        hi = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(300.0), pc_pa=psi_to_pa(150.0))
         assert lo is not None and hi is not None
         assert hi > lo
 
     def test_sqrt_scaling(self):
-        base = lox_mass_flow_rate(-160.0, poi_psi=250.0, pc_psi=150.0)  # ΔP=100
-        quad = lox_mass_flow_rate(-160.0, poi_psi=550.0, pc_psi=150.0)  # ΔP=400
+        base = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(250.0), pc_pa=psi_to_pa(150.0))  # ΔP=100 psi
+        quad = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(550.0), pc_pa=psi_to_pa(150.0))  # ΔP=400 psi
         assert base is not None and quad is not None
         ratio = quad / base
         assert abs(ratio - 2.0) < 0.01, f"Expected ratio ~2.0, got {ratio}"
@@ -291,19 +336,20 @@ class TestLOXMassFlowRate:
         Manually replicate the GoonDAQ lox_mdot() calculation and compare.
         Uses the density value our table returns, not a hardcoded constant.
         """
-        toi_c, poi_psi, pc_psi = -160.0, 250.0, 150.0
+        toi_c = -160.0
+        poi_pa, pc_pa = psi_to_pa(250.0), psi_to_pa(150.0)
         rho_lbm = lox_density_from_celsius(toi_c)
         assert rho_lbm is not None
 
         Cd = 0.6
         A_m2 = 0.02922466566 * 6.4516e-4
         rho_kg_m3 = rho_lbm * 16.0185
-        dp_pa = (poi_psi - pc_psi) * 6894.76
+        dp_pa = poi_pa - pc_pa
         expected = Cd * A_m2 * math.sqrt(2.0 * rho_kg_m3 * dp_pa)
 
-        result = lox_mass_flow_rate(toi_c, poi_psi, pc_psi)
+        result = lox_mass_flow_rate(toi_c, poi_pa, pc_pa)
         assert result is not None
-        assert abs(result - expected) < 1e-9
+        assert abs(result - expected) < 1e-6
 
 
 # -- Fuel Mass Flow Rate --------------------------------------
@@ -311,37 +357,37 @@ class TestLOXMassFlowRate:
 class TestFuelMassFlowRate:
 
     def test_returns_positive_for_valid_inputs(self):
-        result = fuel_mass_flow_rate(pfo_psi=200.0, pc_psi=150.0)
+        result = fuel_mass_flow_rate(pfo_pa=psi_to_pa(200.0), pc_pa=psi_to_pa(150.0))
         assert result is not None
         assert result > 0.0
 
     def test_zero_dp_returns_none(self):
-        result = fuel_mass_flow_rate(200.0, 200.0)
+        result = fuel_mass_flow_rate(psi_to_pa(200.0), psi_to_pa(200.0))
         assert result is None
 
     def test_negative_dp_returns_none(self):
-        result = fuel_mass_flow_rate(150.0, 200.0)
+        result = fuel_mass_flow_rate(psi_to_pa(150.0), psi_to_pa(200.0))
         assert result is None
 
     def test_sqrt_scaling(self):
         """Mass flow ∝ sqrt(ΔP). Quadrupling ΔP should double the flow."""
-        base = fuel_mass_flow_rate(250.0, 150.0)   # ΔP = 100
-        quad = fuel_mass_flow_rate(550.0, 150.0)   # ΔP = 400
+        base = fuel_mass_flow_rate(psi_to_pa(250.0), psi_to_pa(150.0))   # ΔP = 100 psi
+        quad = fuel_mass_flow_rate(psi_to_pa(550.0), psi_to_pa(150.0))   # ΔP = 400 psi
         assert base is not None and quad is not None
         ratio = quad / base
         assert abs(ratio - 2.0) < 0.01, f"Expected ratio ~2.0, got {ratio}"
 
     def test_matches_goondaq_formula(self):
-        pfo_psi, pc_psi = 200.0, 150.0
+        pfo_pa, pc_pa = psi_to_pa(200.0), psi_to_pa(150.0)
         Cd = 0.67
         A_m2 = 0.04526 * 6.4516e-4
         rho = 800.0
-        dp_pa = (pfo_psi - pc_psi) * 6894.76
+        dp_pa = pfo_pa - pc_pa
         expected = Cd * A_m2 * math.sqrt(2.0 * rho * dp_pa)
 
-        result = fuel_mass_flow_rate(pfo_psi, pc_psi)
+        result = fuel_mass_flow_rate(pfo_pa, pc_pa)
         assert result is not None
-        assert abs(result - expected) < 1e-9
+        assert abs(result - expected) < 1e-6
 
 
 # -- Oxidizer / Fuel Mixture Ratio ----------------------------
@@ -437,30 +483,30 @@ class TestImpulseEstimate:
 class TestLOXSaturationPressure:
 
     def test_normal_boiling_point(self):
-        # LOX normal boiling point: -183 °C, 1 atm = 14.696 psia.
+        # LOX normal boiling point: -183 °C, 1 atm = 101325 Pa.
         # The Antoine equation is a curve fit; error at NBP is ~1.6%.
         # Should result in reasonable range & correct direction
         # for saturation check
-        result = lox_saturation_pressure_psia(-183.0)
+        result = lox_saturation_pressure_pa(-183.0)
         assert result is not None
-        assert 13.0 < result < 16.5, (
-            f"At NBP expected ~14.5 psia (Antoine fit), got {result}"
+        assert psi_to_pa(13.0) < result < psi_to_pa(16.5), (
+            f"At NBP expected ~101325 Pa (Antoine fit), got {result}"
         )
 
     def test_above_valid_range_returns_none(self):
         # Above critical point (~-119 °C / 154 K)
-        result = lox_saturation_pressure_psia(-100.0)
+        result = lox_saturation_pressure_pa(-100.0)
         assert result is None
 
     def test_below_valid_range_returns_none(self):
         # Below triple point (~-219 °C / 54 K)
-        result = lox_saturation_pressure_psia(-220.0)
+        result = lox_saturation_pressure_pa(-220.0)
         assert result is None
 
     def test_higher_temp_gives_higher_pressure(self):
         # Saturation pressure increases with temperature
-        p_cold = lox_saturation_pressure_psia(-200.0)
-        p_warm = lox_saturation_pressure_psia(-185.0)
+        p_cold = lox_saturation_pressure_pa(-200.0)
+        p_warm = lox_saturation_pressure_pa(-185.0)
         assert p_cold is not None and p_warm is not None
         assert p_warm > p_cold
 
@@ -470,22 +516,22 @@ class TestLOXSaturationPressure:
 class TestLOXBelowSaturation:
 
     def test_tank_above_saturation_returns_false(self):
-        # At NBP (-183 °C), p_sat ≈ 14.7 psia. Tank at 100 psia -> safe.
-        result = lox_below_saturation(100.0, -183.0)
+        # At NBP (-183 °C), p_sat ≈ 101325 Pa. Tank at 100 psia -> safe.
+        result = lox_below_saturation(psi_to_pa(100.0), -183.0)
         assert result is False
 
     def test_tank_below_saturation_returns_true(self):
-        # At NBP, p_sat ≈ 14.7 psia. Tank at 5 psia -> alert.
-        result = lox_below_saturation(5.0, -183.0)
+        # At NBP, p_sat ≈ 101325 Pa. Tank at 5 psia -> alert.
+        result = lox_below_saturation(psi_to_pa(5.0), -183.0)
         assert result is True
 
     def test_temp_out_of_range_returns_none(self):
-        result = lox_below_saturation(100.0, -220.0)
+        result = lox_below_saturation(psi_to_pa(100.0), -220.0)
         assert result is None
 
     def test_exactly_at_saturation_is_not_below(self):
         # Tank pressure exactly equals saturation: not strictly below.
-        p_sat = lox_saturation_pressure_psia(-183.0)
+        p_sat = lox_saturation_pressure_pa(-183.0)
         assert p_sat is not None
         result = lox_below_saturation(p_sat, -183.0)
         assert result is False

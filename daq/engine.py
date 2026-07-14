@@ -39,7 +39,8 @@ from daq.hardware import Device, USING_MOCK
 from daq.calculations import (
     lm34_voltage_to_celsius,
     software_seebeck_type_k,
-    pt_voltage_to_psi,
+    psi_to_pa,
+    pt_voltage_to_pa,
     load_cell_voltage_to_force,
     lox_mass_flow_rate,
     fuel_mass_flow_rate,
@@ -51,6 +52,7 @@ from daq.calculations import (
 
 
 # Fallback calibrations (overridden by calibration.json at startup).
+# PT slope/intercept remain in psi/V, psi
 _DEFAULT_CAL: dict[str, dict[str, float]] = {
     "POT": {"slope": 252.0, "intercept": -106.0},
     "PFT": {"slope": 252.0, "intercept": -121.0},
@@ -67,11 +69,27 @@ _DEFAULT_CAL: dict[str, dict[str, float]] = {
 # Cold Junction Compensation (CJC) sensor polling interval in seconds.
 _CJC_INTERVAL_S = 0.5
 
+# FC.NLFS.LQDDAQ.1: data older than this is considered stale and should
+# not be presented to an operator/dashboard as current.
+_DATA_STALE_THRESHOLD_S = 1.0
+
 # Specific impulse (seconds) used for impulse estimation if load cells are absent.
 _ISP_ESTIMATE_S = 220.0
 
-# Sea-level atmospheric pressure (psi) used to convert psig -> psia
-_ATMO_PSIA = 14.696
+# Standard sea-level atmospheric pressure (Pa) used to convert gauge -> absolute
+_ATMO_PA = 101_325.0
+
+# Threshold config (config.yaml) is authored in psi for these tags
+_PRESSURE_THRESHOLD_TAGS = frozenset({
+    "POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP",
+})
+
+# Reconnection tuning (FC.NLFS.LJ.2 / FC.NLFS.LQDDAQ.1 mitigation): after this
+# many consecutive stream_read() failures, assume the connection itself is
+# gone and attempt a full close/open/restart cycle.
+_MAX_CONSECUTIVE_READ_ERRORS = 3
+_RECONNECT_BACKOFF_S         = 1.0    # multiplied by attempt number, capped below
+_RECONNECT_BACKOFF_CAP_S     = 10.0
 
 
 class EngineState:
@@ -125,6 +143,10 @@ class Engine:
         thresholds:    Warning and abort thresholds dictionary (optional).
     """
 
+    # Public alias so callers can reference the threshold
+    # w/o reaching into the private module-level constant.
+    DATA_STALE_THRESHOLD_S = _DATA_STALE_THRESHOLD_S
+
     def __init__(
         self,
         cal_path:     Optional[str] = None,
@@ -139,7 +161,7 @@ class Engine:
         self._device        = Device()
         self._logger        = logger
         self._sequence_dir  = sequence_dir
-        self._thresholds    = thresholds or {}
+        self._thresholds    = self._convert_thresholds_to_pa(thresholds or {})
 
         # Calibration state (re-loaded from disk if path exists)        
         self._cal_path = cal_path
@@ -153,6 +175,9 @@ class Engine:
         # CJC polling state (thermocouple cold junction reference)
         self._cjc_celsius: float = 25.0
         self._last_cjc_read: float = 0.0
+
+        # Monotonic timestamp of the last successfully processed batch.
+        self._last_batch_perf_time: float = 0.0
 
         # Impulse integration accumulators
         self._impulse_lbfs:     float = 0.0
@@ -220,6 +245,41 @@ class Engine:
         """Returns configured safety thresholds."""
         with self._lock:
             return dict(self._thresholds)
+
+    @staticmethod
+    def _convert_thresholds_to_pa(raw: dict) -> dict:
+        """
+        Converts psi-authored pressure threshold bounds to Pa
+        """
+        converted: dict = {}
+        for tag, bands in raw.items():
+            if tag in _PRESSURE_THRESHOLD_TAGS and isinstance(bands, dict):
+                converted[tag] = {
+                    band: [psi_to_pa(lo), psi_to_pa(hi)]
+                    for band, (lo, hi) in bands.items()
+                }
+            else:
+                converted[tag] = bands
+        return converted
+
+    @property
+    def data_age_seconds(self) -> float:
+        """
+        Seconds since the last successfully processed stream batch.
+
+        Returns float("inf") if no batch has ever been processed. Snaps back 
+	near-zero when fresh batch is processed.
+        """
+        with self._lock:
+            last = self._last_batch_perf_time
+        if last == 0.0:
+            return float("inf")
+        return time.perf_counter() - last
+
+    @property
+    def is_data_stale(self) -> bool:
+        """True if the most recent snapshot is older than the FC.NLFS.LQDDAQ.1 threshold."""
+        return self.data_age_seconds > _DATA_STALE_THRESHOLD_S
 
     def write_actuator(self, name: str, state: int) -> None:
         """
@@ -379,12 +439,25 @@ class Engine:
                 object.__setattr__(s, "stream_hz",   actual_hz)
                 object.__setattr__(s, "using_mock",  USING_MOCK)
 
+            consecutive_errors = 0
             while self._running:
                 try:
                     batch = self._device.stream_read()
+                    consecutive_errors = 0
                 except Exception as exc:
-                    self._log(f"Stream read error: {exc}")
-                    if self._running:
+                    consecutive_errors += 1
+                    self._log(
+                        f"Stream read error ({consecutive_errors}/"
+                        f"{_MAX_CONSECUTIVE_READ_ERRORS}): {exc}"
+                    )
+                    with self._lock:
+                        object.__setattr__(self._snapshot, "streaming", False)
+
+                    if consecutive_errors >= _MAX_CONSECUTIVE_READ_ERRORS:
+                        consecutive_errors = 0
+                        if self._running:
+                            self._reconnect_device()
+                    elif self._running:
                         time.sleep(0.1)
                     continue
 
@@ -412,6 +485,62 @@ class Engine:
         finally:
             with self._lock:
                 object.__setattr__(self._snapshot, "streaming", False)
+
+    def _sleep_interruptible(self, duration: float) -> None:
+        """
+        Sleep in small increments, rechecking self._running throughout,
+        so a stop() request is noticed promptly instead of being blocked 
+        behind a single long time.sleep() call.
+        """
+        deadline = time.perf_counter() + duration
+        while self._running and time.perf_counter() < deadline:
+            time.sleep(min(0.1, deadline - time.perf_counter()))
+
+    def _reconnect_device(self) -> None:
+        """
+        Attempts to fully re-establish the hardware connection after repeated
+        stream_read() failures.
+
+        Loops with linear backoff (capped) until self._running goes False or
+        a reconnect attempt succeeds. The job is only to get software back 
+        in sync once comms return.
+        """
+        self._log("Device connection lost - attempting to reconnect...")
+        attempt = 0
+        while self._running:
+            attempt += 1
+            try:
+                try:
+                    self._device.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    self._device.close()
+                except Exception:
+                    pass
+
+                backoff = min(_RECONNECT_BACKOFF_S * attempt, _RECONNECT_BACKOFF_CAP_S)
+                self._sleep_interruptible(backoff)
+                if not self._running:
+                    break   # stop() was called mid-backoff - don't touch the device again
+
+                self._device.open()
+                actual_hz = self._device.start_stream()
+
+                with self._lock:
+                    s = self._snapshot
+                    object.__setattr__(s, "streaming", True)
+                    object.__setattr__(s, "stream_hz", actual_hz)
+
+                self._log(
+                    f"Reconnected on attempt {attempt}: stream running at "
+                    f"{actual_hz} Hz"
+                )
+                return
+            except Exception as exc:
+                self._log(f"Reconnect attempt {attempt} failed: {exc}")
+
+        self._log("Reconnect loop exiting - engine is stopping")
 
     def _process_batch(self, batch: dict[str, list[float]]) -> None:
         """Calibrates, computes derived values for a raw data batch, and updates the snapshot."""
@@ -442,7 +571,7 @@ class Engine:
                     row[tag] = None
                     continue
                 c = cal.get(tag, {"slope": 252.0, "intercept": -119.5})
-                row[tag] = pt_voltage_to_psi(v, c["slope"], c["intercept"])
+                row[tag] = pt_voltage_to_pa(v, c["slope"], c["intercept"])
 
             # Accumulate thermocouple raw voltages
             for tag in ("TOI", "TFI", "TFO"):
@@ -509,11 +638,11 @@ class Engine:
         )
         of_ratio  = mixture_ratio(lox_mdot, fuel_mdot)
 
-        # Convert psig to psia for absolute Antoine saturation calculation
+        # Convert gauge Pa to absolute Pa for the Antoine saturation calculation
         below_sat: Optional[bool] = None
         if toi is not None and pot is not None:
-            pot_psia = pot + _ATMO_PSIA
-            below_sat = lox_below_saturation(pot_psia, toi)
+            pot_pa_abs = pot + _ATMO_PA
+            below_sat = lox_below_saturation(pot_pa_abs, toi)
 
         # Apply mathematical fallback calculation for impulse if load cells are missing
         lc1_v = last.get("LC_1")
@@ -551,6 +680,7 @@ class Engine:
 
         with self._lock:
             self._snapshot = new_snap
+            self._last_batch_perf_time = time.perf_counter()
 
         # Export calibrated values and raw hardware rows to CSV
         if self._logger:
@@ -564,7 +694,7 @@ class Engine:
                         row_vals.extend(["", ""])
                     else:
                         c   = cal.get(tag, {"slope": 252.0, "intercept": -119.5})
-                        eng = pt_voltage_to_psi(v, c["slope"], c["intercept"])
+                        eng = pt_voltage_to_pa(v, c["slope"], c["intercept"])
                         row_vals.extend([f"{v:.6f}", f"{eng:.4f}"])
                 for tag in ("TOI", "TFI", "TFO"):
                     v = batch[tag][i]

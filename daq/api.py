@@ -80,6 +80,9 @@ class ActuatorCommand(BaseModel):
 
 
 class CalibrationUpdate(BaseModel):
+    """
+    slope/intercept remain in the psi calibration domain (psi/V, psi)
+    """
     tag:       str
     slope:     float
     intercept: float
@@ -106,6 +109,16 @@ def _snap_to_dict(snap) -> dict[str, Any]:
         result[slot] = getattr(snap, slot, None)
     return result
 
+
+def _data_age_s(eng) -> Optional[float]:
+    """
+    Rounded seconds since the last processed batch, or None if infinite
+    (no data has ever been received). JSON has no infinity literal, so
+    None is the wire representation of "never received data".
+    """
+    age = eng.data_age_seconds
+    return None if age == float("inf") else round(age, 3)
+
 # --------------------------------------------------------
 # Read Endpoints
 # --------------------------------------------------------
@@ -121,6 +134,8 @@ def get_status():
         "stream_hz":       snap.stream_hz,
         "sequence_active": snap.sequence_active,
         "sequence_name":   snap.sequence_name,
+        "stale":           eng.is_data_stale,
+        "data_age_s":      _data_age_s(eng),
         "server_time":     time.time(),
     }
 
@@ -131,14 +146,34 @@ def get_snapshot():
     Latest processed sensor snapshot.
 
     Returns all pressure, temperature, load cell, and derived values.
+    Pressures (POT, PFT, POI, PFI, PFO, PC, PNS, PNP) are in Pa
     Replace with the most recent data available - always represents
     the last completed 500 Hz batch.
 
     Recommended polling pattern (SR 3.3.2):
         t0 = now(); GET /snapshot; sleep(max(0, 1/display_hz - (now()-t0)))
+
+    Raises:
+        500: If the underlying data is older than the staleness threshold
+             e.g. hardware disconnected and a reconnect is in progress.
+
+	     Prevents a dashboard from displaying frozen readings as if 
+	     they were live. Poll /status first if you want to distinguish
+             "stale" from "engine not initialised" ahead of time.
     """
     eng = _require_engine()
-    return _snap_to_dict(eng.snapshot)
+    if eng.is_data_stale:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Snapshot data is stale ({eng.data_age_seconds:.2f}s old, "
+                f"threshold {eng.DATA_STALE_THRESHOLD_S}s) - hardware may be "
+                f"disconnected. Check /status."
+            ),
+        )
+    result = _snap_to_dict(eng.snapshot)
+    result["data_age_s"] = _data_age_s(eng)
+    return result
 
 
 @app.get("/actuators")
