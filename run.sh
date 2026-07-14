@@ -5,7 +5,8 @@
 #   bash run.sh              - start normally (real hardware if available)
 #   bash run.sh --mock       - force mock hardware
 #   bash run.sh --no-server  - engine only, no HTTP API (headless / debug)
-#   bash run.sh --test       - run the test suite instead
+#   bash run.sh --test       - run the test suite (mock hardware only)
+#   bash run.sh --test-live  - run the real hardware test suite (LabJack T7 must be attached)
 
 set -e
 
@@ -28,8 +29,14 @@ else
 fi
 
 if [ "$1" = "--test" ]; then
-    echo "=== Running test suite ==="
-    "$PYEXE" -m pytest tests/ -v
+    echo "=== Running test suite (mock hardware, no LabJack required) ==="
+    "$PYEXE" -m pytest tests/software tests/test_calculations.py -v
+    exit $?
+fi
+
+if [ "$1" = "--test-live" ]; then
+    echo "=== Running live-hardware test suite (LabJack T7 must be attached) ==="
+    "$PYEXE" -m pytest tests/hardware_live -v
     exit $?
 fi
 
