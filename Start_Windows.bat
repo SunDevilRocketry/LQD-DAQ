@@ -1,10 +1,72 @@
 @echo off
-REM install.bat
-REM Windows setup for the Liquids DAQ system.
-REM Run once from the repo root: install.bat
+REM Start_Windows.bat
+REM First run:  installs everything into a local .venv (visible progress in
+REM             this terminal), checks the LabJack driver, then launches.
+REM Every run after: sees .venv already exists, skips straight to launch.
+REM
+REM Usage:
+REM   Start_Windows.bat              - start normally (real hardware if available)
+REM   Start_Windows.bat --mock       - force mock hardware
+REM   Start_Windows.bat --no-server  - engine only, no HTTP API
+REM   Start_Windows.bat --test       - run the test suite (mock hardware only)
+REM   Start_Windows.bat --test-live  - run the real-hardware test suite (LabJack T7 must be attached)
 
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
+set "VENV_DIR=.venv"
+
+REM ====================================================================
+REM  HEALTH CHECK -- only install if the venv is missing
+REM ====================================================================
+if not exist "%VENV_DIR%\Scripts\activate.bat" (
+    call :install
+    if errorlevel 1 (
+        pause
+        exit /b 1
+    )
+) else (
+    echo [INFO] Environment already set up -- skipping install.
+)
+
+call "%VENV_DIR%\Scripts\activate.bat"
+
+REM ====================================================================
+REM  LAUNCH
+REM ====================================================================
+set "PYEXE="
+where python >nul 2>&1 && set "PYEXE=python"
+if not defined PYEXE (
+    where py >nul 2>&1 && set "PYEXE=py -3"
+)
+if not defined PYEXE (
+    echo ERROR: no Python interpreter found ^(tried 'python' and 'py'^).
+    echo Install Python 3.10+ from https://www.python.org/downloads/ and re-run.
+    pause
+    exit /b 1
+)
+
+if "%1"=="--test" goto run_tests
+if "%1"=="--test-live" goto run_tests_live
+
+echo === Liquids DAQ ===
+%PYEXE% -m daq %*
+exit /b %errorlevel%
+
+:run_tests
+echo === Running test suite (mock hardware, no LabJack required) ===
+%PYEXE% -m pytest tests/software tests/test_calculations.py -v
+exit /b %errorlevel%
+
+:run_tests_live
+echo === Running live-hardware test suite (LabJack T7 must be attached) ===
+%PYEXE% -m pytest tests/hardware_live -v
+exit /b %errorlevel%
+
+REM ====================================================================
+REM  :install -- first-run setup only
+REM ====================================================================
+:install
 echo === Liquids DAQ - Install ===
 
 REM --- Python check ---
@@ -19,18 +81,25 @@ if not defined PYEXE (
     echo ERROR: no Python interpreter found ^(tried 'python' and 'py -3'^).
     echo Install Python 3.10+ from https://www.python.org/downloads/
     echo and make sure to check "Add python.exe to PATH" during setup.
-    pause
     exit /b 1
 )
 echo [INFO] Using interpreter: %PYEXE%
 
 REM --- Virtual environment ---
-if not exist ".venv\" (
+if not exist "%VENV_DIR%\" (
     echo Creating virtual environment...
-    %PYEXE% -m venv .venv
+    %PYEXE% -m venv "%VENV_DIR%"
+)
+if not exist "%VENV_DIR%\Scripts\activate.bat" (
+    echo [ERROR] Virtual environment creation failed.
+    echo This can happen if your Python install is missing the 'venv' module,
+    echo or if an antivirus/IT policy blocked writing to this folder.
+    echo Try running this command manually to see the actual error:
+    echo     %PYEXE% -m venv %VENV_DIR%
+    exit /b 1
 )
 
-call .venv\Scripts\activate.bat
+call "%VENV_DIR%\Scripts\activate.bat"
 
 REM --- Python packages ---
 echo Installing Python dependencies...
@@ -38,7 +107,6 @@ pip install --upgrade pip -q
 pip install -r requirements.txt -q
 if errorlevel 1 (
     echo ERROR: Failed to install Python dependencies. See output above.
-    pause
     exit /b 1
 )
 
@@ -120,6 +188,5 @@ if not exist "data\" mkdir data
 
 echo.
 echo === Install complete ===
-echo Run the DAQ with:  run.bat
-echo Run tests with:    run.bat --test
-pause
+echo.
+exit /b 0
