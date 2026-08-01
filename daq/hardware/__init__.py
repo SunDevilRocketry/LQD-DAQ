@@ -12,6 +12,10 @@ Usage:
  
 try:
     from labjack import ljm as _ljm                         # Probe LJM driver availability
+
+    if getattr(_ljm, "_staticLib", None) is None:
+        raise ImportError("LJM native library not found")
+
     from daq.hardware.interface import LabJackT7 as Device
     USING_MOCK = False
 except ImportError:
