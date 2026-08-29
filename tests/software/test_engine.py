@@ -19,7 +19,7 @@ import pytest
 
 from daq.calculations import psi_to_pa
 
-from tests.software._helpers import make_engine
+from tests.software._helpers import make_engine, wait_for_first_batch
 
 
 # -- Background Engine Pipeline Integration -------------------
@@ -29,7 +29,7 @@ class TestEngine:
     def setup_method(self):
         self.engine = make_engine()
         self.engine.start()
-        time.sleep(0.3)
+        wait_for_first_batch(self.engine)
 
     def teardown_method(self):
         self.engine.stop()
@@ -184,7 +184,7 @@ class TestEngineReconnect:
     def test_reconnects_after_repeated_read_failures(self):
         engine = make_engine()
         engine.start()
-        time.sleep(0.3)
+        wait_for_first_batch(engine)
         assert engine.snapshot.streaming is True, "Engine never started streaming"
 
         device = engine._device
@@ -233,7 +233,7 @@ class TestEngineReconnect:
         stay stale True while the connection is actually down."""
         engine = make_engine()
         engine.start()
-        time.sleep(0.3)
+        wait_for_first_batch(engine)
 
         device = engine._device
 
@@ -347,7 +347,7 @@ class TestChannelStatus:
         eng = make_engine()
         eng.start()
         try:
-            time.sleep(0.3)
+            wait_for_first_batch(eng)
             assert eng.snapshot.channels["tc0"].status == "UNASSIGNED"
         finally:
             eng.stop()
@@ -358,7 +358,7 @@ class TestChannelStatus:
         })
         eng.start()
         try:
-            time.sleep(0.3)
+            wait_for_first_batch(eng)
             assert eng.snapshot.channels["pt0"].status == "NOMINAL"
         finally:
             eng.stop()
@@ -372,7 +372,7 @@ class TestDataFreshness:
     def test_fresh_engine_reports_not_stale(self):
         engine = make_engine()
         engine.start()
-        time.sleep(0.3)
+        wait_for_first_batch(engine)
         assert engine.is_data_stale is False
         assert engine.data_age_seconds < 1.0
         engine.stop()
@@ -386,7 +386,7 @@ class TestDataFreshness:
     def test_data_age_grows_during_outage(self):
         engine = make_engine()
         engine.start()
-        time.sleep(0.3)
+        wait_for_first_batch(engine)
 
         device = engine._device
 
@@ -399,3 +399,50 @@ class TestDataFreshness:
         assert engine.is_data_stale is True
         assert engine.data_age_seconds > 1.0
         engine.stop()
+
+
+# -- First-batch wait (the fixed-sleep flake) ------------------
+
+class TestFirstBatchWait:
+    """
+    Reproduces the flake the suite used to carry.
+
+    setup_method() slept a flat 0.3 s after start() and assumed a batch
+    had landed. The first batch normally takes ~0.1 s, but on a loaded
+    runner it can take longer, leaving snapshot.channels empty and every
+    test that subscripts a channel raising KeyError. wait_for_first_batch()
+    polls for a populated snapshot instead.
+    """
+
+    @staticmethod
+    def _delay_first_batch(engine, delay_s: float) -> None:
+        """Stall the device's first stream_read, as a loaded CPU would."""
+        original = engine._device.stream_read
+        state = {"first": True}
+
+        def slow_stream_read():
+            if state["first"]:
+                state["first"] = False
+                time.sleep(delay_s)
+            return original()
+
+        engine._device.stream_read = slow_stream_read
+
+    def test_wait_survives_a_first_batch_slower_than_the_old_sleep(self):
+        engine = make_engine()
+        self._delay_first_batch(engine, 0.6)
+        engine.start()
+        try:
+            time.sleep(0.3)     # exactly what setup_method used to do
+            assert not engine.snapshot.channels, (
+                "first batch landed early - test no longer reproduces the flake"
+            )
+            wait_for_first_batch(engine)
+            assert engine.snapshot.channels["pt0"].value is not None
+        finally:
+            engine.stop()
+
+    def test_wait_raises_a_clear_message_if_no_batch_ever_lands(self):
+        engine = make_engine()
+        with pytest.raises(AssertionError, match="no populated snapshot"):
+            wait_for_first_batch(engine, timeout=0.2)

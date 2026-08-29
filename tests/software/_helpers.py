@@ -7,6 +7,7 @@ Shared helpers for the mock-hardware test suite.
 from __future__ import annotations
 
 import os
+import time
 
 from daq.engine import Engine
 from daq.manifest import load_actuators, load_channels
@@ -48,4 +49,22 @@ def make_engine(logger=None, thresholds=None) -> Engine:
         thresholds=thresholds,
         channels_path=FULL_CHANNELS,
         actuators_path=FULL_ACTUATORS,
+    )
+
+
+def wait_for_first_batch(engine, timeout: float = 5.0) -> None:
+    """
+    Block until the engine has published its first populated snapshot.
+
+    Raises:
+        AssertionError: If no batch has landed within `timeout` seconds.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if engine.snapshot.channels:
+            return
+        time.sleep(0.01)
+    raise AssertionError(
+        f"Engine produced no populated snapshot within {timeout:.1f}s - "
+        f"the acquisition thread never completed a batch"
     )

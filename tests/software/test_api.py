@@ -18,7 +18,7 @@ import daq.api as api_module
 from daq.api import app
 from daq.logger import Logger
 
-from tests.software._helpers import make_engine
+from tests.software._helpers import make_engine, wait_for_first_batch
 
 
 @pytest.fixture(scope="module")
@@ -29,7 +29,7 @@ def api_client():
     logger.open()
     engine.start()
     api_module.set_engine(engine, logger)
-    time.sleep(0.3)
+    wait_for_first_batch(engine)
 
     client = TestClient(app)
     yield client
@@ -210,7 +210,7 @@ class TestDataFreshnessAPI:
         logger.open()
         engine.start()
         api_module.set_engine(engine, logger)
-        time.sleep(0.3)
+        wait_for_first_batch(engine)
 
         try:
             device = engine._device
