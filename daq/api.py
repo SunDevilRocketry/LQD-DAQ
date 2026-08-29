@@ -150,14 +150,15 @@ def get_status():
     eng = _require_engine()
     snap = eng.snapshot
     return {
-        "ok":              snap.streaming,
-        "using_mock":      snap.using_mock,
-        "stream_hz":       snap.stream_hz,
-        "sequence_active": snap.sequence_active,
-        "sequence_name":   snap.sequence_name,
-        "stale":           eng.is_data_stale,
-        "data_age_s":      _data_age_s(eng),
-        "server_time":     time.time(),
+        "ok":                 snap.streaming,
+        "using_mock":         snap.using_mock,
+        "stream_hz":          snap.stream_hz,
+        "sequence_active":    snap.sequence_active,
+        "sequence_name":      snap.sequence_name,
+        "unwired_actuators":  eng.unwired_actuators,
+        "stale":              eng.is_data_stale,
+        "data_age_s":         _data_age_s(eng),
+        "server_time":        time.time(),
     }
 
 

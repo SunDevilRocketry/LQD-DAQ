@@ -39,16 +39,25 @@ def full_actuators():
     return load_actuators(FULL_ACTUATORS)
 
 
-def make_engine(logger=None, thresholds=None) -> Engine:
-    """Create an Engine wired to mock hardware and the fixture manifests."""
-    seq_dir = os.path.join(_REPO, "sequences")
+def make_engine(
+    logger=None,
+    thresholds=None,
+    sequence_dir=None,
+    actuators_path=FULL_ACTUATORS,
+) -> Engine:
+    """
+    Create an Engine wired to mock hardware and the fixture manifests.
+
+    actuators_path defaults to the fully-wired fixture; pass REPO_ACTUATORS
+    to exercise the cart as actually shipped, with no pins assigned.
+    """
     return Engine(
         cal_path=None,
-        sequence_dir=seq_dir,
+        sequence_dir=sequence_dir or os.path.join(_REPO, "sequences"),
         logger=logger,
         thresholds=thresholds,
         channels_path=FULL_CHANNELS,
-        actuators_path=FULL_ACTUATORS,
+        actuators_path=actuators_path,
     )
 
 

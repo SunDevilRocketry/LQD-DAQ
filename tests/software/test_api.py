@@ -47,6 +47,12 @@ class TestAPI:
         assert data["ok"] is True
         assert "stream_hz" in data
 
+    def test_status_reports_unwired_actuators(self, api_client):
+        """An operator's only pre-test view of actuators that cannot be
+        driven."""
+        data = api_client.get("/status").json()
+        assert data["unwired_actuators"] == []
+
     def test_snapshot_channels_are_manifest_keyed(self, api_client):
         r = api_client.get("/snapshot")
         assert r.status_code == 200

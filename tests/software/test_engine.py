@@ -16,10 +16,15 @@ import threading
 import time
 
 import pytest
+import yaml
 
 from daq.calculations import psi_to_pa
 
-from tests.software._helpers import make_engine, wait_for_first_batch
+from tests.software._helpers import (
+    REPO_ACTUATORS,
+    make_engine,
+    wait_for_first_batch,
+)
 
 
 # -- Background Engine Pipeline Integration -------------------
@@ -446,3 +451,92 @@ class TestFirstBatchWait:
         engine = make_engine()
         with pytest.raises(AssertionError, match="no populated snapshot"):
             wait_for_first_batch(engine, timeout=0.2)
+
+
+# -- Unwired actuators  -----------
+
+class TestUnwiredActuatorGate:
+    """
+    Channels and actuators used to treat an unfilled manifest differently.
+    With no channel wired, start_stream() raises and the engine cannot
+    pretend to run. With no actuator wired, nothing was gated: every
+    device write raised, _run_sequence logged it and advanced, and the
+    sequence reported completion having moved nothing.
+    """
+
+    @staticmethod
+    def _seq_engine(tmp_path, steps, actuators_path=REPO_ACTUATORS):
+        """An engine whose sequences/ holds an abort.yaml with `steps`."""
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir()
+        (seq_dir / "abort.yaml").write_text(
+            yaml.safe_dump({"post_record_seconds": 0, "steps": steps})
+        )
+        kwargs = {"sequence_dir": str(seq_dir)}
+        if actuators_path is not None:
+            kwargs["actuators_path"] = actuators_path
+        return make_engine(**kwargs)
+
+    @staticmethod
+    def _wait_for_sequence_end(engine, timeout=5.0):
+        """Join the sequence thread. The engine is never start()ed here, so
+        the snapshot is not a usable signal."""
+        thread = engine._sequence_thread
+        assert thread is not None, "abort() never spawned a sequence thread"
+        thread.join(timeout=timeout)
+        assert not thread.is_alive(), "sequence never finished"
+
+    def test_shipped_manifest_reports_every_actuator_unwired(self):
+        engine = make_engine(actuators_path=REPO_ACTUATORS)
+        assert set(engine.unwired_actuators) == {
+            spec.id for spec in engine.actuator_specs
+        }, "the shipped actuators.yaml assigns no pins at all"
+
+    def test_fixture_manifest_reports_nothing_unwired(self):
+        assert make_engine().unwired_actuators == []
+
+    def test_sequence_commanding_an_unwired_actuator_is_refused(self, tmp_path):
+        engine = self._seq_engine(tmp_path, [[0.0, "lox_vent", 0]])
+        engine.abort()
+        self._wait_for_sequence_end(engine)
+
+        log = engine.event_log
+        assert any("REFUSED" in e and "lox_vent" in e for e in log), log
+        assert not any("T+0.00s" in e for e in log), (
+            "a step ran despite the actuator having no pin assignment"
+        )
+
+    def test_refused_abort_still_drives_the_hardware_safe(self, tmp_path):
+        """An ordered closure is impossible, so fall back to de-energising."""
+        engine = self._seq_engine(tmp_path, [[0.0, "lox_vent", 0]])
+        calls = []
+        engine._device.all_safe = lambda: calls.append("all_safe")
+
+        engine.abort()
+        self._wait_for_sequence_end(engine)
+        assert calls == ["all_safe"]
+
+    def test_sequence_naming_an_actuator_that_does_not_exist_is_refused(
+        self, tmp_path
+    ):
+        engine = self._seq_engine(
+            tmp_path, [[0.0, "no_such_valve", 1]], actuators_path=None
+        )
+        engine.abort()
+        self._wait_for_sequence_end(engine)
+        assert any("REFUSED" in e and "no_such_valve" in e
+                   for e in engine.event_log)
+
+    def test_fully_wired_sequence_still_runs_every_step(self, tmp_path):
+        engine = self._seq_engine(
+            tmp_path,
+            [[0.0, "lox_vent", 1], [0.0, "fuel_vent", 1]],
+            actuators_path=None,
+        )
+        engine.abort()
+        self._wait_for_sequence_end(engine)
+
+        log = engine.event_log
+        assert not any("REFUSED" in e for e in log), log
+        assert engine._device.read_actuator("lox_vent") == 1
+        assert engine._device.read_actuator("fuel_vent") == 1

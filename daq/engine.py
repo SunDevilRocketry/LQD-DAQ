@@ -325,6 +325,16 @@ class Engine:
         """The cart's actuator manifest, as loaded from actuators.yaml."""
         return list(self._actuators)
 
+    @property
+    def unwired_actuators(self) -> list[str]:
+        """
+        Ids of actuators the manifest declares but names no pins for.
+
+        These exist in the inventory and are reported in every snapshot,
+        but cannot be driven: LabJackT7.write_actuator() raises on them.
+        """
+        return [spec.id for spec in self._actuators if not spec.is_wired]
+
     def _default_calibration(self) -> dict[str, dict[str, float]]:
         """Builds the per-channel fallback calibration table from the manifest."""
         return {
@@ -879,6 +889,23 @@ class Engine:
             self._sequence_done()
             return
 
+        undrivable = self._undrivable_steps(steps)
+        if undrivable:
+            self._log(
+                f"Sequence '{name}' REFUSED: cannot drive "
+                f"{', '.join(undrivable)} - not wired in actuators.yaml. "
+                f"Every step for these would have failed and the sequence "
+                f"would have reported completion having moved nothing."
+            )
+            if not is_fire:
+                # An ordered closure is off the table, so fall back to the
+                # same de-energise abort() uses when there is no abort.yaml
+                # at all.
+                self._device.all_safe()
+                self._log("ABORT: refused sequence, hardware -> all safe")
+            self._sequence_done()
+            return
+
         if is_fire and self._logger:
             self._logger.start_recording(prefix="hotfire")
 
@@ -936,6 +963,20 @@ class Engine:
             self._sequence_active = False
             self._sequence_name   = ""
             self._sequence_t0     = None
+
+    def _undrivable_steps(
+        self, steps: list[tuple[float, str, int]]
+    ) -> list[str]:
+        """
+        Actuator ids a sequence commands that this cart cannot drive.
+
+        Covers both an id absent from actuators.yaml and one present but
+        with null pin fields. Either way the device write raises, and
+        _run_sequence's per-step handler logs it and moves on - so without
+        this check a sequence runs to "completion" having moved nothing.
+        """
+        drivable = {spec.id for spec in self._actuators if spec.is_wired}
+        return sorted({name for _, name, _ in steps if name not in drivable})
 
     def _load_sequence(
         self, path: str
