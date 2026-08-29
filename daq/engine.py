@@ -615,7 +615,11 @@ class Engine:
                     self._log(
                         f"Batch processing error (scan dropped, stream continues): "
                         f"{exc}\n{traceback.format_exc()}"
-                    )
+                    ) 
+                    now_err = time.perf_counter()
+                    if now_err - last_error_notify >= _ERROR_NOTIFY_INTERVAL_S:
+                        last_error_notify = now_err
+                        self._notify_state()
                     continue
 
         except Exception as exc:

@@ -106,13 +106,30 @@ class TestMockLabJack:
         self.device.write_actuator("lox_vent", 0)
         assert self.device.read_actuator("lox_vent") == 0
 
-    def test_all_safe_clears_all_actuators(self):
+    def test_all_safe_closes_solenoids_and_stops_all_motion(self):
         for name in ("lox_main", "fuel_main", "ignition"):
             self.device.write_actuator(name, 1)
         self.device.all_safe()
-        for name, reading in self.device.actuator_states().items():
-            assert reading.state == 0, f"{name} not cleared by all_safe()"
+
+        states = self.device.actuator_states()
+        assert states["ignition"].state == 0, "solenoid not cleared by all_safe()"
+        for name, reading in states.items():
             assert reading.moving is False, f"{name} still moving after all_safe()"
+
+    def test_all_safe_does_not_claim_the_stepper_mains_are_closed(self):
+        """
+        all_safe() cancels an in-flight burst and drops ENA, which leaves an
+        open-loop stepper wherever it currently sits | ordered closure of the
+        mains is abort.yaml's job. Reporting state 0 here would tell the
+        operator the main is shut at the exact moment we did not
+        shut it, so a stepper keeps its last commanded state instead.
+        """
+        self.device.write_actuator("lox_main", 1)
+        self.device.all_safe()
+
+        reading = self.device.actuator_states()["lox_main"]
+        assert reading.state == 1, "stepper main falsely reported closed by all_safe()"
+        assert reading.moving is False, "burst was not cancelled"
 
     def test_unknown_actuator_raises(self):
         with pytest.raises(KeyError):

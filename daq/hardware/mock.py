@@ -26,6 +26,7 @@ from daq.manifest import (
     ActuatorReading,
     ActuatorSpec,
     ChannelSpec,
+    BINARY_DIO,
     PULSE_STEPPER,
     PT_DIRECT,
     TC_DIFFERENTIAL,
@@ -301,10 +302,18 @@ class MockLabJack:
             return self._actuators[name]
 
     def all_safe(self) -> None:
-        """De-energise all actuators (safe/closed position)."""
+        """
+        De-energise all actuators (safe/closed position).
+
+        Mirrors LabJackT7.all_safe(): only binary_dio actuators report
+        closed. A pulse_stepper keeps its last commanded state, because
+        cancelling its burst leaves the valve wherever it sat rather than
+        shutting it.
+        """
         with self._lock:
-            for name in self._actuators:
-                self._actuators[name] = 0
+            for name, spec in self._actuator_specs.items():
+                if spec.type == BINARY_DIO:
+                    self._actuators[name] = 0
             self._move_deadline.clear()
         self._refresh_fire_state()
         print("[MOCK] All actuators -> SAFE/CLOSED")

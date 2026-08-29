@@ -181,6 +181,10 @@ class LabJackT7:
         self._scan_types:   list[int] = []
         self._n_channels:   int = 0
 
+        # Shared DIO_EF CLOCK0 roll value, resolved once in
+        # _configure_steppers() from the single stepper pulse rate.
+        self._pulse_roll: int = 0
+
         # Watchdog covers solenoid lines only (see module docstring).
         self._actuator_mask = 0
         for spec in actuators:
@@ -439,13 +443,20 @@ class LabJackT7:
         Solenoids drop to their safe state. Steppers have any in-flight
         pulse burst cancelled and their driver disabled, which leaves the
         valve wherever it currently sits.
-        An open-loop stepper can't be shut immediately, ordered closure of the 
+        An open-loop stepper can't be shut immediately, ordered closure of the
         mains is abort.yaml's job, which Engine.abort() runs before reaching here.
+
+        B/c of that, only binary_dio actuators are reported closed here.
+        A stepper keeps its last commanded state: forcing it to 0 would tell
+        the operator the main is shut at the exact moment we have deliberately
+        left it wherever it sat. `moving` does drop to false for every
+        actuator, since any in-flight burst really has been cancelled.
         """
         self._safe_all_hardware()
         with self._lock:
-            for name in self._actuators:
-                self._actuators[name] = 0
+            for name, spec in self._actuator_specs.items():
+                if spec.type == BINARY_DIO:
+                    self._actuators[name] = 0
             self._move_deadline.clear()
         print("[T7] All actuators -> SAFE/CLOSED")
 
@@ -535,6 +546,14 @@ class LabJackT7:
         The clock is set up once; each burst then only has to write that
         actuator's own pulse-count/width registers. DIR and ENA are plain
         DIO lines and need no EF configuration.
+
+        CLOCK0 is a single shared resource. It is configured and enabled
+        exactly once here and never touched again, because disabling it
+        while any STEP line is mid-burst truncates that burst.
+
+        The consequence is that every stepper must share one
+        pulse_freq_hz. A mismatch is rejected here rather than silently
+        running whichever stepper was armed second at the wrong rate.
         """
         steppers = [
             spec for spec in self._actuator_specs.values()
@@ -543,8 +562,24 @@ class LabJackT7:
         if not steppers:
             return
 
+        rates = {spec.pulse_freq_hz for spec in steppers}
+        if len(rates) > 1:
+            raise ValueError(
+                f"All pulse_stepper actuators must share one pulse_freq_hz "
+                f"(they share DIO_EF CLOCK0); actuators.yaml declares "
+                f"{sorted(rates)}"
+            )
+        rate = rates.pop()
+        if not rate or rate <= 0:
+            raise ValueError(
+                f"pulse_freq_hz must be a positive number; got {rate!r}"
+            )
+        self._pulse_roll = int(_DIO_EF_TICK_HZ / rate)
+
         ljm.eWriteName(self._handle, "DIO_EF_CLOCK0_ENABLE",  0)
         ljm.eWriteName(self._handle, "DIO_EF_CLOCK0_DIVISOR", _DIO_EF_CLOCK_DIV)
+        ljm.eWriteName(self._handle, "DIO_EF_CLOCK0_ROLL_VALUE", self._pulse_roll)
+        ljm.eWriteName(self._handle, "DIO_EF_CLOCK0_ENABLE",  1)
 
         for spec in steppers:
             ljm.eWriteName(self._handle, f"{spec.step_dio}_EF_ENABLE", 0)
@@ -556,9 +591,13 @@ class LabJackT7:
 
         Open-loop and fire-and-forget (T7's pulse engine emits the whole
         burst in hardware).
+
+        Touches only this actuator's own EF registers. The shared CLOCK0 is
+        owned by _configure_steppers() and must not be disturbed here, or a
+        burst already running on the other STEP line would be cut short.
         """
         steps = spec.steps_open if state == 1 else spec.steps_close
-        roll  = int(_DIO_EF_TICK_HZ / spec.pulse_freq_hz)
+        roll  = self._pulse_roll
 
         # DIR first so the line is settled b/f the first STEP edge.
         ljm.eWriteName(self._handle, spec.dir_dio, 1 if state == 1 else 0)
@@ -566,9 +605,6 @@ class LabJackT7:
 
         step_dio = spec.step_dio
         ljm.eWriteName(self._handle, f"{step_dio}_EF_ENABLE",   0)
-        ljm.eWriteName(self._handle, "DIO_EF_CLOCK0_ENABLE",    0)
-        ljm.eWriteName(self._handle, "DIO_EF_CLOCK0_ROLL_VALUE", roll)
-        ljm.eWriteName(self._handle, "DIO_EF_CLOCK0_ENABLE",    1)
         ljm.eWriteName(self._handle, f"{step_dio}_EF_INDEX",    _DIO_EF_INDEX_PULSE_OUT)
         ljm.eWriteName(self._handle, f"{step_dio}_EF_CONFIG_A", roll // 2)  # 50% duty
         ljm.eWriteName(self._handle, f"{step_dio}_EF_CONFIG_B", 0)          # no phase offset
