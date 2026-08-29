@@ -25,7 +25,7 @@ from tests.software._helpers import make_engine
 def api_client():
     """Stand up engine + API for the full module test run."""
     engine = make_engine()
-    logger = Logger(output_dir=tempfile.mkdtemp())
+    logger = Logger(output_dir=tempfile.mkdtemp(), channels=engine.channel_specs)
     logger.open()
     engine.start()
     api_module.set_engine(engine, logger)
@@ -47,26 +47,34 @@ class TestAPI:
         assert data["ok"] is True
         assert "stream_hz" in data
 
-    def test_snapshot_has_pc(self, api_client):
+    def test_snapshot_channels_are_manifest_keyed(self, api_client):
         r = api_client.get("/snapshot")
         assert r.status_code == 200
-        data = r.json()
-        assert "PC" in data
-        assert data["PC"] is not None
+        channels = r.json()["channels"]
+        assert "pt0" in channels
+        assert channels["pt0"]["value"] is not None
+        assert channels["pt0"]["unit"] == "Pa"
 
-    def test_snapshot_has_derived_fields(self, api_client):
-        r = api_client.get("/snapshot")
-        data = r.json()
-        assert "lox_mdot"      in data
-        assert "mixture_ratio" in data
-        assert "impulse_ns"    in data
+    def test_snapshot_reports_inactive_channels_as_null(self, api_client):
+        """An inactive channel stays in the reported set so a consumer's
+        key set matches the manifest - it just carries no value."""
+        channels = api_client.get("/snapshot").json()["channels"]
+        assert "pt7" in channels
+        assert channels["pt7"]["value"] is None
+
+    def test_snapshot_has_no_derived_channels(self, api_client):
+        """Derived channels were deleted, not generalised (handoff sec 3/5)."""
+        data = api_client.get("/snapshot").json()
+        for gone in ("lox_mdot", "fuel_mdot", "mixture_ratio", "impulse_ns"):
+            assert gone not in data
 
     def test_actuators_endpoint(self, api_client):
         r = api_client.get("/actuators")
         assert r.status_code == 200
         data = r.json()
-        assert "LOx Main" in data
-        assert data["LOx Main"] in (0, 1)
+        assert "lox_main" in data
+        assert data["lox_main"]["state"] in (0, 1)
+        assert isinstance(data["lox_main"]["moving"], bool)
 
     def test_events_endpoint(self, api_client):
         r = api_client.get("/events")
@@ -82,18 +90,18 @@ class TestAPI:
         assert "recording" in data
 
     def test_actuator_command(self, api_client):
-        r = api_client.post("/actuator", json={"name": "Fuel Vent", "state": 1})
+        r = api_client.post("/actuator", json={"name": "fuel_vent", "state": 1})
         assert r.status_code == 200
         assert r.json()["ok"] is True
         # Clean up
-        api_client.post("/actuator", json={"name": "Fuel Vent", "state": 0})
+        api_client.post("/actuator", json={"name": "fuel_vent", "state": 0})
 
     def test_actuator_invalid_state(self, api_client):
-        r = api_client.post("/actuator", json={"name": "Fuel Vent", "state": 99})
+        r = api_client.post("/actuator", json={"name": "fuel_vent", "state": 99})
         assert r.status_code == 422
 
     def test_actuator_unknown_name(self, api_client):
-        r = api_client.post("/actuator", json={"name": "Mystery Valve", "state": 1})
+        r = api_client.post("/actuator", json={"name": "mystery_valve", "state": 1})
         assert r.status_code == 422
 
     def test_safe_endpoint(self, api_client):
@@ -106,10 +114,6 @@ class TestAPI:
         assert r.status_code == 200
         assert r.json()["ok"] is True
 
-    def test_reset_impulse_endpoint(self, api_client):
-        r = api_client.post("/reset_impulse")
-        assert r.status_code == 200
-
     def test_abort_endpoint(self, api_client):
         r = api_client.post("/abort")
         assert r.status_code == 200
@@ -117,7 +121,7 @@ class TestAPI:
 
     def test_calibration_update_endpoint(self, api_client):
         r = api_client.post("/calibration", json={
-            "tag": "PC", "slope": 128.0, "intercept": -62.8
+            "tag": "pt0", "slope": 500.0, "intercept": 0.0
         })
         assert r.status_code == 200
         assert r.json()["ok"] is True
@@ -202,7 +206,7 @@ class TestDataFreshnessAPI:
         prev_engine, prev_logger = api_module._engine, api_module._logger
 
         engine = make_engine()
-        logger = Logger(output_dir=tempfile.mkdtemp())
+        logger = Logger(output_dir=tempfile.mkdtemp(), channels=engine.channel_specs)
         logger.open()
         engine.start()
         api_module.set_engine(engine, logger)

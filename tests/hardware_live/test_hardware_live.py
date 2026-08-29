@@ -14,6 +14,12 @@ Run this file directly, on the bench, with the hardware attached:
 
 If no physical device is present, every test here will fail fast with a
 device/connection error.
+
+The driver is manifest-driven, so these tests run against the repo's real
+channels.yaml / actuators.yaml. Any test that needs a wired pin skips with
+a clear reason while that pin is still null - the point of running this on
+the bench is to confirm the wiring you just did, so it should tell you
+what isn't wired rather than fail opaquely.
 """
 
 import os
@@ -25,12 +31,24 @@ sys.path.insert(
 
 import pytest
 
+from daq.engine import DEFAULT_ACTUATORS_PATH, DEFAULT_CHANNELS_PATH
 from daq.hardware.interface import LabJackT7
+from daq.manifest import BINARY_DIO, load_actuators, load_channels
+
+
+@pytest.fixture(scope="module")
+def channels():
+    return load_channels(DEFAULT_CHANNELS_PATH)
+
+
+@pytest.fixture(scope="module")
+def actuators():
+    return load_actuators(DEFAULT_ACTUATORS_PATH)
 
 
 @pytest.fixture
-def device():
-    dev = LabJackT7()
+def device(channels, actuators):
+    dev = LabJackT7(channels, actuators)
     dev.open()
     try:
         yield dev
@@ -48,19 +66,44 @@ class TestPhysicalConnection:
 
     def test_physical_stream(self, device):
         """Verify real 500 Hz streaming pulls at least one non-empty batch."""
+        tags = device.sensor_tags
+        if not tags:
+            pytest.skip(
+                "No channel in channels.yaml has an AIN assigned yet - "
+                "nothing to stream"
+            )
+
         device.start_stream()
         try:
             batch = device.stream_read()
-            assert "POT" in batch
-            assert len(batch["POT"]) > 0
+            for tag in tags:
+                assert tag in batch, f"{tag} missing from batch"
+                assert len(batch[tag]) > 0, f"{tag} batch is empty"
         finally:
             device.stop_stream()
 
-    def test_physical_actuator_round_trip(self, device):
-        """Write then read back a single actuator on real hardware, then
-        immediately return it to the safe (closed) state."""
+    def test_physical_actuator_round_trip(self, device, actuators):
+        """
+        Write then read back a single solenoid on real hardware, then
+        immediately return it to the safe (closed) state.
+
+        Deliberately picks a binary_dio actuator: a stepper round-trip
+        would physically move a main valve, which is not something a
+        connectivity smoke test should do on its own.
+        """
+        wired = [
+            spec for spec in actuators
+            if spec.type == BINARY_DIO and spec.is_wired
+        ]
+        if not wired:
+            pytest.skip(
+                "No binary_dio actuator in actuators.yaml has a DIO "
+                "assigned yet"
+            )
+
+        name = wired[0].id
         try:
-            device.write_actuator("LOx Vent", 1)
-            assert device.read_actuator("LOx Vent") == 1
+            device.write_actuator(name, 1)
+            assert device.read_actuator(name) == 1
         finally:
-            device.write_actuator("LOx Vent", 0)
+            device.write_actuator(name, 0)

@@ -12,7 +12,9 @@ Client Polling Guideline (SR 3.3.2):
 
 Endpoints:
   GET  /status          - connection and system health
-  GET  /snapshot        - latest engineering values (all sensors + derived)
+  GET  /stream          - server-sent events: manifest on connect, then
+                          live system-state pushed per acquisition batch
+  GET  /snapshot        - latest engineering values (all sensors)
   GET  /actuators       - current actuator states
   GET  /events          - recent event log (SR 3.5 debug console)
   GET  /logger          - logger status and current file path
@@ -21,7 +23,6 @@ Endpoints:
   POST /fire            - start the fire autosequence
   POST /abort           - abort any running sequence
   POST /tare            - tare load cells
-  POST /reset_impulse   - zero impulse accumulators
   POST /calibration     - update a sensor calibration coefficient
   POST /log/start       - start manual CSV recording
   POST /log/stop        - stop manual CSV recording
@@ -36,18 +37,38 @@ from typing import Optional, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from daq.broadcast import (
+    Broadcaster,
+    format_sse,
+    manifest_message,
+    system_state_message,
+)
 
 # Engine and Logger instances injected at application startup.
 _engine = None
 _logger = None
 
+_broadcaster = Broadcaster()
+
 
 def set_engine(engine, logger=None) -> None:
-    """Injects runtime engine and logger instances at startup."""
+    """
+    Injects runtime engine and logger instances at startup.
+
+    Also subscribes the SSE broadcaster to the engine's state updates, so
+    /stream clients are fed straight off the acquisition thread.
+    """
     global _engine, _logger
     _engine = engine
     _logger = logger
+
+    if engine is not None:
+        engine.set_state_listener(
+            lambda: _broadcaster.publish(system_state_message(engine))
+        )
 
 
 # --------------------------------------------------------
@@ -140,15 +161,51 @@ def get_status():
     }
 
 
+@app.get("/stream")
+async def get_stream():
+    """
+    Live telemetry as server-sent events.
+
+    On connect the client receives a `manifest` message (the cart's full
+    channel/actuator inventory) followed immediately by one `system-state`
+    frame, so a dashboard can render w/o waiting for the next batch.
+    After that, one `system-state` per processed acquisition batch.
+
+    Cadence is the natural batch rate, ~10 Hz (500 Hz / 50 scans per read),
+    which already sits under Dashboard's render ceiling - no down-sampling
+    is applied here.
+
+    /snapshot is kept alongside this for a client that doesn't want a persistent
+    connection.
+    """
+    eng = _require_engine()
+
+    async def event_source():
+        queue = _broadcaster.register()
+        try:
+            yield format_sse(manifest_message(eng))
+            yield format_sse(system_state_message(eng))
+            while True:
+                yield format_sse(await queue.get())
+        finally:
+            _broadcaster.unregister(queue)
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/snapshot")
 def get_snapshot():
     """
     Latest processed sensor snapshot.
 
-    Returns all pressure, temperature, load cell, and derived values.
-    Pressures (POT, PFT, POI, PFI, PFO, PC, PNS, PNP) are in Pa
-    Replace with the most recent data available - always represents
-    the last completed 500 Hz batch.
+    `channels` is keyed by channel id from channels.yaml; each entry
+    carries value / unit / status / last_updated. Units are whatever the
+    manifest declares (pressures in Pa). Always represents the last
+    completed 500 Hz batch.
 
     Recommended polling pattern (SR 3.3.2):
         t0 = now(); GET /snapshot; sleep(max(0, 1/display_hz - (now()-t0)))
@@ -178,7 +235,13 @@ def get_snapshot():
 
 @app.get("/actuators")
 def get_actuators():
-    """Returns the current logical states of all system actuators. (1=open, 0=closed)."""
+    """
+    Current state of every system actuator.
+
+    Each entry is {"state": 1|0, "moving": bool}. `moving` is only ever
+    true for stepper-driven valves, where a commanded move takes real time
+    to complete; for a solenoid the DIO write is the state.
+    """
     eng = _require_engine()
     return eng.snapshot.actuators or {}
 
@@ -274,14 +337,6 @@ def post_tare():
     """Captures load cell baseline readings as tare offsets."""
     eng = _require_engine()
     eng.tare()
-    return {"ok": True}
-
-
-@app.post("/reset_impulse")
-def post_reset_impulse():
-    """Resets the total impulse accumulators."""
-    eng = _require_engine()
-    eng.reset_impulse()
     return {"ok": True}
 
 

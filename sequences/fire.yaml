@@ -4,33 +4,38 @@
 #   state 1 = energise / open
 #   state 0 = de-energise / closed / safe
 #
-# Actuator names must exactly match _ACTUATOR_CHANNELS in hardware/interface.py:
-#   LOx Press, Fuel Press, LOx Purge, Fuel Purge,
-#   LOx Main, Fuel Main, LOx Vent, Fuel Vent, Ignition
+# Actuator names must exactly match an `id` in actuators.yaml:
+#   lox_press, fuel_press, lox_purge, fuel_purge,
+#   lox_main, fuel_main, lox_vent, fuel_vent, ignition
 #
 # Times are relative to T=0 (moment FIRE is confirmed).
 #
 # Format is as follows: [elapsed_seconds, actuator_name, state]
-# Sourced from prior DAQ FIRE_SEQUENCE.
+#
+# !! TIMINGS BELOW ARE PLACEHOLDERS, NOT A REVIEWED LEGACY-CART TIMELINE !!
+# They are LQD-DAQ's timeline with the actuator names remapped to this
+# cart's ids, kept so the sequence executor has a runnable file. This cart
+# is a different engine. The real timeline (lox_main & fuel_main that are 
+# stepper moves, so instant shut off is impossible). Awaiting liquid review.
 
 post_record_seconds: 5.0
 
 steps:
-  - [1.10,  "LOx Purge",  1]
-  - [1.10,  "Fuel Purge", 1]
-  - [4.00,  "Ignition",   1]
-  - [4.50,  "Ignition",   0]
-  - [4.90,  "LOx Purge",  0]
-  - [4.90,  "Fuel Purge", 0]
-  - [5.00,  "LOx Main",   1]
-  - [5.05,  "Fuel Main",  1]
-  - [15.00, "LOx Main",   0]
-  - [15.10, "LOx Purge",  1]
-  - [15.10, "Fuel Main",  0]
-  - [15.20, "Fuel Purge", 1]
-  - [16.00, "LOx Press",  0]
-  - [16.00, "Fuel Press", 0]
-  - [16.00, "LOx Vent",   0]
-  - [16.00, "Fuel Vent",  0]
-  - [21.00, "LOx Purge",  0]
-  - [21.00, "Fuel Purge", 0]
+  - [1.10,  "lox_purge",  1]
+  - [1.10,  "fuel_purge", 1]
+  - [4.00,  "ignition",   1]
+  - [4.50,  "ignition",   0]
+  - [4.90,  "lox_purge",  0]
+  - [4.90,  "fuel_purge", 0]
+  - [5.00,  "lox_main",   1]
+  - [5.05,  "fuel_main",  1]
+  - [15.00, "lox_main",   0]
+  - [15.10, "lox_purge",  1]
+  - [15.10, "fuel_main",  0]
+  - [15.20, "fuel_purge", 1]
+  - [16.00, "lox_press",  0]
+  - [16.00, "fuel_press", 0]
+  - [16.00, "lox_vent",   0]
+  - [16.00, "fuel_vent",  0]
+  - [21.00, "lox_purge",  0]
+  - [21.00, "fuel_purge", 0]

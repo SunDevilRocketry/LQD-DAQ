@@ -6,19 +6,28 @@
 # water hammer.
 #
 # Format is as follows: [elapsed_seconds, actuator_name, state]
-# Sourced from prior DAQ ABORT_SEQUENCE.
+#
+# !! TIMINGS BELOW ARE PLACEHOLDERS, NOT A REVIEWED LEGACY-CART ABORT !!
+# LQD-DAQ's abort ordering with actuator names remapped to this cart's ids.
+# The ordering is safety-critical and belongs to the Liquids review. 
+# Two things specifically need re-deciding here:
+#   - lox_main/fuel_main are stepper-driven on this cart. Commanding them
+#     closed starts.
+#   - Engine.all_safe() de-energises solenoids and cancels any in-flight
+#     stepper burst, which leaves a main valve wherever it currently sits.
+#     Closing the mains is this file's responsibility.
 
 post_record_seconds: 5.0
 
 steps:
-  - [0.00, "Ignition",   0]
-  - [0.00, "LOx Main",   0]
-  - [0.00, "Fuel Main",  0]
-  - [0.00, "LOx Press",  0]
-  - [0.00, "Fuel Press", 0]
-  - [0.05, "LOx Purge",  1]
-  - [0.05, "Fuel Purge", 1]
-  - [0.10, "LOx Vent",   0]
-  - [0.10, "Fuel Vent",  0]
-  - [5.00, "LOx Purge",  0]
-  - [5.00, "Fuel Purge", 0]
+  - [0.00, "ignition",   0]
+  - [0.00, "lox_main",   0]
+  - [0.00, "fuel_main",  0]
+  - [0.00, "lox_press",  0]
+  - [0.00, "fuel_press", 0]
+  - [0.05, "lox_purge",  1]
+  - [0.05, "fuel_purge", 1]
+  - [0.10, "lox_vent",   0]
+  - [0.10, "fuel_vent",  0]
+  - [5.00, "lox_purge",  0]
+  - [5.00, "fuel_purge", 0]

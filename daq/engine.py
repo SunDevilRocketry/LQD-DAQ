@@ -31,58 +31,69 @@ import time
 import threading
 import traceback
 from collections import deque
-from typing import Optional, Any
+from typing import Optional
 
 import yaml
 
 from daq.hardware import Device, USING_MOCK
+from daq.manifest import (
+    ChannelReading,
+    ChannelSpec,
+    ActuatorSpec,
+    load_channels,
+    load_actuators,
+    PT_DIRECT,
+    TC_DIFFERENTIAL,
+    LC_DIRECT,
+    PHOTOGATE_COUNTER,
+)
 from daq.calculations import (
     lm34_voltage_to_celsius,
     software_seebeck_type_k,
     psi_to_pa,
     pt_voltage_to_pa,
     load_cell_voltage_to_force,
-    lox_mass_flow_rate,
-    fuel_mass_flow_rate,
-    mixture_ratio,
-    impulse_step_load_cell,
-    impulse_step_estimate,
-    lox_below_saturation,
 )
 
 
-# Fallback calibrations (overridden by calibration.json at startup).
-# PT slope/intercept remain in psi/V, psi
-_DEFAULT_CAL: dict[str, dict[str, float]] = {
-    "POT": {"slope": 252.0, "intercept": -106.0},
-    "PFT": {"slope": 252.0, "intercept": -121.0},
-    "POI": {"slope": 252.0, "intercept": -119.5},
-    "PFI": {"slope": 252.0, "intercept": -119.5},
-    "PFO": {"slope": 252.0, "intercept": -119.5},
-    "PC":  {"slope": 128.0, "intercept": -62.8},
-    "PNS": {"slope": 252.0, "intercept": -116.5},
-    "PNP": {"slope": 252.0, "intercept": -104.5},
-    "LC_1": {"slope": 100.0, "intercept": 0.0},
-    "LC_2": {"slope": 100.0, "intercept": 0.0},
+# Manifests live at the repo root next to config.yaml. Resolved off this
+# file so the defaults hold regardless of the process working directory.
+_PKG_DIR  = os.path.dirname(os.path.abspath(__file__))
+_REPO_DIR = os.path.dirname(_PKG_DIR)
+
+DEFAULT_CHANNELS_PATH  = os.path.join(_REPO_DIR, "channels.yaml")
+DEFAULT_ACTUATORS_PATH = os.path.join(_REPO_DIR, "actuators.yaml")
+
+# Fallback calibrations by channel type, applied to every channel of that
+# type that calibration.json doesn't override. Slope/intercept stay in the
+# psi calibration domain for PTs (psi/V, psi), lbf for load cells.
+#
+#   pt_direct - Omega PX309-2K5V nominal transfer function: 0-2500 psig
+#               over a 0-5 V output => 500 psi/V, 0 psi offset. Nominal
+#               datasheet values.
+#   lc_direct - placeholder. The PUSHTON S1 bridge is conditioned by an
+#               external amplifier whose gain isn't recorded yet, so this
+#               slope is a stand-in until the module is identified.
+_DEFAULT_CAL_BY_TYPE: dict[str, dict[str, float]] = {
+    PT_DIRECT: {"slope": 500.0, "intercept": 0.0},
+    LC_DIRECT: {"slope": 100.0, "intercept": 0.0},
 }
 
 # Cold Junction Compensation (CJC) sensor polling interval in seconds.
+# Photogate counters are polled on the same out-of-band tick.
 _CJC_INTERVAL_S = 0.5
+
+# LJM's missing-sample sentinel inside a stream batch.
+_MISSING_SAMPLE = -9999.0
+
+# During a comms outage no batch is processed, so state pushes come from
+# the error path instead. The first failure fires immediately; subsequent
+# ones are rate-limited to this interval.
+_ERROR_NOTIFY_INTERVAL_S = 0.5
 
 # FC.NLFS.LQDDAQ.1: data older than this is considered stale and should
 # not be presented to an operator/dashboard as current.
 _DATA_STALE_THRESHOLD_S = 1.0
-
-# Specific impulse (seconds) used for impulse estimation if load cells are absent.
-_ISP_ESTIMATE_S = 220.0
-
-# Standard sea-level atmospheric pressure (Pa) used to convert gauge -> absolute
-_ATMO_PA = 101_325.0
-
-# Threshold config (config.yaml) is authored in psi for these tags
-_PRESSURE_THRESHOLD_TAGS = frozenset({
-    "POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP",
-})
 
 # Reconnection tuning (FC.NLFS.LJ.2 / FC.NLFS.LQDDAQ.1 mitigation): after this
 # many consecutive stream_read() failures, assume the connection itself is
@@ -96,22 +107,24 @@ class EngineState:
     """
     Read-only snapshot of calculated sensor data and system states.
 
-    All scalar fields are primitive types or None (Json serialization ease).
-    Instance fields are restricted using __slots__ to prevent dynamic 
+    Split into two halves:
+
+      Structural fields  - fixed for every cart, kept as named __slots__.
+      Channel-set fields - whatever channels.yaml declares, carried in the
+                           `channels` dict as ChannelReading objects.
+
+    The channel set is manifest-driven precisely so this class does *not*
+    have to be edited when the cart's sensor inventory changes.
+
+    Instance fields are restricted using __slots__ to prevent dynamic
     attribute assignment.
     """
     __slots__ = (
         "timestamp",
-        # Calibrated sensor readings
-        "POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP",
-        "TOI", "TFI", "TFO",
-        "LC_1", "LC_2",
-        # Calculated physical values
-        "lox_mdot", "fuel_mdot", "mixture_ratio",
-        "impulse_lbfs", "impulse_ns",
-        "lox_below_sat",
+        # Manifest-driven readings
+        "channels",     # dict[str, ChannelReading]
+        "actuators",    # dict[str, ActuatorReading]
         # Hardware & loop state
-        "actuators",
         "streaming", "sequence_active", "sequence_name",
         "using_mock", "stream_hz",
         "cjc_celsius",
@@ -120,6 +133,7 @@ class EngineState:
     def __init__(self) -> None:
         for slot in self.__slots__:
             object.__setattr__(self, slot, None)
+        object.__setattr__(self, "channels", {})
         object.__setattr__(self, "actuators", {})
         object.__setattr__(self, "streaming", False)
         object.__setattr__(self, "sequence_active", False)
@@ -133,6 +147,8 @@ class Engine:
     Instantiate once, call start(), then read .snapshot from any thread.
 
     Args:
+        channels_path:  Path to channels.yaml (the cart's sensor manifest).
+        actuators_path: Path to actuators.yaml (the cart's actuator manifest).
         cal_path:      Path to calibration.json (optional).
                        Also used by save_calibration() to persist runtime changes.
         sequence_dir:  Directory containing fire.yaml / abort.yaml.
@@ -149,47 +165,59 @@ class Engine:
 
     def __init__(
         self,
-        cal_path:     Optional[str] = None,
-        sequence_dir: str = "sequences",
+        cal_path:       Optional[str] = None,
+        sequence_dir:   str = "sequences",
         logger=None,
-        thresholds:   Optional[dict] = None,
+        thresholds:     Optional[dict] = None,
+        channels_path:  str = DEFAULT_CHANNELS_PATH,
+        actuators_path: str = DEFAULT_ACTUATORS_PATH,
     ) -> None:
         self._lock = threading.RLock()
         self._event_log: deque[str] = deque(maxlen=500)  # Rolling debug log console (SR 3.5)
         self._snapshot = EngineState()
 
-        self._device        = Device()
+        # Cart inventory - everything downstream iterates these instead of
+        # a literal tag tuple.
+        self._channels:  list[ChannelSpec]  = load_channels(channels_path)
+        self._actuators: list[ActuatorSpec] = load_actuators(actuators_path)
+
+        self._device        = Device(self._channels, self._actuators)
         self._logger        = logger
         self._sequence_dir  = sequence_dir
         self._thresholds    = self._convert_thresholds_to_pa(thresholds or {})
 
-        # Calibration state (re-loaded from disk if path exists)        
+        # Calibration state (re-loaded from disk if path exists)
         self._cal_path = cal_path
-        self._cal = dict(_DEFAULT_CAL)
+        self._cal = self._default_calibration()
         if cal_path and os.path.exists(cal_path):
             self._load_calibration(cal_path)
 
-        # Tare offsets for load cells (set by caller via tare())
-        self._lc_tare: dict[str, float] = {"LC_1": 0.0, "LC_2": 0.0}
+        # Tare offsets, keyed by load cell channel id (set by caller via tare())
+        self._lc_tare: dict[str, float] = {
+            spec.id: 0.0 for spec in self._channels if spec.type == LC_DIRECT
+        }
 
         # CJC polling state (thermocouple cold junction reference)
         self._cjc_celsius: float = 25.0
         self._last_cjc_read: float = 0.0
 
+        # Latest out-of-band photogate counter values, keyed by channel id.
+        self._counters: dict[str, float] = {}
+
         # Monotonic timestamp of the last successfully processed batch.
         self._last_batch_perf_time: float = 0.0
-
-        # Impulse integration accumulators
-        self._impulse_lbfs:     float = 0.0
-        self._impulse_ns:       float = 0.0
-        self._prev_force_lbf:   Optional[float] = None
-        self._prev_scan_time:   Optional[float] = None
 
         # Autosequence thread handles & event flags
         self._sequence_thread:   Optional[threading.Thread] = None
         self._abort_flag         = threading.Event()
         self._sequence_active    = False
         self._sequence_name      = ""
+        self._sequence_t0:       Optional[float] = None
+
+        # Optional callback fired whenever there is new state worth pushing.
+        # Kept as a plain callable so the engine stays free of any asyncio
+        # or transport concern | api.py is what turns this into SSE.
+        self._state_listener = None
 
         # Hardware streaming thread state
         self._stream_thread: Optional[threading.Thread] = None
@@ -246,14 +274,78 @@ class Engine:
         with self._lock:
             return dict(self._thresholds)
 
-    @staticmethod
-    def _convert_thresholds_to_pa(raw: dict) -> dict:
+    def set_state_listener(self, listener) -> None:
         """
-        Converts psi-authored pressure threshold bounds to Pa
+        Registers a callback fired whenever there is new state worth pushing.
+
+        Called with no arguments from the stream thread, both after a batch
+        is processed and on an error tick where no batch arrived. The
+        listener is responsible for reading the snapshot itself and for
+        being quick and non-blocking - it runs on the acquisition thread.
+        Pass None to detach.
         """
+        self._state_listener = listener
+
+    def _notify_state(self) -> None:
+        """
+        Fires the state listener, swallowing anything it raises.
+        """
+        listener = self._state_listener
+        if listener is None:
+            return
+        try:
+            listener()
+        except Exception as exc:
+            self._log(f"State listener error (ignored): {exc}")
+
+    @property
+    def sequence_elapsed_s(self) -> Optional[float]:
+        """Seconds since the active sequence started, or None if idle."""
+        with self._lock:
+            t0 = self._sequence_t0 if self._sequence_active else None
+        return None if t0 is None else time.perf_counter() - t0
+
+    def set_logger(self, logger) -> None:
+        """
+        Attaches a CSV logger after construction.
+
+        The logger's column set is built from this engine's channel
+        manifest, so it can't be constructed until the engine has parsed
+        channels.yaml - hence the post-construction hand-off.
+        """
+        self._logger = logger
+
+    @property
+    def channel_specs(self) -> list[ChannelSpec]:
+        """The cart's channel manifest, as loaded from channels.yaml."""
+        return list(self._channels)
+
+    @property
+    def actuator_specs(self) -> list[ActuatorSpec]:
+        """The cart's actuator manifest, as loaded from actuators.yaml."""
+        return list(self._actuators)
+
+    def _default_calibration(self) -> dict[str, dict[str, float]]:
+        """Builds the per-channel fallback calibration table from the manifest."""
+        return {
+            spec.cal_ref or spec.id: dict(_DEFAULT_CAL_BY_TYPE[spec.type])
+            for spec in self._channels
+            if spec.type in _DEFAULT_CAL_BY_TYPE
+        }
+
+    def _convert_thresholds_to_pa(self, raw: dict) -> dict:
+        """
+        Converts psi-authored pressure threshold bounds to Pa.
+
+        Which tags count as pressures comes from the manifest (every
+        pt_direct channel).
+        """
+        pressure_ids = {
+            spec.id for spec in self._channels if spec.type == PT_DIRECT
+        }
         converted: dict = {}
         for tag, bands in raw.items():
-            if tag in _PRESSURE_THRESHOLD_TAGS and isinstance(bands, dict):
+            if tag in pressure_ids and isinstance(bands, dict):
                 converted[tag] = {
                     band: [psi_to_pa(lo), psi_to_pa(hi)]
                     for band, (lo, hi) in bands.items()
@@ -261,6 +353,40 @@ class Engine:
             else:
                 converted[tag] = bands
         return converted
+
+    def _channel_status(self, tag: str, value: Optional[float]) -> Optional[str]:
+        """
+        Classify a reading against its config.yaml threshold bands.
+
+        Returns:
+            NOMINAL    - inside the normal band
+            CAUTION    - outside normal but inside warning
+            WARNING    - outside warning (interlock hazard)
+            UNASSIGNED - the channel has no threshold bands configured
+            None       - bands exist but there is no reading to classify
+
+        The first three are Dashboard's existing enum (readingStatus.ts).
+        UNASSIGNED extends it, and is checked first because it describes
+        the *config* rather than the reading: A channel w/o set bounds is 
+        an open gap. Flagging it as such.
+
+        None survives only for the narrow case of a monitored channel with
+        no data this batch - there is genuinely nothing to classify there.
+        """
+        bands = self._thresholds.get(tag)
+        if not isinstance(bands, dict):
+            return "UNASSIGNED"
+        if value is None:
+            return None
+
+        normal  = bands.get("normal")
+        warning = bands.get("warning")
+
+        if normal and normal[0] <= value <= normal[1]:
+            return "NOMINAL"
+        if warning and warning[0] <= value <= warning[1]:
+            return "CAUTION"
+        return "WARNING"
 
     @property
     def data_age_seconds(self) -> float:
@@ -310,20 +436,12 @@ class Engine:
     def tare(self) -> None:
         """Tares the load cells using the latest baseline sensor readings."""
         with self._lock:
-            snap = self._snapshot
-            for tag in ("LC_1", "LC_2"):
-                raw = getattr(snap, tag, None)
-                if raw is not None:
-                    self._lc_tare[tag] = raw
+            channels = self._snapshot.channels or {}
+            for tag in self._lc_tare:
+                reading = channels.get(tag)
+                if reading is not None and reading.value is not None:
+                    self._lc_tare[tag] += reading.value
         self._log("Load cells tared")
-
-    def reset_impulse(self) -> None:
-        """Resets the total impulse integration accumulators."""
-        with self._lock:
-            self._impulse_lbfs   = 0.0
-            self._impulse_ns     = 0.0
-            self._prev_force_lbf = None
-            self._prev_scan_time = None
 
     def fire(self) -> None:
         """Spawns the fire autosequence thread if the system is idle."""
@@ -375,7 +493,7 @@ class Engine:
         Update a sensor calibration coefficient at runtime.
 
         Args:
-            tag:       Sensor tag (e.g. "PC", "POT").
+            tag:       Calibration reference tag (e.g. "pt0", "lc0").
             slope:     New slope in engineering-units per volt.
             intercept: New intercept in engineering units.
         """
@@ -397,8 +515,14 @@ class Engine:
                 "Pass cal_path=<path> to enable persistence."
             )
 
-        pt_tags = {"POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP"}
-        lc_tags = {"LC_1", "LC_2"}
+        pt_tags = {
+            spec.cal_ref or spec.id
+            for spec in self._channels if spec.type == PT_DIRECT
+        }
+        lc_tags = {
+            spec.cal_ref or spec.id
+            for spec in self._channels if spec.type == LC_DIRECT
+        }
         output: dict[str, dict] = {"PT": {}, "LC": {}}
 
         with self._lock:
@@ -440,6 +564,7 @@ class Engine:
                 object.__setattr__(s, "using_mock",  USING_MOCK)
 
             consecutive_errors = 0
+            last_error_notify = 0.0
             while self._running:
                 try:
                     batch = self._device.stream_read()
@@ -453,6 +578,14 @@ class Engine:
                     with self._lock:
                         object.__setattr__(self._snapshot, "streaming", False)
 
+                    # The moment comms drop is the one moment no batch gets
+                    # processed. Push the first failure immediately then throttle.
+                    now_err = time.perf_counter()
+                    if (consecutive_errors == 1
+                            or now_err - last_error_notify >= _ERROR_NOTIFY_INTERVAL_S):
+                        last_error_notify = now_err
+                        self._notify_state()
+
                     if consecutive_errors >= _MAX_CONSECUTIVE_READ_ERRORS:
                         consecutive_errors = 0
                         if self._running:
@@ -461,12 +594,17 @@ class Engine:
                         time.sleep(0.1)
                     continue
 
-                # Periodically poll CJC temperature outside the hardware stream
+                # Periodically poll the out-of-band channels (CJC reference
+                # and photogate counters) outside the hardware stream.
                 now = time.perf_counter()
                 if now - self._last_cjc_read >= _CJC_INTERVAL_S:
                     try:
                         cjc_v = self._device.read_cjc()
                         self._cjc_celsius = lm34_voltage_to_celsius(cjc_v)
+                    except Exception:
+                        pass
+                    try:
+                        self._counters = dict(self._device.read_counters())
                     except Exception:
                         pass
                     self._last_cjc_read = now
@@ -542,180 +680,142 @@ class Engine:
 
         self._log("Reconnect loop exiting - engine is stopping")
 
+    def _channel_calibration(self, spec: ChannelSpec) -> dict[str, float]:
+        """Calibration coefficients for one channel, falling back to its type default."""
+        return self._cal.get(
+            spec.cal_ref or spec.id,
+            _DEFAULT_CAL_BY_TYPE.get(spec.type, {"slope": 1.0, "intercept": 0.0}),
+        )
+
+    def _scale_channel(
+        self, spec: ChannelSpec, raw: list[float], cjc_c: float
+    ) -> list[Optional[float]]:
+        """
+        Convert one channel's raw scan voltages to engineering units.
+
+        Dispatches on the manifest's channel type to the matching
+        calculations.py function.
+        """
+        c = self._channel_calibration(spec)
+
+        if spec.type == PT_DIRECT:
+            return [
+                None if v == _MISSING_SAMPLE
+                else pt_voltage_to_pa(v, c["slope"], c["intercept"])
+                for v in raw
+            ]
+
+        if spec.type == LC_DIRECT:
+            tare = self._lc_tare.get(spec.id, 0.0)
+            return [
+                None if v == _MISSING_SAMPLE
+                else load_cell_voltage_to_force(v, c["slope"], c["intercept"], tare)
+                for v in raw
+            ]
+
+        if spec.type == TC_DIFFERENTIAL:
+            return [
+                None if v == _MISSING_SAMPLE
+                else software_seebeck_type_k(v, cjc_c)
+                for v in raw
+            ]
+
+        return [None] * len(raw)
+
     def _process_batch(self, batch: dict[str, list[float]]) -> None:
-        """Calibrates, computes derived values for a raw data batch, and updates the snapshot."""
+        """
+        Calibrates a raw data batch and atomically swaps in a new snapshot.
+
+        Iterates the channels.yaml manifest so the cart's sensor inventory 
+        is config. Channels the manifest marks inactive & channels the hardware
+        layer had no wired pin for simply carry no value. They stay in the 
+        reported channel set so a consumer's key set matches the manifest.
+        """
         scan_times = batch.get("scan_times", [])
         n_scans    = len(scan_times)
         if n_scans == 0:
             return
 
-        cal   = self._cal
         cjc_c = self._cjc_celsius
+        now_epoch = time.time()
 
-        # Accumulate high-frequency TC readings for batch-averaging to mitigate noise
-        tc_accum: dict[str, list[float]] = {tag: [] for tag in ("TOI", "TFI", "TFO")}
+        # Per-scan engineering values, keyed by channel id (feeds the CSV).
+        eng_rows: dict[str, list[Optional[float]]] = {}
+        # Snapshot value per channel - the batch's final scan, except TCs.
+        latest: dict[str, Optional[float]] = {}
 
-        last: dict[str, Any] = {}
+        for spec in self._channels:
+            if not spec.active or not spec.is_streamed:
+                continue
+            raw = batch.get(spec.id)
+            if raw is None:
+                continue
 
-        # Capture intermediate impulse step values per scan for accurate row logging
-        impulse_ns_per_scan: list[float] = []
+            eng_rows[spec.id] = self._scale_channel(spec, raw, cjc_c)
 
-        for i in range(n_scans):
-            t = scan_times[i]
-            row: dict[str, Any] = {"t": t}
-
-            # Scale pressure transducers
-            for tag in ("POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP"):
-                v = batch[tag][i]
-                if v == -9999.0:
-                    row[tag] = None
-                    continue
-                c = cal.get(tag, {"slope": 252.0, "intercept": -119.5})
-                row[tag] = pt_voltage_to_pa(v, c["slope"], c["intercept"])
-
-            # Accumulate thermocouple raw voltages
-            for tag in ("TOI", "TFI", "TFO"):
-                v = batch[tag][i]
-                if v != -9999.0:
-                    tc_accum[tag].append(v)
-                row[tag] = None
-
-            # Scale and tare load cells
-            for tag in ("LC_1", "LC_2"):
-                v = batch[tag][i]
-                if v == -9999.0:
-                    row[tag] = None
-                    continue
-                c    = cal.get(tag, {"slope": 100.0, "intercept": 0.0})
-                tare = self._lc_tare.get(tag, 0.0)
-                row[tag] = load_cell_voltage_to_force(v, c["slope"], c["intercept"], tare)
-
-            # Integrate force over time to accumulate total impulse (trapezoidal step)
-            lc1 = row.get("LC_1")
-            lc2 = row.get("LC_2")
-            if lc1 is not None and lc2 is not None:
-                total_force = lc1 + lc2
-                if self._prev_force_lbf is not None and self._prev_scan_time is not None:
-                    dt = t - self._prev_scan_time
-                    if 0 < dt < 1.0:
-                        step = impulse_step_load_cell(
-                            self._prev_force_lbf, total_force, dt
-                        )
-                        self._impulse_lbfs += step
-                        self._impulse_ns   += step * 4.44822
-                self._prev_force_lbf = total_force
-                self._prev_scan_time = t
-
-            impulse_ns_per_scan.append(self._impulse_ns)
-            last = row
-
-        # Compute batch-averaged engineering values for thermocouples
-        tc_eng: dict[str, Optional[float]] = {}
-        for tag, vals in tc_accum.items():
-            if vals:
-                avg_v = sum(vals) / len(vals)
-                tc_eng[tag] = software_seebeck_type_k(avg_v, cjc_c)
+            if spec.type == TC_DIFFERENTIAL:
+                # Batch-average the raw voltages before conversion; the TC
+                # signal is small enough that per-scan noise dominates.
+                valid = [v for v in raw if v != _MISSING_SAMPLE]
+                latest[spec.id] = (
+                    software_seebeck_type_k(sum(valid) / len(valid), cjc_c)
+                    if valid else None
+                )
             else:
-                tc_eng[tag] = None
+                latest[spec.id] = eng_rows[spec.id][-1]
 
-        # Calculate derived mass flow and mixture ratios
-        toi  = tc_eng.get("TOI")
-        poi  = last.get("POI")
-        pfo  = last.get("PFO")
-        pc   = last.get("PC")
-        pot  = last.get("POT")
+        # Photogate counters arrive from the out-of-band poll. Informational 
+        # telemetry only.
+        for spec in self._channels:
+            if spec.active and spec.type == PHOTOGATE_COUNTER:
+                latest[spec.id] = self._counters.get(spec.id)
 
-        # Guard against None values (zero is a valid physical value).
-        lox_mdot  = (
-            lox_mass_flow_rate(toi, poi, pc)
-            if (toi is not None and poi is not None and pc is not None)
-            else None
-        )
-        fuel_mdot = (
-            fuel_mass_flow_rate(pfo, pc)
-            if (pfo is not None and pc is not None)
-            else None
-        )
-        of_ratio  = mixture_ratio(lox_mdot, fuel_mdot)
-
-        # Convert gauge Pa to absolute Pa for the Antoine saturation calculation
-        below_sat: Optional[bool] = None
-        if toi is not None and pot is not None:
-            pot_pa_abs = pot + _ATMO_PA
-            below_sat = lox_below_saturation(pot_pa_abs, toi)
-
-        # Apply mathematical fallback calculation for impulse if load cells are missing
-        lc1_v = last.get("LC_1")
-        lc2_v = last.get("LC_2")
-        if (lc1_v is None or lc2_v is None) and (lox_mdot or fuel_mdot):
-            dt_est = (1.0 / self._device.stream_rate_hz) * n_scans
-            est_step = impulse_step_estimate(lox_mdot, fuel_mdot, dt_est, _ISP_ESTIMATE_S)
-            if est_step is not None:
-                self._impulse_ns += est_step
+        channels = {
+            spec.id: ChannelReading(
+                value        = latest.get(spec.id),
+                unit         = spec.unit,
+                status       = self._channel_status(spec.id, latest.get(spec.id)),
+                last_updated = now_epoch if spec.id in latest else None,
+            )
+            for spec in self._channels
+        }
 
         # Build and swap the new snapshot
         new_snap = EngineState()
-        object.__setattr__(new_snap, "timestamp",       last.get("t"))
+        object.__setattr__(new_snap, "timestamp",       scan_times[-1])
         object.__setattr__(new_snap, "streaming",       True)
         object.__setattr__(new_snap, "stream_hz",       self._device.stream_rate_hz)
         object.__setattr__(new_snap, "using_mock",      USING_MOCK)
         object.__setattr__(new_snap, "cjc_celsius",     cjc_c)
+        object.__setattr__(new_snap, "channels",        channels)
         object.__setattr__(new_snap, "actuators",       dict(self._device.actuator_states()))
         object.__setattr__(new_snap, "sequence_active", self._sequence_active)
         object.__setattr__(new_snap, "sequence_name",   self._sequence_name)
-
-        for tag in ("POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP",
-                    "LC_1", "LC_2"):
-            object.__setattr__(new_snap, tag, last.get(tag))
-
-        for tag in ("TOI", "TFI", "TFO"):
-            object.__setattr__(new_snap, tag, tc_eng.get(tag))
-
-        object.__setattr__(new_snap, "lox_mdot",      lox_mdot)
-        object.__setattr__(new_snap, "fuel_mdot",     fuel_mdot)
-        object.__setattr__(new_snap, "mixture_ratio", of_ratio)
-        object.__setattr__(new_snap, "impulse_lbfs",  self._impulse_lbfs)
-        object.__setattr__(new_snap, "impulse_ns",    self._impulse_ns)
-        object.__setattr__(new_snap, "lox_below_sat", below_sat)
 
         with self._lock:
             self._snapshot = new_snap
             self._last_batch_perf_time = time.perf_counter()
 
-        # Export calibrated values and raw hardware rows to CSV
+        # Push before the CSV work so consumers see the new state at the
+        # earliest possible moment; logging is the slower, non-urgent half.
+        self._notify_state()
+
+        # Export raw hardware and calibrated values to CSV, one row per scan.
+        # Column order follows logger.py's manifest-driven header.
         if self._logger:
+            csv_specs = [
+                spec for spec in self._channels
+                if spec.active and spec.is_streamed
+            ]
             for i in range(n_scans):
-                t = scan_times[i]
-                row_vals: list = [t]
-                for tag in ("POT", "PFT", "POI", "PFI", "PFO",
-                            "PC", "PNS", "PNP"):
-                    v = batch[tag][i]
-                    if v == -9999.0:
+                row_vals: list = [scan_times[i]]
+                for spec in csv_specs:
+                    raw = batch.get(spec.id)
+                    eng = eng_rows.get(spec.id)
+                    if raw is None or eng is None or eng[i] is None:
                         row_vals.extend(["", ""])
                     else:
-                        c   = cal.get(tag, {"slope": 252.0, "intercept": -119.5})
-                        eng = pt_voltage_to_pa(v, c["slope"], c["intercept"])
-                        row_vals.extend([f"{v:.6f}", f"{eng:.4f}"])
-                for tag in ("TOI", "TFI", "TFO"):
-                    v = batch[tag][i]
-                    if v == -9999.0:
-                        row_vals.extend(["", ""])
-                    else:
-                        eng = software_seebeck_type_k(v, cjc_c)
-                        row_vals.extend([f"{v:.6f}", f"{eng:.4f}"])
-                for tag in ("LC_1", "LC_2"):
-                    v = batch[tag][i]
-                    if v == -9999.0:
-                        row_vals.extend(["", ""])
-                    else:
-                        c    = cal.get(tag, {"slope": 100.0, "intercept": 0.0})
-                        tare = self._lc_tare.get(tag, 0.0)
-                        eng  = load_cell_voltage_to_force(v, c["slope"], c["intercept"], tare)
-                        row_vals.extend([f"{v:.6f}", f"{eng:.4f}"])
-                # Per-scan impulse - not batch-final
-                row_vals.append(f"{impulse_ns_per_scan[i]:.4f}")
-                row_vals.append(f"{lox_mdot:.6f}"  if lox_mdot  is not None else "")
-                row_vals.append(f"{fuel_mdot:.6f}" if fuel_mdot is not None else "")
+                        row_vals.extend([f"{raw[i]:.6f}", f"{eng[i]:.4f}"])
                 self._logger.write_row(row_vals)
 
     # --------------------------------------------------------
@@ -779,6 +879,8 @@ class Engine:
             self._logger.start_recording(prefix="hotfire")
 
         t0 = time.perf_counter()
+        with self._lock:
+            self._sequence_t0 = t0
         idx = 0
 
         while idx < len(steps):
@@ -829,6 +931,7 @@ class Engine:
         with self._lock:
             self._sequence_active = False
             self._sequence_name   = ""
+            self._sequence_t0     = None
 
     def _load_sequence(
         self, path: str

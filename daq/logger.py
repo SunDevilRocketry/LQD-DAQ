@@ -17,7 +17,9 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Sequence
+
+from daq.manifest import ChannelSpec
 
 
 # Buffer polling and disk flushing intervals
@@ -31,7 +33,7 @@ class Logger:
     Non-blocking CSV logger.
 
     Usage:
-        logger = Logger(output_dir="data")
+        logger = Logger(output_dir="data", channels=engine.channel_specs)
         logger.open()                          # starts writer thread
 
         logger.start_recording("hotfire")      # opens CSV file
@@ -46,9 +48,21 @@ class Logger:
         start_recording() and stop_recording() are driven dynamically by the engine.
     """
 
-    def __init__(self, output_dir: str = ".") -> None:
+    def __init__(
+        self,
+        output_dir: str = ".",
+        channels: Optional[Sequence[ChannelSpec]] = None,
+    ) -> None:
         self._output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
+
+        # CSV column set follows channels.yaml. Only active, streamed
+        # channels get columns. Photogate counter isn't sampled per scan,
+        # and an inactive channel would be a column of empty strings.
+        self._channels: list[ChannelSpec] = [
+            spec for spec in (channels or [])
+            if spec.active and spec.is_streamed
+        ]
 
         self._buffer: deque[list] = deque(maxlen=_MAX_BUFFER)
         self._lock   = threading.Lock()
@@ -253,27 +267,16 @@ class Logger:
     # CSV Schema Definition
     # --------------------------------------------------------
 
-    @staticmethod
-    def _header() -> list[str]:
-        """Returns the list of column headers matching the telemetry row schema."""
+    def _header(self) -> list[str]:
+        """
+        Column headers for the telemetry row schema.
+
+        Derived from channels.yaml. Column order here must match the
+        order engine._process_batch() assembles rows in - both iterate the
+        same filtered manifest list.
+        """
         cols = ["time_s"]
-
-        pt_tags = ["POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP"]
-        tc_tags = ["TOI", "TFI", "TFO"]
-        lc_tags = ["LC_1", "LC_2"]
-
-        for tag in pt_tags:
-            cols.append(f"{tag}_raw_V")
-            cols.append(f"{tag}_eng_Pa")
-        for tag in tc_tags:
-            cols.append(f"{tag}_raw_V")
-            cols.append(f"{tag}_eng_C")
-        for tag in lc_tags:
-            cols.append(f"{tag}_raw_V")
-            cols.append(f"{tag}_eng_lbf")
-
-        cols.append("impulse_ns")
-        cols.append("lox_mdot_kg_s")
-        cols.append("fuel_mdot_kg_s")
-
+        for spec in self._channels:
+            cols.append(f"{spec.id}_raw_V")
+            cols.append(f"{spec.id}_eng_{spec.unit}")
         return cols

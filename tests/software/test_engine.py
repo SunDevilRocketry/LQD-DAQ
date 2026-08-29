@@ -17,7 +17,6 @@ import time
 
 import pytest
 
-from daq.engine import Engine
 from daq.calculations import psi_to_pa
 
 from tests.software._helpers import make_engine
@@ -38,64 +37,84 @@ class TestEngine:
     def test_snapshot_is_streaming(self):
         assert self.engine.snapshot.streaming is True
 
-    def test_snapshot_has_pressure_values(self):
+    def test_snapshot_channels_match_manifest(self):
+        """Every channel in channels.yaml is reported, active or not."""
         snap = self.engine.snapshot
-        assert snap.PC  is not None, "PC is None"
-        assert snap.POT is not None, "POT is None"
-        assert snap.PFT is not None, "PFT is None"
+        assert set(snap.channels) == {
+            spec.id for spec in self.engine.channel_specs
+        }
+
+    def test_snapshot_has_pressure_values(self):
+        channels = self.engine.snapshot.channels
+        for tag in ("pt0", "pt1", "pt2"):
+            assert channels[tag].value is not None, f"{tag} is None"
 
     def test_snapshot_pressures_in_engineering_range(self):
-        snap = self.engine.snapshot
+        channels = self.engine.snapshot.channels
         # Default mock + default cal -> should be roughly 100-400 psi equivalent.
-        assert psi_to_pa(50) < snap.PC  < psi_to_pa(500), f"PC={snap.PC}"
-        assert psi_to_pa(50) < snap.POT < psi_to_pa(500), f"POT={snap.POT}"
+        for tag in ("pt0", "pt1", "pt2"):
+            v = channels[tag].value
+            assert psi_to_pa(50) < v < psi_to_pa(500), f"{tag}={v}"
+
+    def test_inactive_channel_reported_with_no_value(self):
+        reading = self.engine.snapshot.channels["pt7"]
+        assert reading.value is None
+        assert reading.unit == "Pa"
 
     def test_snapshot_has_tc_values(self):
-        snap = self.engine.snapshot
         # TCs are batch-averaged; need a couple of batches
         time.sleep(0.3)
-        snap = self.engine.snapshot
-        assert snap.TOI is not None, "TOI is None"
+        assert self.engine.snapshot.channels["tc0"].value is not None
 
     def test_snapshot_has_actuator_dict(self):
         snap = self.engine.snapshot
         assert isinstance(snap.actuators, dict)
-        assert "LOx Main" in snap.actuators
+        assert "lox_main" in snap.actuators
+        assert snap.actuators["lox_main"].moving is False
+
+    def test_stepper_reports_moving_during_commanded_move(self):
+        """A stepper main is in flight for the burst duration; a solenoid
+        never is, b/c for a solenoid the DIO write is the state."""
+        self.engine.write_actuator("lox_main", 1)
+        time.sleep(0.15)
+        actuators = self.engine.snapshot.actuators
+        assert actuators["lox_main"].moving is True
+        assert actuators["lox_purge"].moving is False
+
+    def test_photogate_counter_is_reported(self):
+        """Position feedback is telemetry, polled out-of-band like CJC."""
+        self.engine.write_actuator("lox_main", 1)
+        time.sleep(1.2)   # cover at least two out-of-band poll ticks
+        reading = self.engine.snapshot.channels["pos_lox_main"]
+        assert reading.value is not None
+        assert reading.unit == "counts"
 
     def test_snapshot_using_mock_true(self):
         assert self.engine.snapshot.using_mock is True
 
     def test_manual_actuator_command(self):
-        self.engine.write_actuator("Fuel Vent", 1)
+        self.engine.write_actuator("fuel_vent", 1)
         time.sleep(0.15)
         snap = self.engine.snapshot
-        assert snap.actuators.get("Fuel Vent") == 1
+        assert snap.actuators["fuel_vent"].state == 1
 
     def test_all_safe_clears_actuators(self):
-        self.engine.write_actuator("Fuel Vent", 1)
+        self.engine.write_actuator("fuel_vent", 1)
         time.sleep(0.05)
         self.engine.all_safe()
         time.sleep(0.15)
         snap = self.engine.snapshot
-        assert snap.actuators.get("Fuel Vent") == 0
+        assert snap.actuators["fuel_vent"].state == 0
 
     def test_tare_sets_lc_near_zero(self):
         # Before tare, LC values may be non-zero (noise)
         self.engine.tare()
         time.sleep(0.15)
-        snap = self.engine.snapshot
+        reading = self.engine.snapshot.channels["lc0"]
         # After tare, tared force should be near zero
         # (within noise of a few lbf)
-        if snap.LC_1 is not None:
-            assert abs(snap.LC_1) < 5.0, f"LC_1 after tare: {snap.LC_1}"
-
-    def test_reset_impulse(self):
-        time.sleep(0.2)
-        self.engine.reset_impulse()
-        time.sleep(0.15)
-        snap = self.engine.snapshot
-        assert snap.impulse_ns is not None
-        assert snap.impulse_ns < 1.0, "Impulse didn't reset"
+        if reading.value is not None:
+            assert abs(reading.value) < 5.0, f"lc0 after tare: {reading.value}"
 
     def test_event_log_has_entries(self):
         log = self.engine.event_log
@@ -109,7 +128,7 @@ class TestEngine:
             for _ in range(50):
                 try:
                     snap = self.engine.snapshot
-                    _ = snap.PC
+                    _ = snap.channels
                     _ = snap.actuators
                     time.sleep(0.01)
                 except Exception as exc:
@@ -127,22 +146,20 @@ class TestEngine:
         snap = self.engine.snapshot
         if snap.sequence_active:
             with pytest.raises(RuntimeError):
-                self.engine.write_actuator("LOx Main", 1)
+                self.engine.write_actuator("lox_main", 1)
 
     def test_update_calibration_changes_snapshot(self):
-        """Changing PC slope should change the PC reading."""
-        snap_before = self.engine.snapshot
-        pc_before   = snap_before.PC
+        """Doubling pt0's slope should roughly double its reading."""
+        before = self.engine.snapshot.channels["pt0"].value
+        assert before is not None
 
-        # Double the slope — reading should roughly double
-        self.engine.update_calibration("PC", slope=256.0, intercept=-62.8)
+        self.engine.update_calibration("pt0", slope=1000.0, intercept=0.0)
         time.sleep(0.3)
-        snap_after = self.engine.snapshot
-        pc_after   = snap_after.PC
+        after = self.engine.snapshot.channels["pt0"].value
 
-        assert pc_after is not None
-        # Allow wide tolerance since mock has noise and drift
-        assert pc_after != pc_before or True   # Just confirm no crash
+        assert after is not None
+        # Wide tolerance: the mock drifts and adds noise between batches.
+        assert 1.8 < after / before < 2.2, f"{before} -> {after}"
 
     def test_stop_and_snapshot_streaming_false(self):
         self.engine.stop()
@@ -241,48 +258,110 @@ class TestEngineReconnect:
 
 class TestThresholdConversion:
     """
-    config.yaml is authored in psi for pressure tags (matches
+    config.yaml is authored in psi for pressure channels (matches
     calibration.json's convention); Engine.thresholds should expose Pa
     so it's unit-consistent with /snapshot. Non-pressure entries pass
     through untouched.
     """
 
-    def test_pressure_tag_converted_to_pa(self):
-        raw = {"PC": {"normal": [100, 250], "warning": [50, 300]}}
-        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
-        pc = engine.thresholds["PC"]
-        assert abs(pc["normal"][0]  - psi_to_pa(100)) < 1e-6
-        assert abs(pc["normal"][1]  - psi_to_pa(250)) < 1e-6
-        assert abs(pc["warning"][0] - psi_to_pa(50))  < 1e-6
-        assert abs(pc["warning"][1] - psi_to_pa(300)) < 1e-6
+    def test_pressure_channel_converted_to_pa(self):
+        raw = {"pt0": {"normal": [100, 250], "warning": [50, 300]}}
+        engine = make_engine(thresholds=raw)
+        pt0 = engine.thresholds["pt0"]
+        assert abs(pt0["normal"][0]  - psi_to_pa(100)) < 1e-6
+        assert abs(pt0["normal"][1]  - psi_to_pa(250)) < 1e-6
+        assert abs(pt0["warning"][0] - psi_to_pa(50))  < 1e-6
+        assert abs(pt0["warning"][1] - psi_to_pa(300)) < 1e-6
 
-    def test_all_eight_pressure_tags_convert(self):
-        raw = {
-            tag: {"normal": [10, 20], "warning": [5, 25]}
-            for tag in ["POT", "PFT", "POI", "PFI", "PFO", "PC", "PNS", "PNP"]
-        }
-        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
-        for tag in raw:
+    def test_every_manifest_pressure_channel_converts(self):
+        engine = make_engine()
+        pt_ids = [
+            spec.id for spec in engine.channel_specs
+            if spec.type == "pt_direct"
+        ]
+        raw = {tag: {"normal": [10, 20], "warning": [5, 25]} for tag in pt_ids}
+        engine = make_engine(thresholds=raw)
+        for tag in pt_ids:
             assert abs(engine.thresholds[tag]["normal"][0] - psi_to_pa(10)) < 1e-6
 
-    def test_temperature_tag_passthrough(self):
-        raw = {"TOI": {"normal": [-200, -140], "warning": [-210, -130]}}
-        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
-        assert engine.thresholds["TOI"] == raw["TOI"], "Temp thresholds should not be converted"
+    def test_temperature_channel_passthrough(self):
+        raw = {"tc0": {"normal": [-200, -140], "warning": [-210, -130]}}
+        engine = make_engine(thresholds=raw)
+        assert engine.thresholds["tc0"] == raw["tc0"], "Temp thresholds should not be converted"
 
-    def test_load_cell_tag_passthrough(self):
-        raw = {"LC_1": {"normal": [0, 800], "warning": [-50, 900]}}
-        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
-        assert engine.thresholds["LC_1"] == raw["LC_1"], "Load cell thresholds (lbf) should not be converted"
+    def test_load_cell_channel_passthrough(self):
+        raw = {"lc0": {"normal": [0, 800], "warning": [-50, 900]}}
+        engine = make_engine(thresholds=raw)
+        assert engine.thresholds["lc0"] == raw["lc0"], "Load cell thresholds (lbf) should not be converted"
 
-    def test_derived_channel_tag_passthrough(self):
-        raw = {"mixture_ratio": {"normal": [1.8, 3.0], "warning": [1.2, 3.5]}}
-        engine = Engine(cal_path=None, sequence_dir=".", thresholds=raw)
-        assert engine.thresholds["mixture_ratio"] == raw["mixture_ratio"]
+    def test_unknown_tag_passthrough(self):
+        raw = {"not_a_channel": {"normal": [1.8, 3.0], "warning": [1.2, 3.5]}}
+        engine = make_engine(thresholds=raw)
+        assert engine.thresholds["not_a_channel"] == raw["not_a_channel"]
 
     def test_empty_thresholds_ok(self):
-        engine = Engine(cal_path=None, sequence_dir=".", thresholds=None)
+        engine = make_engine()
         assert engine.thresholds == {}
+
+
+# -- Reading Status (Dashboard readingStatus.ts enum) ----------
+
+class TestChannelStatus:
+    """
+    Status is computed DAQ-side so Dashboard never re-derives bands from a
+    separately fetched config that could drift from what actually triggers
+    an abort.
+    """
+
+    def _engine(self, bands):
+        return make_engine(thresholds={"pt0": bands})
+
+    def test_inside_normal_is_nominal(self):
+        eng = self._engine({"normal": [100, 300], "warning": [50, 400]})
+        assert eng._channel_status("pt0", psi_to_pa(200)) == "NOMINAL"
+
+    def test_outside_normal_inside_warning_is_caution(self):
+        eng = self._engine({"normal": [100, 300], "warning": [50, 400]})
+        assert eng._channel_status("pt0", psi_to_pa(350)) == "CAUTION"
+
+    def test_outside_warning_is_warning(self):
+        eng = self._engine({"normal": [100, 300], "warning": [50, 400]})
+        assert eng._channel_status("pt0", psi_to_pa(450)) == "WARNING"
+
+    def test_channel_without_bands_is_unassigned(self):
+        """No bands set is a config gap, never a reassuring NOMINAL."""
+        eng = make_engine()
+        assert eng._channel_status("pt0", psi_to_pa(200)) == "UNASSIGNED"
+
+    def test_unassigned_wins_even_with_no_reading(self):
+        """UNASSIGNED describes the config, so it doesn't need a value."""
+        eng = make_engine()
+        assert eng._channel_status("pt0", None) == "UNASSIGNED"
+
+    def test_monitored_channel_with_no_reading_has_no_status(self):
+        """Bands exist but there's nothing to classify this batch."""
+        eng = self._engine({"normal": [100, 300], "warning": [50, 400]})
+        assert eng._channel_status("pt0", None) is None
+
+    def test_inactive_channel_reports_unassigned_on_the_snapshot(self):
+        eng = make_engine()
+        eng.start()
+        try:
+            time.sleep(0.3)
+            assert eng.snapshot.channels["tc0"].status == "UNASSIGNED"
+        finally:
+            eng.stop()
+
+    def test_status_lands_on_the_snapshot(self):
+        eng = make_engine(thresholds={
+            "pt0": {"normal": [0, 5000], "warning": [0, 6000]}
+        })
+        eng.start()
+        try:
+            time.sleep(0.3)
+            assert eng.snapshot.channels["pt0"].status == "NOMINAL"
+        finally:
+            eng.stop()
 
 
 # -- Data Freshness --------------------------

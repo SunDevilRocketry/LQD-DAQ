@@ -1,16 +1,17 @@
 {
+  "_comment": "Keyed by cal_ref from channels.yaml. PT slope/intercept are psi/V and psi; LC are lbf/V and lbf. PT values below are the Omega PX309-2K5V nominal transfer function (0-2500 psig over 0-5 V), NOT a bench calibration. LC slope is a placeholder until the external bridge amplifier's gain is identified.",
   "PT": {
-    "POT": {"slope": 252.0, "intercept": -106.0},
-    "PFT": {"slope": 252.0, "intercept": -121.0},
-    "POI": {"slope": 252.0, "intercept": -119.5},
-    "PFI": {"slope": 252.0, "intercept": -119.5},
-    "PFO": {"slope": 252.0, "intercept": -119.5},
-    "PC":  {"slope": 128.0, "intercept": -62.8},
-    "PNS": {"slope": 252.0, "intercept": -116.5},
-    "PNP": {"slope": 252.0, "intercept": -104.5}
+    "pt0": {"slope": 500.0, "intercept": 0.0},
+    "pt1": {"slope": 500.0, "intercept": 0.0},
+    "pt2": {"slope": 500.0, "intercept": 0.0},
+    "pt3": {"slope": 500.0, "intercept": 0.0},
+    "pt4": {"slope": 500.0, "intercept": 0.0},
+    "pt5": {"slope": 500.0, "intercept": 0.0},
+    "pt6": {"slope": 500.0, "intercept": 0.0},
+    "pt7": {"slope": 500.0, "intercept": 0.0}
   },
   "LC": {
-    "LC_1": {"slope": 100.0, "intercept": 0.0},
-    "LC_2": {"slope": 100.0, "intercept": 0.0}
+    "lc0": {"slope": 100.0, "intercept": 0.0},
+    "lc1": {"slope": 100.0, "intercept": 0.0}
   }
 }

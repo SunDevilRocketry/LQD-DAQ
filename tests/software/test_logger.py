@@ -14,12 +14,14 @@ import time
 
 from daq.logger import Logger
 
+from tests.software._helpers import full_channels
+
 
 class TestLogger:
 
     def setup_method(self):
         self.tmp = tempfile.mkdtemp()
-        self.logger = Logger(output_dir=self.tmp)
+        self.logger = Logger(output_dir=self.tmp, channels=full_channels())
         self.logger.open()
 
     def teardown_method(self):
@@ -45,7 +47,21 @@ class TestLogger:
             reader = csv.reader(f)
             header = next(reader)
         assert "time_s" in header
-        assert "PC_raw_V" in header
+        # CSV schema follows channels.yaml, so column names are channel ids
+        # and their declared units.
+        assert "pt0_raw_V"  in header
+        assert "pt0_eng_Pa" in header
+        assert "tc0_eng_celsius" in header
+        assert "lc0_eng_lbf"     in header
+
+    def test_header_excludes_inactive_and_out_of_band_channels(self):
+        path = self.logger.start_recording("test")
+        self.logger.stop_recording()
+        with open(path) as f:
+            header = next(csv.reader(f))
+        # pt7 is inactive; photogate counters aren't sampled per scan.
+        assert not any(c.startswith("pt7_") for c in header)
+        assert not any(c.startswith("pos_") for c in header)
 
     def test_double_start_replaces_file(self):
         p1 = self.logger.start_recording("run1")
