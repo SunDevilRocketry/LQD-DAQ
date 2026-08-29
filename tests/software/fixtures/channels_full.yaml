@@ -1,0 +1,73 @@
+# tests/software/fixtures/channels_full.yaml
+#
+# A fully-populated variant of the repo's channels.yaml: every channel
+# active and every physical pin filled in.
+#
+# The real channels.yaml leaves pins null and marks the TC,
+# load cells and photogates inactive, because none of that is confirmed on
+# the cart yet. That is correct for the cart and useless for testing - it
+# would leave the tc_differential / lc_direct / photogate_counter code
+# paths unexercised. This fixture exists so those paths are covered.
+#
+# AIN/DIO assignments here are arbitrary but structurally valid. They are
+# NOT a proposed wiring plan for the cart.
+
+channels:
+  - id: pt0
+    type: pt_direct
+    unit: Pa
+    ain: AIN0
+    cal_ref: pt0
+  - id: pt1
+    type: pt_direct
+    unit: Pa
+    ain: AIN1
+    cal_ref: pt1
+  - id: pt2
+    type: pt_direct
+    unit: Pa
+    ain: AIN2
+    cal_ref: pt2
+
+  - id: tc0
+    type: tc_differential
+    unit: celsius
+    ain_pos: AIN4
+    ain_neg: AIN5
+    cal_ref: tc0
+    active: true
+
+  - id: lc0
+    type: lc_direct
+    unit: lbf
+    ain: AIN6
+    cal_ref: lc0
+    active: true
+  - id: lc1
+    type: lc_direct
+    unit: lbf
+    ain: AIN7
+    cal_ref: lc1
+    active: true
+
+  - id: pos_lox_main
+    type: photogate_counter
+    unit: counts
+    dio: CIO2
+    cal_ref: null
+    active: true
+  - id: pos_fuel_main
+    type: photogate_counter
+    unit: counts
+    dio: CIO3
+    cal_ref: null
+    active: true
+
+  # Left inactive on purpose, so the "declared but not present" path is
+  # covered too: it must appear in the channel set with a null value.
+  - id: pt7
+    type: pt_direct
+    unit: Pa
+    ain: AIN3
+    cal_ref: pt7
+    active: false

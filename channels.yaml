@@ -1,0 +1,111 @@
+# channels.yaml
+#
+# LQD-Legacy-DAQ channel manifest.
+#
+# Principle: this is data. Physical fields (ain, dio, etc.)
+# are null until confirmed on the cart by wire count - a null field is
+# a placeholder.
+#
+# Tags below are pt0-pt7 / tc.. / lc.. / pos.. - placeholders following
+# how we've been referring to the legacy P&ID/sdec channels in
+# conversation.
+#
+# This is a different liquids system than LQD-DAQ's target architecture
+# do not reuse LQD-DAQ's POT/PFT/POI/... tags or its threshold shape.
+#
+# `unit` is the unit the channel is *reported* in (snapshot, SSE, CSV).
+# Pressures report Pa, matching the SI-internal convention the pipeline
+# already used and the magnitudes in legacy_liquids_sse_contract.md.
+# Calibration coefficients (calibration.json) and threshold bands
+# (config.yaml) stay authored in psi and are converted on load.
+
+channels:
+  # -- Pressure transducers (Omega PX309-2K5V, 0-5V direct to T7 AIN) --
+  # All 8 assumed direct-wired for this bridge - no mux/amp stage.
+  # `type: pt_direct` today; a future `pt_muxed` type (DIO-addressed,
+  # e.g. via a CB37/CB-series breakout) is additive, not a rewrite.
+  - id: pt0
+    type: pt_direct
+    unit: Pa
+    ain: null
+    cal_ref: pt0
+  - id: pt1
+    type: pt_direct
+    unit: Pa
+    ain: null
+    cal_ref: pt1
+  - id: pt2
+    type: pt_direct
+    unit: Pa
+    ain: null
+    cal_ref: pt2
+  - id: pt3
+    type: pt_direct
+    unit: Pa
+    ain: null
+    cal_ref: pt3
+  - id: pt4
+    type: pt_direct
+    unit: Pa
+    ain: null
+    cal_ref: pt4
+  - id: pt5
+    type: pt_direct
+    unit: Pa
+    ain: null
+    cal_ref: pt5
+  - id: pt6
+    type: pt_direct
+    unit: Pa
+    ain: null
+    cal_ref: pt6
+  - id: pt7
+    type: pt_direct
+    unit: Pa
+    ain: null
+    cal_ref: pt7
+    active: null
+
+  # -- Thermocouple (differential pair, LM34 CJC ref) --
+  # Connector exists on L0002; physical probe presence unconfirmed.
+  - id: tc0
+    type: tc_differential
+    unit: celsius
+    ain_pos: null
+    ain_neg: null
+    cal_ref: tc0
+    active: false
+
+  # -- Load cells (PUSHTON S1 2000kg, bridge-amplified upstream) --
+  # Amplifier module conditions the bridge output before the T7 AIN,
+  # same direct-read shape as a PT once conditioned.
+  - id: lc0
+    type: lc_direct
+    unit: lbf
+    ain: null
+    cal_ref: lc0
+    active: false
+  - id: lc1
+    type: lc_direct
+    unit: lbf
+    ain: null
+    cal_ref: lc1
+    active: false
+
+  # -- Stepper position feedback (L0004 photogate boards) --
+  # Informational telemetry only, same as any other channel. Reported
+  # in EngineState like a PT/TC.
+  - id: pos_lox_main
+    type: photogate_counter
+    unit: counts
+    dio: null
+    cal_ref: null
+    active: false
+    notes: "L0004 board retained; operational status unconfirmed"
+  - id: pos_fuel_main
+    type: photogate_counter
+    unit: counts
+    dio: null
+    cal_ref: null
+    active: false
+    notes: "L0004 board retained; operational status unconfirmed"

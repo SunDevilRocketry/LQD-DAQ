@@ -1,0 +1,82 @@
+# actuators.yaml
+#
+# LQD-Legacy-DAQ actuator manifest.
+#
+# type: binary_dio    - single DIO write, open(1)/closed(0). Matches
+#                        LQD-DAQ's existing write_actuator() model
+#                        unchanged.
+# type: pulse_stepper  - DM860T stepper via T7 DIO_EF Pulse Out (STEP)
+#                        + static DIO writes (DIR/ENA). Open-loop
+#                        fixed-count burst unless position_feedback
+#                        is enabled - and even then, feedback is
+#                        reported only, not used for autonomous
+#                        correction. Hardware executes; it doesn't
+#                        decide.
+#
+#
+# A null physical field (dio/step_dio/...) is a placeholder.
+# the actuator still exists in the manifest.
+#
+# Sequence timing (what fires when) is deliberately NOT hardcoded here.
+# This file defines *what actuators exist and how to drive them* -
+# timing/sequencing is separate, dashboard-editable data (format TBD).
+
+actuators:
+  # -- Solenoids (120VAC, via Grayhill relay modules on the RB12 rack) --
+  - id: lox_press
+    type: binary_dio
+    dio: null
+    relay: "70G-OAC5"
+    notes: "confirm which of the 3 pilot vs. 3 direct-acting solenoids this is"
+  - id: fuel_press
+    type: binary_dio
+    dio: null
+    relay: "70G-OAC5"
+  - id: lox_purge
+    type: binary_dio
+    dio: null
+    relay: "70G-OAC5"
+  - id: fuel_purge
+    type: binary_dio
+    dio: null
+    relay: "70G-OAC5"
+  - id: lox_vent
+    type: binary_dio
+    dio: null
+    relay: "70G-OAC5"
+  - id: fuel_vent
+    type: binary_dio
+    dio: null
+    relay: "70G-OAC5"
+  - id: ignition
+    type: binary_dio
+    dio: null
+    notes: "igniter trigger"
+
+  # -- Stepper-driven main valves (DM860T + NEMA-34) --
+  - id: lox_main
+    type: pulse_stepper
+    step_dio: null
+    dir_dio: null
+    ena_dio: null
+    steps_open: null
+    steps_close: null
+    pulse_freq_hz: null
+    notes: "start conservative, no accel ramp for v1 - confirm against DM860T current draw / T7 output before assuming direct wiring is fine (see hardware notes, not a firmware blocker)"
+    position_feedback:
+      enabled: false
+      source: pos_lox_main
+      note: "reported via channels.yaml only, not closed-loop"
+
+  - id: fuel_main
+    type: pulse_stepper
+    step_dio: null
+    dir_dio: null
+    ena_dio: null
+    steps_open: null
+    steps_close: null
+    pulse_freq_hz: null
+    position_feedback:
+      enabled: false
+      source: pos_fuel_main
+      note: "reported via channels.yaml only, not closed-loop"

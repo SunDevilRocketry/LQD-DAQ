@@ -1,0 +1,55 @@
+# tests/software/fixtures/actuators_full.yaml
+#
+# A fully-populated variant of the repo's actuators.yaml: every pin, step
+# count and pulse rate filled in, so the pulse_stepper path (and the
+# watchdog-mask scoping that depends on actuator type) is exercised.
+#
+# DIO assignments, step counts and rates here are arbitrary but
+# structurally valid.
+
+actuators:
+  - id: lox_press
+    type: binary_dio
+    dio: EIO0
+  - id: fuel_press
+    type: binary_dio
+    dio: EIO1
+  - id: lox_purge
+    type: binary_dio
+    dio: EIO2
+  - id: fuel_purge
+    type: binary_dio
+    dio: EIO3
+  - id: lox_vent
+    type: binary_dio
+    dio: EIO4
+  - id: fuel_vent
+    type: binary_dio
+    dio: EIO5
+  - id: ignition
+    type: binary_dio
+    dio: CIO1
+
+  - id: lox_main
+    type: pulse_stepper
+    step_dio: FIO0
+    dir_dio: FIO2
+    ena_dio: FIO3
+    steps_open: 400
+    steps_close: 400
+    pulse_freq_hz: 2000
+    position_feedback:
+      enabled: true
+      source: pos_lox_main
+
+  - id: fuel_main
+    type: pulse_stepper
+    step_dio: FIO1
+    dir_dio: FIO4
+    ena_dio: FIO5
+    steps_open: 400
+    steps_close: 400
+    pulse_freq_hz: 2000
+    position_feedback:
+      enabled: true
+      source: pos_fuel_main
