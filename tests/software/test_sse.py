@@ -28,7 +28,12 @@ import uvicorn
 
 import daq.api as api_module
 from daq.api import app
-from daq.broadcast import Broadcaster, manifest_message, system_state_message
+from daq.broadcast import (
+    SSE_KEEPALIVE,
+    Broadcaster,
+    manifest_message,
+    system_state_message,
+)
 
 from tests.software._helpers import make_engine
 
@@ -365,3 +370,76 @@ class TestBroadcaster:
         asyncio.run(scenario())
 
         assert results["depth"] == 0
+
+
+# -- Keep-alive on an idle stream ------------------------------
+
+class TestKeepAlive:
+    """
+    A client that connects while the engine is stopped gets the two
+    initial frames and then nothing.
+    """
+
+    def test_idle_stream_sends_comment_frames(self, sse_client, monkeypatch):
+        client, engine = sse_client
+        monkeypatch.setattr(api_module, "_KEEPALIVE_INTERVAL_S", 0.2)
+        engine.stop()   # no more batches, so nothing is ever pushed
+
+        with client.stream("GET", "/stream") as response:
+            saw_keepalive = False
+            for line in response.iter_lines():
+                if line.startswith(":"):
+                    saw_keepalive = True
+                    break
+        assert saw_keepalive, "an idle stream sent no keep-alive"
+
+    def test_keepalive_carries_no_data_field(self):
+        """Clients ignore comment frames; it must not decode as a message."""
+        assert SSE_KEEPALIVE.startswith(":")
+        assert "data:" not in SSE_KEEPALIVE
+        assert SSE_KEEPALIVE.endswith("\n\n")
+
+    def test_state_frames_still_arrive_while_keepalives_are_armed(
+        self, sse_client, monkeypatch
+    ):
+        """The keep-alive timeout must not swallow real frames."""
+        client, _ = sse_client
+        monkeypatch.setattr(api_module, "_KEEPALIVE_INTERVAL_S", 0.2)
+        with client.stream("GET", "/stream") as response:
+            frames = read_frames(response, 6)
+        states = [f for f in frames if f["messageType"] == "system-state"]
+        assert len(states) >= 4
+
+
+# -- Listener cost with nobody connected -----------------------
+
+class TestListenerCost:
+    """
+    The listener runs on the acquisition thread ~10 Hz. publish() already
+    no-ops with no clients, but only after the whole state dict has been
+    built - walking every channel and actuator for nobody.
+    """
+
+    def test_no_state_message_is_built_with_nobody_connected(self, monkeypatch):
+        assert api_module._broadcaster.client_count == 0, (
+            "a previous test left a client registered"
+        )
+        prev_engine, prev_logger = api_module._engine, api_module._logger
+
+        built = []
+        monkeypatch.setattr(
+            api_module,
+            "system_state_message",
+            lambda eng: built.append(eng) or {},
+        )
+
+        engine = make_engine()
+        api_module.set_engine(engine)
+        try:
+            engine.start()
+            time.sleep(0.5)     # several batches at ~10 Hz
+        finally:
+            engine.stop()
+            api_module.set_engine(prev_engine, prev_logger)
+
+        assert built == [], f"built {len(built)} frames for nobody"

@@ -32,6 +32,7 @@ All endpoints return JSON. Errors return {"error": "description"}.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Optional, Any
 
@@ -41,11 +42,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from daq.broadcast import (
+    SSE_KEEPALIVE,
     Broadcaster,
     format_sse,
     manifest_message,
     system_state_message,
 )
+
+# Seconds of silence on /stream before a comment frame is sent instead.
+_KEEPALIVE_INTERVAL_S = 5.0
 
 # Engine and Logger instances injected at application startup.
 _engine = None
@@ -66,9 +71,19 @@ def set_engine(engine, logger=None) -> None:
     _logger = logger
 
     if engine is not None:
-        engine.set_state_listener(
-            lambda: _broadcaster.publish(system_state_message(engine))
-        )
+        engine.set_state_listener(lambda: _publish_state(engine))
+
+
+def _publish_state(engine) -> None:
+    """
+    Build and publish one state frame, unless nobody is listening.
+
+    Runs on the acquisition thread ~10 Hz. Broadcaster.publish() already
+    no-ops with no clients, so the client check comes first.
+    """
+    if _broadcaster.client_count == 0:
+        return
+    _broadcaster.publish(system_state_message(engine))
 
 
 # --------------------------------------------------------
@@ -170,7 +185,9 @@ async def get_stream():
     On connect the client receives a `manifest` message (the cart's full
     channel/actuator inventory) followed immediately by one `system-state`
     frame, so a dashboard can render w/o waiting for the next batch.
-    After that, one `system-state` per processed acquisition batch.
+    After that, one `system-state` per processed acquisition batch, plus
+    an SSE comment frame every few seconds whenever no state has been
+    pushed in that window.
 
     Cadence is the natural batch rate, ~10 Hz (500 Hz / 50 scans per read),
     which already sits under Dashboard's render ceiling - no down-sampling
@@ -187,7 +204,14 @@ async def get_stream():
             yield format_sse(manifest_message(eng))
             yield format_sse(system_state_message(eng))
             while True:
-                yield format_sse(await queue.get())
+                try:
+                    message = await asyncio.wait_for(
+                        queue.get(), timeout=_KEEPALIVE_INTERVAL_S
+                    )
+                except asyncio.TimeoutError:
+                    yield SSE_KEEPALIVE
+                    continue
+                yield format_sse(message)
         finally:
             _broadcaster.unregister(queue)
 
@@ -349,7 +373,7 @@ def post_calibration(update: CalibrationUpdate):
     Changes take effect on the next processed scan batch.
     Does not persist to calibration.json - call /calibration/save for that.
 
-    Body: {"tag": "PC", "slope": 128.0, "intercept": -62.8}
+    Body: {"tag": "pt0", "slope": 128.0, "intercept": -62.8}
     """
     eng = _require_engine()
     eng.update_calibration(update.tag, update.slope, update.intercept)

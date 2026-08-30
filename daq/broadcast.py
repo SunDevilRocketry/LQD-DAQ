@@ -138,6 +138,12 @@ def format_sse(message: dict[str, Any]) -> str:
     return f"data: {json.dumps(message)}\n\n"
 
 
+# An SSE comment: carries no data and every client ignores it, but it is
+# traffic, which is what keeps an idle connection from being dropped by an
+# intervening proxy or a browser timeout.
+SSE_KEEPALIVE = ": keep-alive\n\n"
+
+
 class Broadcaster:
     """
     Fans state messages out to every connected /stream client.

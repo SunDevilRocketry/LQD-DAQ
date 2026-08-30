@@ -97,10 +97,18 @@ class ActuatorSpec:
 
 @dataclass(frozen=True)
 class ChannelReading:
-    """One channel's latest processed value."""
+    """
+    One channel's latest processed value.
+
+    `status` is NOMINAL | CAUTION | WARNING for a channel with threshold
+    bands configured, UNASSIGNED for one with none - which is every channel
+    on this cart today, since config.yaml's `thresholds` is deliberately
+    empty until the Liquids review supplies real bounds - and None for a
+    channel that has bands but produced no reading in this batch.
+    """
     value:        Optional[float]
     unit:         str
-    status:       Optional[str]   # NOMINAL | CAUTION | WARNING, or None
+    status:       Optional[str]
     last_updated: Optional[float] # epoch seconds
 
 
