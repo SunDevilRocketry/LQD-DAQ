@@ -12,7 +12,6 @@ import math
 import sys
 import os
 import tempfile
-import textwrap
 
 # Make the package importable when running from the repo root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
