@@ -46,6 +46,7 @@ from daq.manifest import (
     TC_DIFFERENTIAL,
     LC_DIRECT,
     PHOTOGATE_COUNTER,
+    PULSE_STEPPER,
 )
 from daq.calculations import (
     lm34_voltage_to_celsius,
@@ -426,7 +427,8 @@ class Engine:
             state: 1 = open, 0 = safe/closed.
 
         Raises:
-            RuntimeError: If a sequence is currently active.
+            RuntimeError: If a sequence is currently active, or if the
+                          actuator is a stepper still executing a move.
         """
         with self._lock:
             if self._sequence_active:
@@ -434,8 +436,32 @@ class Engine:
                     "Cannot send manual commands while a sequence is running. "
                     "Send ABORT first."
                 )
+
+        if self._is_stepper(name):
+            reading = self._device.actuator_states().get(name)
+            if reading is not None:
+                if reading.state == state:
+                    self._log(
+                        f"Manual: {name} already "
+                        f"{'OPEN' if state else 'CLOSED'} - command ignored "
+                        f"rather than re-running the step burst"
+                    )
+                    return
+                if reading.moving:
+                    raise RuntimeError(
+                        f"'{name}' is still executing a move - wait for it to "
+                        f"finish, or send ABORT to reverse it now"
+                    )
+
         self._device.write_actuator(name, state)
         self._log(f"Manual: {name} -> {'OPEN' if state else 'CLOSED'}")
+
+    def _is_stepper(self, name: str) -> bool:
+        """True if `name` is a pulse_stepper in this cart's manifest."""
+        return any(
+            spec.id == name and spec.type == PULSE_STEPPER
+            for spec in self._actuators
+        )
 
     def all_safe(self) -> None:
         """De-energizes all hardware outputs immediately."""
