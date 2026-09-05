@@ -17,6 +17,11 @@
 # A null physical field (dio/step_dio/...) is a placeholder.
 # the actuator still exists in the manifest.
 #
+# normal: open | closed | null - the actuator's de-energised resting state,
+#         i.e. where the hardware sits with no command applied. Reported to
+#         Dashboard so an operator can see commanded state against resting
+#         state.
+#
 # Sequence timing (what fires when) is deliberately NOT hardcoded here.
 # This file defines *what actuators exist and how to drive them* -
 # timing/sequencing is separate, dashboard-editable data (format TBD).
@@ -25,37 +30,45 @@ actuators:
   # -- Solenoids (120VAC, via Grayhill relay modules on the RB12 rack) --
   - id: lox_press
     type: binary_dio
+    normal: null
     dio: null
     relay: "70G-OAC5"
     notes: "confirm which of the 3 pilot vs. 3 direct-acting solenoids this is"
   - id: fuel_press
     type: binary_dio
+    normal: null
     dio: null
     relay: "70G-OAC5"
   - id: lox_purge
     type: binary_dio
+    normal: null
     dio: null
     relay: "70G-OAC5"
   - id: fuel_purge
     type: binary_dio
+    normal: null
     dio: null
     relay: "70G-OAC5"
   - id: lox_vent
     type: binary_dio
+    normal: null
     dio: null
     relay: "70G-OAC5"
   - id: fuel_vent
     type: binary_dio
+    normal: null
     dio: null
     relay: "70G-OAC5"
   - id: ignition
     type: binary_dio
+    normal: null
     dio: null
     notes: "igniter trigger"
 
   # -- Stepper-driven main valves (DM860T + NEMA-34) --
   - id: lox_main
     type: pulse_stepper
+    normal: null
     step_dio: null
     dir_dio: null
     ena_dio: null
@@ -70,6 +83,7 @@ actuators:
 
   - id: fuel_main
     type: pulse_stepper
+    normal: null
     step_dio: null
     dir_dio: null
     ena_dio: null

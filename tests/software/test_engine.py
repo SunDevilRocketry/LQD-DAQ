@@ -19,6 +19,8 @@ import pytest
 import yaml
 
 from daq.calculations import psi_to_pa
+from daq.engine import SequenceRefused
+from daq.manifest import load_actuators
 
 from tests.software._helpers import (
     REPO_ACTUATORS,
@@ -336,12 +338,12 @@ class TestChannelStatus:
     def test_channel_without_bands_is_unassigned(self):
         """No bands set is a config gap, never a reassuring NOMINAL."""
         eng = make_engine()
-        assert eng._channel_status("pt0", psi_to_pa(200)) == "UNASSIGNED"
+        assert eng._channel_status("pt0", psi_to_pa(200)) == "UNCONFIGURED"
 
     def test_unassigned_wins_even_with_no_reading(self):
-        """UNASSIGNED describes the config, so it doesn't need a value."""
+        """UNCONFIGURED describes the config, so it doesn't need a value."""
         eng = make_engine()
-        assert eng._channel_status("pt0", None) == "UNASSIGNED"
+        assert eng._channel_status("pt0", None) == "UNCONFIGURED"
 
     def test_monitored_channel_with_no_reading_has_no_status(self):
         """Bands exist but there's nothing to classify this batch."""
@@ -353,7 +355,7 @@ class TestChannelStatus:
         eng.start()
         try:
             wait_for_first_batch(eng)
-            assert eng.snapshot.channels["tc0"].status == "UNASSIGNED"
+            assert eng.snapshot.channels["tc0"].status == "UNCONFIGURED"
         finally:
             eng.stop()
 
@@ -479,10 +481,16 @@ class TestUnwiredActuatorGate:
 
     @staticmethod
     def _wait_for_sequence_end(engine, timeout=5.0):
-        """Join the sequence thread. The engine is never start()ed here, so
-        the snapshot is not a usable signal."""
+        """
+        Join the sequence thread if one was spawned. The engine is never
+        start()ed here, so the snapshot is not a usable signal.
+
+        A refused sequence is now rejected before any thread starts, so
+        having no thread at all is a valid outcome.
+        """
         thread = engine._sequence_thread
-        assert thread is not None, "abort() never spawned a sequence thread"
+        if thread is None:
+            return
         thread.join(timeout=timeout)
         assert not thread.is_alive(), "sequence never finished"
 
@@ -540,3 +548,190 @@ class TestUnwiredActuatorGate:
         assert not any("REFUSED" in e for e in log), log
         assert engine._device.read_actuator("lox_vent") == 1
         assert engine._device.read_actuator("fuel_vent") == 1
+
+
+class TestActuatorNormalState:
+    """
+    `normal` is the actuator's de-energised resting state, reported to
+    Dashboard alongside commanded state. It is a P&ID fact, so an
+    unconfirmed one stays null rather than being defaulted to a guess.
+    """
+
+    @staticmethod
+    def _manifest(tmp_path, **extra):
+        entry = {"id": "lox_vent", "type": "binary_dio", "dio": "EIO4", **extra}
+        path = tmp_path / "actuators.yaml"
+        path.write_text(yaml.safe_dump({"actuators": [entry]}))
+        return str(path)
+
+    @pytest.mark.parametrize("normal", ["open", "closed"])
+    def test_valid_resting_states_parse(self, tmp_path, normal):
+        specs = load_actuators(self._manifest(tmp_path, normal=normal))
+        assert specs[0].normal == normal
+
+    def test_omitted_resting_state_stays_none(self, tmp_path):
+        specs = load_actuators(self._manifest(tmp_path))
+        assert specs[0].normal is None
+
+    def test_explicitly_null_resting_state_stays_none(self, tmp_path):
+        specs = load_actuators(self._manifest(tmp_path, normal=None))
+        assert specs[0].normal is None
+
+    def test_unrecognised_resting_state_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="invalid normal"):
+            load_actuators(self._manifest(tmp_path, normal="ajar"))
+
+    def test_shipped_manifest_leaves_every_resting_state_unconfirmed(self):
+        engine = make_engine(actuators_path=REPO_ACTUATORS)
+        assert all(spec.normal is None for spec in engine.actuator_specs)
+
+
+class TestDerivedChannels:
+    """
+    Mass flow and mixture ratio are computed from the differential PTs and
+    the geometry in config.yaml's `derived` block.
+    """
+
+    CFG = {
+        "lox": {
+            "dp_channel": "dpt0",
+            "inlet_temp_channel": "tc0",
+            "orifice_diameter_in": 0.199,
+            "orifice_count": 1,
+            "discharge_coefficient": 0.6,
+        },
+        "fuel": {
+            "dp_channel": "dpt1",
+            "orifice_diameter_in": 0.280,
+            "orifice_count": 1,
+            "discharge_coefficient": 0.67,
+            "density_kg_m3": 800.0,
+        },
+    }
+
+    @staticmethod
+    def _latest(dp0=psi_to_pa(100.0), dp1=psi_to_pa(50.0), tc0=-160.0):
+        return {"dpt0": dp0, "dpt1": dp1, "tc0": tc0}
+
+    def _engine(self, cfg=None):
+        return make_engine(derived=cfg if cfg is not None else self.CFG)
+
+    def test_all_three_outputs_are_always_present(self):
+        """Shape is stable even with no config - values go null, keys don't."""
+        result = make_engine(derived={})._compute_derived(self._latest())
+        assert set(result) == {
+            "lox_mass_flow_rate_kg_s",
+            "fuel_mass_flow_rate_kg_s",
+            "mixture_ratio",
+        }
+        assert all(v is None for v in result.values())
+
+    def test_fuel_flow_computes_without_a_thermocouple(self):
+        """Fuel density is a constant, so fuel flow needs no temperature."""
+        result = self._engine()._compute_derived(self._latest(tc0=None))
+        assert result["fuel_mass_flow_rate_kg_s"] > 0.0
+
+    def test_lox_flow_requires_inlet_temperature(self):
+        """LOX density comes from a table keyed on temperature."""
+        result = self._engine()._compute_derived(self._latest(tc0=None))
+        assert result["lox_mass_flow_rate_kg_s"] is None
+        assert result["mixture_ratio"] is None
+
+    def test_non_positive_dp_yields_none(self):
+        result = self._engine()._compute_derived(self._latest(dp0=0.0, dp1=-1.0))
+        assert result["lox_mass_flow_rate_kg_s"] is None
+        assert result["fuel_mass_flow_rate_kg_s"] is None
+
+    def test_missing_geometry_yields_none_not_a_guess(self):
+        cfg = {"lox": {"dp_channel": "dpt0", "inlet_temp_channel": "tc0"},
+               "fuel": {"dp_channel": "dpt1"}}
+        result = self._engine(cfg)._compute_derived(self._latest())
+        assert all(v is None for v in result.values())
+
+    def test_orifice_count_scales_flow(self):
+        """Flow area, and so mass flow, scales linearly with element count."""
+        one  = self._engine()._compute_derived(self._latest())
+        four_cfg = {
+            "lox": self.CFG["lox"],
+            "fuel": {**self.CFG["fuel"], "orifice_count": 4},
+        }
+        four = self._engine(four_cfg)._compute_derived(self._latest())
+        ratio = four["fuel_mass_flow_rate_kg_s"] / one["fuel_mass_flow_rate_kg_s"]
+        assert abs(ratio - 4.0) < 1e-9
+
+    def test_shipped_config_names_the_differential_channels(self):
+        with open("config.yaml") as f:
+            cfg = yaml.safe_load(f)["derived"]
+        assert cfg["lox"]["dp_channel"] == "dpt0"
+        assert cfg["fuel"]["dp_channel"] == "dpt1"
+
+
+class TestFireRefusalReachesTheCaller:
+    """
+    A refused sequence used to be discovered inside the sequence thread,
+    after fire() had already returned. POST /fire answered 200 and nothing
+    moved. Validation now runs on the caller's thread so the refusal is
+    something a caller can act on.
+    """
+
+    @staticmethod
+    def _engine(tmp_path, steps, name="fire.yaml", actuators_path=REPO_ACTUATORS):
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir(exist_ok=True)
+        (seq_dir / name).write_text(
+            yaml.safe_dump({"post_record_seconds": 0, "steps": steps})
+        )
+        kwargs = {"sequence_dir": str(seq_dir)}
+        if actuators_path is not None:
+            kwargs["actuators_path"] = actuators_path
+        return make_engine(**kwargs)
+
+    def test_fire_raises_when_an_actuator_is_unwired(self, tmp_path):
+        engine = self._engine(tmp_path, [[0.0, "lox_vent", 1]])
+        with pytest.raises(SequenceRefused, match="not wired"):
+            engine.fire()
+
+    def test_refused_fire_starts_nothing(self, tmp_path):
+        engine = self._engine(tmp_path, [[0.0, "lox_vent", 1]])
+        with pytest.raises(SequenceRefused):
+            engine.fire()
+        assert engine._sequence_thread is None
+        assert engine.snapshot.sequence_active is False
+
+    def test_unreadable_sequence_file_also_raises(self, tmp_path):
+        """The other silent-success path: a malformed fire.yaml."""
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir()
+        (seq_dir / "fire.yaml").write_text("steps: [[0.0, 'lox_vent']]")
+        engine = make_engine(sequence_dir=str(seq_dir))
+        with pytest.raises(SequenceRefused, match="could not be loaded"):
+            engine.fire()
+
+    def test_missing_sequence_file_raises(self, tmp_path):
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir()
+        engine = make_engine(sequence_dir=str(seq_dir))
+        with pytest.raises(SequenceRefused, match="could not be loaded"):
+            engine.fire()
+
+    def test_a_drivable_fire_still_starts(self, tmp_path):
+        engine = self._engine(tmp_path, [[0.0, "lox_vent", 1]],
+                              actuators_path=None)
+        engine.fire()
+        assert engine._sequence_thread is not None
+        engine._sequence_thread.join(timeout=5.0)
+
+    def test_abort_never_raises_and_still_safes_the_hardware(self, tmp_path):
+        """
+        abort() absorbs the refusal fire() propagates: leaving the cart
+        de-energised matters more than reporting the failure upward.
+        """
+        engine = self._engine(tmp_path, [[0.0, "lox_vent", 0]],
+                              name="abort.yaml")
+        calls = []
+        engine._device.all_safe = lambda: calls.append("all_safe")
+
+        engine.abort()   # must not raise
+
+        assert calls == ["all_safe"]
+        assert any("REFUSED" in e for e in engine.event_log)

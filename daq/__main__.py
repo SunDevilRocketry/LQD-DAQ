@@ -45,6 +45,7 @@ _DEFAULT_CONFIG = {
     },
     "stream":  {"target_hz": 500},
     "thresholds": {},  # Allows the parser to recognize and merge this section
+    "derived": {},     # Orifice geometry + the channels feeding mass flow
 }
 
 
@@ -115,6 +116,7 @@ def main() -> None:
         cal_path=cal_path,
         sequence_dir=sequence_dir,
         thresholds=cfg.get("thresholds"),  # Ingest thresholds from custom_config.yaml / config.yaml
+        derived=cfg.get("derived"),
         channels_path=_resolve(paths["channels"]),
         actuators_path=_resolve(paths["actuators"]),
     )

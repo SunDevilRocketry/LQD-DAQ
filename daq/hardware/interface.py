@@ -10,6 +10,8 @@ Channel and actuator layout is built at construction time from the
 ChannelSpec/ActuatorSpec manifests loaded from
 channels.yaml / actuators.yaml:
     pt_direct         - single-ended, AIN_NEGATIVE_CH=199, ±5 V range
+    pt_differential   - orifice dP transducer; same single-ended wiring
+                        and range as pt_direct, the value is a delta
     tc_differential   - differential pair, ±0.1 V range
     lc_direct         - single-ended, AIN_NEGATIVE_CH=199, ±5 V range
     photogate_counter - DIO_EF Counter, polled outside the stream
@@ -60,6 +62,7 @@ from daq.manifest import (
     BINARY_DIO,
     PULSE_STEPPER,
     PT_DIRECT,
+    PT_DIFFERENTIAL,
     TC_DIFFERENTIAL,
     LC_DIRECT,
     PHOTOGATE_COUNTER,
@@ -517,7 +520,7 @@ class LabJackT7:
             Single-ended, ±1 V range, resolution 4
         """
         for spec in self._stream_channels:
-            if spec.type in (PT_DIRECT, LC_DIRECT):
+            if spec.type in (PT_DIRECT, PT_DIFFERENTIAL, LC_DIRECT):
                 ljm.eWriteName(self._handle, f"{spec.ain}_NEGATIVE_CH",    199)
                 ljm.eWriteName(self._handle, f"{spec.ain}_RANGE",          5.0)
                 ljm.eWriteName(self._handle, f"{spec.ain}_RESOLUTION_INDEX", 1)

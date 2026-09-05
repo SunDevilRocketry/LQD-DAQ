@@ -1,17 +1,55 @@
 {
-  "_comment": "Keyed by cal_ref from channels.yaml. PT slope/intercept are psi/V and psi; LC are lbf/V and lbf. PT values below are the Omega PX309-2K5V nominal transfer function (0-2500 psig over 0-5 V), NOT a bench calibration. LC slope is a placeholder until the external bridge amplifier's gain is identified.",
+  "_comment": "Keyed by cal_ref from channels.yaml. PT slope/intercept are psi/V and psi; LC are lbf/V and lbf. PT values below are the Omega PX309-2K5V nominal transfer function (0-2500 psig over 0-5 V), NOT a bench calibration. LC slope is a placeholder until the external bridge amplifier's gain is identified. dpt0/dpt1 are differential PTs; their values here are the pt_direct nominal placeholder, NOT that part's transfer function.",
   "PT": {
-    "pt0": {"slope": 500.0, "intercept": 0.0},
-    "pt1": {"slope": 500.0, "intercept": 0.0},
-    "pt2": {"slope": 500.0, "intercept": 0.0},
-    "pt3": {"slope": 500.0, "intercept": 0.0},
-    "pt4": {"slope": 500.0, "intercept": 0.0},
-    "pt5": {"slope": 500.0, "intercept": 0.0},
-    "pt6": {"slope": 500.0, "intercept": 0.0},
-    "pt7": {"slope": 500.0, "intercept": 0.0}
+    "pt0": {
+      "slope": 500.0,
+      "intercept": 0.0
+    },
+    "pt1": {
+      "slope": 500.0,
+      "intercept": 0.0
+    },
+    "pt2": {
+      "slope": 500.0,
+      "intercept": 0.0
+    },
+    "pt3": {
+      "slope": 500.0,
+      "intercept": 0.0
+    },
+    "pt4": {
+      "slope": 500.0,
+      "intercept": 0.0
+    },
+    "pt5": {
+      "slope": 500.0,
+      "intercept": 0.0
+    },
+    "pt6": {
+      "slope": 500.0,
+      "intercept": 0.0
+    },
+    "pt7": {
+      "slope": 500.0,
+      "intercept": 0.0
+    },
+    "dpt0": {
+      "slope": 500.0,
+      "intercept": 0.0
+    },
+    "dpt1": {
+      "slope": 500.0,
+      "intercept": 0.0
+    }
   },
   "LC": {
-    "lc0": {"slope": 100.0, "intercept": 0.0},
-    "lc1": {"slope": 100.0, "intercept": 0.0}
+    "lc0": {
+      "slope": 100.0,
+      "intercept": 0.0
+    },
+    "lc1": {
+      "slope": 100.0,
+      "intercept": 0.0
+    }
   }
 }

@@ -43,6 +43,8 @@ from daq.manifest import (
     load_channels,
     load_actuators,
     PT_DIRECT,
+    PT_DIFFERENTIAL,
+    PRESSURE_TYPES,
     TC_DIFFERENTIAL,
     LC_DIRECT,
     PHOTOGATE_COUNTER,
@@ -54,6 +56,10 @@ from daq.calculations import (
     psi_to_pa,
     pt_voltage_to_pa,
     load_cell_voltage_to_force,
+    orifice_area_m2,
+    lox_mass_flow_rate,
+    fuel_mass_flow_rate,
+    mixture_ratio,
 )
 
 
@@ -77,6 +83,7 @@ DEFAULT_ACTUATORS_PATH = os.path.join(_REPO_DIR, "actuators.yaml")
 #               slope is a stand-in until the module is identified.
 _DEFAULT_CAL_BY_TYPE: dict[str, dict[str, float]] = {
     PT_DIRECT: {"slope": 500.0, "intercept": 0.0},
+    PT_DIFFERENTIAL: {"slope": 500.0, "intercept": 0.0},
     LC_DIRECT: {"slope": 100.0, "intercept": 0.0},
 }
 
@@ -124,6 +131,7 @@ class EngineState:
         "timestamp",
         # Manifest-driven readings
         "channels",     # dict[str, ChannelReading]
+        "derived",      # dict[str, float | None] - computed, not measured
         "actuators",    # dict[str, ActuatorReading]
         # Hardware & loop state
         "streaming", "sequence_active", "sequence_name",
@@ -135,10 +143,20 @@ class EngineState:
         for slot in self.__slots__:
             object.__setattr__(self, slot, None)
         object.__setattr__(self, "channels", {})
+        object.__setattr__(self, "derived", {})
         object.__setattr__(self, "actuators", {})
         object.__setattr__(self, "streaming", False)
         object.__setattr__(self, "sequence_active", False)
         object.__setattr__(self, "using_mock", USING_MOCK)
+
+
+class SequenceRefused(RuntimeError):
+    """
+    A sequence cannot run, determined before it starts.
+
+    Raised on the caller's thread - by _validate_sequence(), so a caller 
+    (e.g. POST /fire) can report the failure when sequence moves nothing.
+    """
 
 
 class Engine:
@@ -158,6 +176,8 @@ class Engine:
                        The caller is responsible for logger.open() / logger.close();
                        the engine only calls start_recording() / stop_recording().
         thresholds:    Warning and abort thresholds dictionary (optional).
+        derived:       config.yaml's `derived` block - orifice geometry and
+                       the channel ids feeding mass flow (optional).
     """
 
     # Public alias so callers can reference the threshold
@@ -170,6 +190,7 @@ class Engine:
         sequence_dir:   str = "sequences",
         logger=None,
         thresholds:     Optional[dict] = None,
+        derived:        Optional[dict] = None,
         channels_path:  str = DEFAULT_CHANNELS_PATH,
         actuators_path: str = DEFAULT_ACTUATORS_PATH,
     ) -> None:
@@ -186,6 +207,7 @@ class Engine:
         self._logger        = logger
         self._sequence_dir  = sequence_dir
         self._thresholds    = self._convert_thresholds_to_pa(thresholds or {})
+        self._derived_cfg   = derived or {}
 
         # Calibration state (re-loaded from disk if path exists)
         self._cal_path = cal_path
@@ -279,7 +301,7 @@ class Engine:
         """
         Registers a callback fired whenever there is new state worth pushing.
 
-        Called with no arguments from the stream thread, both after a batch
+        Called w/ no arguments from the stream thread, both after a batch
         is processed and on an error tick where no batch arrived. The
         listener is responsible for reading the snapshot itself and for
         being quick and non-blocking - it runs on the acquisition thread.
@@ -352,7 +374,8 @@ class Engine:
         pt_direct channel).
         """
         pressure_ids = {
-            spec.id for spec in self._channels if spec.type == PT_DIRECT
+            spec.id for spec in self._channels
+            if spec.type in PRESSURE_TYPES
         }
         converted: dict = {}
         for tag, bands in raw.items():
@@ -365,6 +388,43 @@ class Engine:
                 converted[tag] = bands
         return converted
 
+    def _compute_derived(self, latest: dict) -> dict:
+        """
+        Injector mass flows (kg/s) and mixture ratio, from this batch.
+
+        Every input is named in config.yaml's `derived` block.
+
+        Any missing channel, inactive channel, absent geometry, or
+        non-positive dP yields None for that output.
+
+        Units are SI on the wire, matching the Pa used for pressures.
+        """
+        def _mdot(side: str):
+            cfg = self._derived_cfg.get(side) or {}
+            diameter = cfg.get("orifice_diameter_in")
+            cd       = cfg.get("discharge_coefficient")
+            dp       = latest.get(cfg.get("dp_channel"))
+            if diameter is None or cd is None or dp is None:
+                return None
+
+            area = orifice_area_m2(diameter, cfg.get("orifice_count", 1))
+            if side == "lox":
+                return lox_mass_flow_rate(
+                    latest.get(cfg.get("inlet_temp_channel")), dp, area, cd
+                )
+            density = cfg.get("density_kg_m3")
+            if density is None:
+                return None
+            return fuel_mass_flow_rate(dp, area, cd, density)
+
+        lox_mdot  = _mdot("lox")
+        fuel_mdot = _mdot("fuel")
+        return {
+            "lox_mass_flow_rate_kg_s":  lox_mdot,
+            "fuel_mass_flow_rate_kg_s": fuel_mdot,
+            "mixture_ratio":            mixture_ratio(lox_mdot, fuel_mdot),
+        }
+
     def _channel_status(self, tag: str, value: Optional[float]) -> Optional[str]:
         """
         Classify a reading against its config.yaml threshold bands.
@@ -372,21 +432,24 @@ class Engine:
         Returns:
             NOMINAL    - inside the normal band
             CAUTION    - outside normal but inside warning
-            WARNING    - outside warning (interlock hazard)
-            UNASSIGNED - the channel has no threshold bands configured
+            WARNING    - outside warning
+            UNCONFIGURED - the channel has no threshold bands configured
             None       - bands exist but there is no reading to classify
 
-        The first three are Dashboard's existing enum (readingStatus.ts).
-        UNASSIGNED extends it, and is checked first because it describes
+        Status is reported. WARNING does not trigger an action.
+
+        All four are Dashboard's enum (readingStatus.ts) verbatim.
+
+        UNCONFIGURED is checked first b/c it describes
         the *config* rather than the reading: A channel w/o set bounds is 
-        an open gap. Flagging it as such.
+        an open gap to be flagged.
 
         None survives only for the narrow case of a monitored channel with
-        no data this batch - there is genuinely nothing to classify there.
+        no data this batch.
         """
         bands = self._thresholds.get(tag)
         if not isinstance(bands, dict):
-            return "UNASSIGNED"
+            return "UNCONFIGURED"
         if value is None:
             return None
 
@@ -480,9 +543,17 @@ class Engine:
         self._log("Load cells tared")
 
     def fire(self) -> None:
-        """Spawns the fire autosequence thread if the system is idle."""
+        """
+        Spawns the fire autosequence thread if the system is idle.
+
+        Raises:
+            SequenceRefused: If fire.yaml cannot be loaded, or commands an
+                             actuator this cart cannot drive. Raised before
+                             anything starts.
+        """
         seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        if not self._start_sequence("fire", seq_path, is_fire=True):
+        steps, post_s = self._validate_sequence("fire", seq_path)
+        if not self._start_sequence("fire", steps, post_s, is_fire=True):
             self._log("Fire command ignored: autosequence already active")
 
     def abort(self) -> None:
@@ -517,9 +588,20 @@ class Engine:
 
         seq_path = os.path.join(self._sequence_dir, "abort.yaml")
         if os.path.exists(seq_path):
+            try:
+                steps, post_s = self._validate_sequence("abort", seq_path)
+            except SequenceRefused as exc:
+                # An ordered closure is off the table, but abort must still
+                # leave the hardware safe - never propagate out of abort().
+                self._log(str(exc))
+                self._device.all_safe()
+                self._log("ABORT: refused sequence, hardware -> all safe")
+                return
             # force=True: abort must always be able to preempt, even if the
             # previous sequence thread is (unexpectedly) still marked alive.
-            self._start_sequence("abort", seq_path, is_fire=False, force=True)
+            self._start_sequence(
+                "abort", steps, post_s, is_fire=False, force=True
+            )
         else:
             self._device.all_safe()
             self._log("ABORT: no abort.yaml found, hardware -> all safe")
@@ -553,7 +635,7 @@ class Engine:
 
         pt_tags = {
             spec.cal_ref or spec.id
-            for spec in self._channels if spec.type == PT_DIRECT
+            for spec in self._channels if spec.type in PRESSURE_TYPES
         }
         lc_tags = {
             spec.cal_ref or spec.id
@@ -738,7 +820,7 @@ class Engine:
         """
         c = self._channel_calibration(spec)
 
-        if spec.type == PT_DIRECT:
+        if spec.type in PRESSURE_TYPES:
             return [
                 None if v == _MISSING_SAMPLE
                 else pt_voltage_to_pa(v, c["slope"], c["intercept"])
@@ -828,6 +910,7 @@ class Engine:
         object.__setattr__(new_snap, "using_mock",      USING_MOCK)
         object.__setattr__(new_snap, "cjc_celsius",     cjc_c)
         object.__setattr__(new_snap, "channels",        channels)
+        object.__setattr__(new_snap, "derived",         self._compute_derived(latest))
         object.__setattr__(new_snap, "actuators",       dict(self._device.actuator_states()))
         object.__setattr__(new_snap, "sequence_active", self._sequence_active)
         object.__setattr__(new_snap, "sequence_name",   self._sequence_name)
@@ -862,8 +945,44 @@ class Engine:
     # Sequence control
     # --------------------------------------------------------
 
+    def _validate_sequence(
+        self, name: str, path: str
+    ) -> tuple[list[tuple[float, str, int]], float]:
+        """
+        Load a sequence and confirm this cart can actually drive it.
+
+        Runs b/f any thread is spawned, so both failure modes - an
+        unreadable file and a step naming an actuator with no pin - reach
+        the caller.
+
+        Raises:
+            SequenceRefused: If the file cannot be parsed, or any step
+                             commands an actuator this cart cannot drive.
+        """
+        try:
+            steps, post_s = self._load_sequence(path)
+        except Exception as exc:
+            raise SequenceRefused(
+                f"Sequence '{name}' could not be loaded: {exc}"
+            ) from exc
+
+        undrivable = self._undrivable_steps(steps)
+        if undrivable:
+            raise SequenceRefused(
+                f"Sequence '{name}' REFUSED: cannot drive "
+                f"{', '.join(undrivable)} - not wired in actuators.yaml. "
+                f"Every step for these would have failed and the sequence "
+                f"would have reported completion having moved nothing."
+            )
+        return steps, post_s
+
     def _start_sequence(
-        self, name: str, path: str, is_fire: bool, force: bool = False
+        self,
+        name: str,
+        steps: list[tuple[float, str, int]],
+        post_s: float,
+        is_fire: bool,
+        force: bool = False,
     ) -> bool:
         """
         Spawns a new background thread to execute an autosequence.
@@ -897,40 +1016,26 @@ class Engine:
         self._abort_flag.clear()
         self._sequence_thread = threading.Thread(
             target=self._run_sequence,
-            args=(name, path, is_fire),
+            args=(name, steps, post_s, is_fire),
             name=f"daq-seq-{name}",
             daemon=True,
         )
         self._sequence_thread.start()
         return True
 
-    def _run_sequence(self, name: str, path: str, is_fire: bool) -> None:
-        """Executes a YAML-defined autosequence step-by-step."""
+    def _run_sequence(
+        self,
+        name: str,
+        steps: list[tuple[float, str, int]],
+        post_s: float,
+        is_fire: bool,
+    ) -> None:
+        """
+        Execute an already-validated autosequence step by step.
+
+        Loading check happen in _validate_sequence() on the caller's thread.
+        """
         self._log(f"Sequence '{name}' starting")
-
-        try:
-            steps, post_s = self._load_sequence(path)
-        except Exception as exc:
-            self._log(f"Sequence load failed: {exc}")
-            self._sequence_done()
-            return
-
-        undrivable = self._undrivable_steps(steps)
-        if undrivable:
-            self._log(
-                f"Sequence '{name}' REFUSED: cannot drive "
-                f"{', '.join(undrivable)} - not wired in actuators.yaml. "
-                f"Every step for these would have failed and the sequence "
-                f"would have reported completion having moved nothing."
-            )
-            if not is_fire:
-                # An ordered closure is off the table, so fall back to the
-                # same de-energise abort() uses when there is no abort.yaml
-                # at all.
-                self._device.all_safe()
-                self._log("ABORT: refused sequence, hardware -> all safe")
-            self._sequence_done()
-            return
 
         if is_fire and self._logger:
             self._logger.start_recording(prefix="hotfire")

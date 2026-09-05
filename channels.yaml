@@ -13,6 +13,11 @@
 # This is a different liquids system than LQD-DAQ's target architecture
 # do not reuse LQD-DAQ's POT/PFT/POI/... tags or its threshold shape.
 #
+# type: pt_direct       - absolute/gauge PT, single-ended AIN.
+# type: pt_differential - differential PT across an injector orifice.
+#                         Same 0-5 V wiring and same calibration form as
+#                         pt_direct; the value is a pressure drop.
+#
 # `unit` is the unit the channel is *reported* in (snapshot, SSE, CSV).
 # Pressures report Pa, matching the SI-internal convention the pipeline
 # already used and the magnitudes in legacy_liquids_sse_contract.md.
@@ -65,6 +70,23 @@ channels:
     ain: null
     cal_ref: pt7
     active: null
+
+  # -- Differential PTs (across the injector orifices) --
+  # Feed lox/fuel mass flow. Orifice geometry lives in config.yaml.
+  # slope/intercept in calibration.json are the pt_direct nominal values
+  # as a placeholder.
+  - id: dpt0
+    type: pt_differential
+    unit: Pa
+    ain: null
+    cal_ref: dpt0
+    notes: "LOx injector orifice dP - confirm part and full-scale range"
+  - id: dpt1
+    type: pt_differential
+    unit: Pa
+    ain: null
+    cal_ref: dpt1
+    notes: "fuel injector orifice dP - confirm part and full-scale range"
 
   # -- Thermocouple (differential pair, LM34 CJC ref) --
   # Connector exists on L0002; physical probe presence unconfirmed.

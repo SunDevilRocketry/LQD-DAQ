@@ -29,6 +29,20 @@ channels:
     ain: AIN2
     cal_ref: pt2
 
+  - id: dpt0
+    type: pt_differential
+    unit: Pa
+    ain: AIN10
+    cal_ref: dpt0
+    active: true
+
+  - id: dpt1
+    type: pt_differential
+    unit: Pa
+    ain: AIN11
+    cal_ref: dpt1
+    active: true
+
   - id: tc0
     type: tc_differential
     unit: celsius

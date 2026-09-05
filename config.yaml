@@ -23,7 +23,42 @@ paths:
 stream:
   target_hz: 500       # Requested hardware sampling rate (negotiated at start)
 
+# -- DERIVED CHANNELS ----------------------------------------
+#
+# Injector mass flow and mixture ratio, computed per batch from the
+# differential PTs and published under `derived` on /stream.
+#
+# Each side names the channel that feeds it, so nothing here depends on
+# the pt0..pt7 slot mapping being settled. A null or inactive channel, or
+# a null value below, makes that output null.
+#
+#   orifice_count         - 1 assumes a single orifice per side. If the
+#                           injector has N elements, this must be N or the
+#                           flow is wrong by a factor of N.
+#   discharge_coefficient - carried over from Goondaq's engine, NOT
+#                           measured on this injector.
+# The diameters are this cart's, supplied by Liquids.
+
+derived:
+  lox:
+    dp_channel:            dpt0
+    inlet_temp_channel:    tc0      # needed for LOX density; null -> no output
+    orifice_diameter_in:   0.199
+    orifice_count:         1
+    discharge_coefficient: 0.6
+  fuel:
+    dp_channel:            dpt1
+    orifice_diameter_in:   0.280
+    orifice_count:         1
+    discharge_coefficient: 0.67
+    density_kg_m3:         800.0    # IPA at standard operating temperature
+
 # -- SAFETY THRESHOLDS (SR 3.2.2 / SR 3.2.3.1) ---------------
+#
+# These bands classify readings for the operator's display. They do NOT
+# arm an interlock: crossing into WARNING does not ACT
+# Nothing in the DAQ reads a status and acts on it. Do not add bounds here
+# expecting them to stop anything by themselves.
 #
 # Keyed by channel id from channels.yaml.
 # Bounds are authored in calibrated units: pressures (psig), temperatures
@@ -33,9 +68,9 @@ stream:
 # GUI State Mapping (Dashboard readingStatus.ts):
 #   - Within [normal]:                        NOMINAL
 #   - Outside [normal] but within [warning]:  CAUTION
-#   - Outside [warning]:                      WARNING (interlock hazard)
+#   - Outside [warning]:                      WARNING
 #
-# A channel with no entry here reports status: UNASSIGNED - nobody has set
+# A channel with no entry here reports status: UNCONFIGURED - nobody has set
 # bounds for it yet.
 #
 # EMPTY ON PURPOSE. Real psi/°C bounds for this cart must come from the Liquids review.

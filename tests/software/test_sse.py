@@ -218,6 +218,16 @@ class TestStreamEndpoint:
         assert valve["status"] == "open"
         assert valve["moving"] is True
 
+    def test_valves_report_normal_resting_state(self, sse_client):
+        client, _ = sse_client
+        with client.stream("GET", "/stream") as response:
+            frames = read_frames(response, 3)
+        valves = frames[-1]["payload"]["valves"]
+        assert valves["lox_vent"]["normal"] == "open"
+        assert valves["lox_main"]["normal"] == "closed"
+        # Omitted in the manifest - reaches Dashboard as null, not defaulted.
+        assert valves["ignition"]["normal"] is None
+
     def test_client_unregisters_on_disconnect(self, sse_client):
         client, _ = sse_client
         with client.stream("GET", "/stream") as response:

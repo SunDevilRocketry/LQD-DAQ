@@ -12,8 +12,9 @@ Functions:
     pt_voltage_to_pa()              - Pressure transducer linear cal (Pa, internal/SI)
     load_cell_voltage_to_force()    - Load cell with tare offset
     lox_density_from_celsius()      - LOX saturation density lookup
-    lox_mass_flow_rate()            - LOX injector mass flow (Pa inputs)
-    fuel_mass_flow_rate()           - Fuel injector mass flow (Pa inputs)
+    orifice_area_m2()               - Orifice flow area from diameter/count
+    lox_mass_flow_rate()            - LOX injector mass flow (dP input)
+    fuel_mass_flow_rate()           - Fuel injector mass flow (dP input)
     mixture_ratio()                 - Oxidizer/fuel ratio
     impulse_step_load_cell()        - Total impulse from load cells
     impulse_step_estimate()         - Total impulse estimate
@@ -278,74 +279,96 @@ def lox_density_from_celsius(temp_celsius: float) -> Optional[float]:
 # Sutton Eq. 6.15 orifice model: m = Cd * A * sqrt(2 * rho * dP)
 # Inputs are converted internally from imperial (psi, in²) to SI (Pa, m²) for kg/s output.
 
-_LOX_Cd = 0.6
-_LOX_A_IN2 = 0.02922466566
-_LOX_A_M2 = _LOX_A_IN2 * 6.4516e-4
+def orifice_area_m2(diameter_in: float, count: int = 1) -> float:
+    """
+    Total flow area of `count` identical round orifices.
+
+    Args:
+        diameter_in: Diameter of one orifice in inches.
+        count:       Number of identical orifice elements.
+
+    Returns:
+        Total area in m^2.
+    """
+    area_in2 = count * math.pi / 4.0 * diameter_in ** 2
+    return area_in2 * 6.4516e-4
+
+
+def _orifice_mdot(
+    dp_pa: float,
+    area_m2: float,
+    cd: float,
+    density_kg_m3: float,
+) -> Optional[float]:
+    """
+    Incompressible orifice mass flow. None when there is no forward dP.
+
+    Source:
+        Sutton, "Rocket Propulsion Elements", Eq. 6.15
+    """
+    if dp_pa is None or dp_pa <= 0.0:
+        return None
+    return cd * area_m2 * math.sqrt(2.0 * density_kg_m3 * dp_pa)
 
 
 def lox_mass_flow_rate(
     toi_celsius: float,
-    poi_pa: float,
-    pc_pa: float,
+    dp_pa: float,
+    area_m2: float,
+    cd: float,
 ) -> Optional[float]:
     """
     Calculate LOX mass flow rate through the injector orifice.
 
     Args:
-        toi_celsius:    LOX inlet temperature in °C.
-        poi_pa:         LOX inlet pressure in Pa.
-        pc_pa:          Chamber pressure in Pa.
+        toi_celsius: LOX inlet temperature in °C, for the density lookup.
+        dp_pa:       Pressure drop across the orifice in Pa.
+        area_m2:     Total orifice flow area in m^2.
+        cd:          Discharge coefficient.
 
     Returns:
         Mass flow rate in kg/s, or None if:
             - The LOX density table is not loaded.
             - toi_celsius is outside the table's valid range.
-            - The differential pressure (poi_pa - pc_pa) is <= 0.
+            - dp_pa is <= 0.
 
     Source:
         Sutton, "Rocket Propulsion Elements", Eq. 6.15
     """
+    if toi_celsius is None:
+        return None
     rho_lbm_ft3 = lox_density_from_celsius(toi_celsius)
     if rho_lbm_ft3 is None:
         return None
-
-    dp_pa = poi_pa - pc_pa
-    if dp_pa <= 0.0:
-        return None
-
-    rho_kg_m3 = rho_lbm_ft3 * 16.0185
-
-    return _LOX_Cd * _LOX_A_M2 * math.sqrt(2.0 * rho_kg_m3 * dp_pa)
+    return _orifice_mdot(dp_pa, area_m2, cd, rho_lbm_ft3 * 16.0185)
 
 
-# -- FUEL (IPA) MASS FLOW RATE --------------------------------
-# Orifice model using fixed IPA density (800 kg/m³) at standard operating temperature.
-
-_FUEL_Cd = 0.67
-_FUEL_A_IN2 = 0.04526
-_FUEL_A_M2 = _FUEL_A_IN2 * 6.4516e-4
-_FUEL_RHO_KG_M3 = 800.0
-
-
-def fuel_mass_flow_rate(pfo_pa: float, pc_pa: float) -> Optional[float]:
+def fuel_mass_flow_rate(
+    dp_pa: float,
+    area_m2: float,
+    cd: float,
+    density_kg_m3: float,
+) -> Optional[float]:
     """
-    Calculate fuel (IPA) mass flow rate through the injector orifice.
+    Calculate fuel mass flow rate through the injector orifice.
+
+    Fuel density is taken as constant (no fuel-side temp channel; IPA
+    density moves little over the operating range).
+    range.
 
     Args:
-        pfo_pa:     Fuel channel outlet pressure in Pa.
-        pc_pa:      Chamber pressure in Pa.
+        dp_pa:         Pressure drop across the orifice in Pa.
+        area_m2:       Total orifice flow area in m^2.
+        cd:            Discharge coefficient.
+        density_kg_m3: Fuel density.
 
     Returns:
-        Mass flow rate in kg/s, or None if the differential pressure is <= 0.
+        Mass flow rate in kg/s, or None if dp_pa is <= 0.
 
     Source:
         Sutton, "Rocket Propulsion Elements", Eq. 6.15
     """
-    dp_pa = pfo_pa - pc_pa
-    if dp_pa <= 0.0:
-        return None
-
-    return _FUEL_Cd * _FUEL_A_M2 * math.sqrt(2.0 * _FUEL_RHO_KG_M3 * dp_pa)
+    return _orifice_mdot(dp_pa, area_m2, cd, density_kg_m3)
 
 
 # -- MIXTURE RATIO (O/F) --------------------------------------

@@ -41,6 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from daq.engine import SequenceRefused
 from daq.broadcast import (
     SSE_KEEPALIVE,
     Broadcaster,
@@ -310,7 +311,7 @@ def post_actuator(cmd: ActuatorCommand):
     Blocked while a sequence is active (returns 409 Conflict).
     The GUI should reflect the blocked state immediately per SR 3.2.4.
 
-    Body: {"name": "LOx Main", "state": 1}
+    Body: {"name": "lox_main", "state": 1}
     """
     eng = _require_engine()
     if cmd.state not in (0, 1):
@@ -336,7 +337,13 @@ def post_safe():
 def post_fire():
     """
     Triggers the fire autosequence if the system is idle.
-    Returns 409 if a sequence is already running.
+
+    Returns 409 if a sequence is already running, or if fire.yaml cannot be
+    run at all - unreadable, or commanding an actuator with no pin assigned.
+    [200 = sequence was launched].
+
+    Raises:
+        409: A sequence is already active, or this one was refused.
     """
     eng = _require_engine()
     snap = eng.snapshot
@@ -345,13 +352,22 @@ def post_fire():
             status_code=409,
             detail=f"Sequence '{snap.sequence_name}' already running"
         )
-    eng.fire()
+    try:
+        eng.fire()
+    except SequenceRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     return {"ok": True, "sequence": "fire"}
 
 
 @app.post("/abort")
 def post_abort():
-    """Aborts active sequences and triggers the safe shutdown sequence."""
+    """
+    Aborts active sequences and triggers the safe shutdown sequence.
+
+    Always succeeds. If abort.yaml is unrunnable the hardware is still
+    de-energised, so there is no failure to report to the caller - check
+    /events for whether the ordered closure or the fallback ran.
+    """
     eng = _require_engine()
     eng.abort()
     return {"ok": True}

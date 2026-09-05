@@ -42,6 +42,7 @@ def full_actuators():
 def make_engine(
     logger=None,
     thresholds=None,
+    derived=None,
     sequence_dir=None,
     actuators_path=FULL_ACTUATORS,
 ) -> Engine:
@@ -56,6 +57,7 @@ def make_engine(
         sequence_dir=sequence_dir or os.path.join(_REPO, "sequences"),
         logger=logger,
         thresholds=thresholds,
+        derived=derived,
         channels_path=FULL_CHANNELS,
         actuators_path=actuators_path,
     )

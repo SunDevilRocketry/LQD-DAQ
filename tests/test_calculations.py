@@ -31,6 +31,7 @@ from daq.calculations import (
     lox_density_from_celsius,
     lox_mass_flow_rate,
     fuel_mass_flow_rate,
+    orifice_area_m2,
     mixture_ratio,
     impulse_step_load_cell,
     impulse_step_estimate,
@@ -304,28 +305,38 @@ class TestLOXMassFlowRate:
         yield
         os.unlink(path)
 
+    # This cart measures orifice dP with a differential transducer, so the
+    # functions take dP directly and carry no built-in geometry.
+    LOX_AREA = orifice_area_m2(0.199)
+    LOX_CD   = 0.6
+
+    def _mdot(self, dp_psi, toi_c=-160.0):
+        return lox_mass_flow_rate(toi_c, psi_to_pa(dp_psi), self.LOX_AREA, self.LOX_CD)
+
     def test_returns_positive_value_for_valid_inputs(self):
-        result = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(250.0), pc_pa=psi_to_pa(150.0))
+        result = self._mdot(100.0)
         assert result is not None
         assert result > 0.0
 
     def test_zero_dp_returns_none(self):
-        result = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(200.0), pc_pa=psi_to_pa(200.0))
-        assert result is None
+        assert self._mdot(0.0) is None
 
     def test_negative_dp_returns_none(self):
-        result = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(150.0), pc_pa=psi_to_pa(200.0))
-        assert result is None
+        assert self._mdot(-50.0) is None
+
+    def test_missing_inlet_temperature_returns_none(self):
+        """No LOX inlet temperature means no density, so no flow rate."""
+        assert self._mdot(100.0, toi_c=None) is None
 
     def test_higher_dp_gives_higher_flow(self):
-        lo = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(200.0), pc_pa=psi_to_pa(150.0))
-        hi = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(300.0), pc_pa=psi_to_pa(150.0))
+        lo = self._mdot(50.0)
+        hi = self._mdot(150.0)
         assert lo is not None and hi is not None
         assert hi > lo
 
     def test_sqrt_scaling(self):
-        base = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(250.0), pc_pa=psi_to_pa(150.0))  # ΔP=100 psi
-        quad = lox_mass_flow_rate(-160.0, poi_pa=psi_to_pa(550.0), pc_pa=psi_to_pa(150.0))  # ΔP=400 psi
+        base = self._mdot(100.0)
+        quad = self._mdot(400.0)
         assert base is not None and quad is not None
         ratio = quad / base
         assert abs(ratio - 2.0) < 0.01, f"Expected ratio ~2.0, got {ratio}"
@@ -336,57 +347,69 @@ class TestLOXMassFlowRate:
         Uses the density value our table returns, not a hardcoded constant.
         """
         toi_c = -160.0
-        poi_pa, pc_pa = psi_to_pa(250.0), psi_to_pa(150.0)
+        dp_pa = psi_to_pa(100.0)
         rho_lbm = lox_density_from_celsius(toi_c)
         assert rho_lbm is not None
 
-        Cd = 0.6
-        A_m2 = 0.02922466566 * 6.4516e-4
-        rho_kg_m3 = rho_lbm * 16.0185
-        dp_pa = poi_pa - pc_pa
-        expected = Cd * A_m2 * math.sqrt(2.0 * rho_kg_m3 * dp_pa)
+        expected = self.LOX_CD * self.LOX_AREA * math.sqrt(
+            2.0 * rho_lbm * 16.0185 * dp_pa
+        )
 
-        result = lox_mass_flow_rate(toi_c, poi_pa, pc_pa)
+        result = lox_mass_flow_rate(toi_c, dp_pa, self.LOX_AREA, self.LOX_CD)
         assert result is not None
-        assert abs(result - expected) < 1e-6
+        assert abs(result - expected) < 1e-9
 
 
 # -- Fuel Mass Flow Rate --------------------------------------
 
 class TestFuelMassFlowRate:
 
+    FUEL_AREA = orifice_area_m2(0.280)
+    FUEL_CD   = 0.67
+    FUEL_RHO  = 800.0
+
+    def _mdot(self, dp_psi):
+        return fuel_mass_flow_rate(
+            psi_to_pa(dp_psi), self.FUEL_AREA, self.FUEL_CD, self.FUEL_RHO
+        )
+
     def test_returns_positive_for_valid_inputs(self):
-        result = fuel_mass_flow_rate(pfo_pa=psi_to_pa(200.0), pc_pa=psi_to_pa(150.0))
+        result = self._mdot(50.0)
         assert result is not None
         assert result > 0.0
 
     def test_zero_dp_returns_none(self):
-        result = fuel_mass_flow_rate(psi_to_pa(200.0), psi_to_pa(200.0))
-        assert result is None
+        assert self._mdot(0.0) is None
 
     def test_negative_dp_returns_none(self):
-        result = fuel_mass_flow_rate(psi_to_pa(150.0), psi_to_pa(200.0))
-        assert result is None
+        assert self._mdot(-50.0) is None
 
     def test_sqrt_scaling(self):
-        """Mass flow ∝ sqrt(ΔP). Quadrupling ΔP should double the flow."""
-        base = fuel_mass_flow_rate(psi_to_pa(250.0), psi_to_pa(150.0))   # ΔP = 100 psi
-        quad = fuel_mass_flow_rate(psi_to_pa(550.0), psi_to_pa(150.0))   # ΔP = 400 psi
+        """Mass flow is proportional to sqrt(dP): quadrupling dP doubles flow."""
+        base = self._mdot(100.0)
+        quad = self._mdot(400.0)
         assert base is not None and quad is not None
         ratio = quad / base
         assert abs(ratio - 2.0) < 0.01, f"Expected ratio ~2.0, got {ratio}"
 
     def test_matches_goondaq_formula(self):
-        pfo_pa, pc_pa = psi_to_pa(200.0), psi_to_pa(150.0)
-        Cd = 0.67
-        A_m2 = 0.04526 * 6.4516e-4
-        rho = 800.0
-        dp_pa = pfo_pa - pc_pa
-        expected = Cd * A_m2 * math.sqrt(2.0 * rho * dp_pa)
-
-        result = fuel_mass_flow_rate(pfo_pa, pc_pa)
+        dp_pa = psi_to_pa(50.0)
+        expected = self.FUEL_CD * self.FUEL_AREA * math.sqrt(
+            2.0 * self.FUEL_RHO * dp_pa
+        )
+        result = self._mdot(50.0)
         assert result is not None
-        assert abs(result - expected) < 1e-6
+        assert abs(result - expected) < 1e-9
+
+
+class TestOrificeArea:
+
+    def test_area_from_diameter(self):
+        assert abs(orifice_area_m2(0.199) - (math.pi / 4 * 0.199 ** 2) * 6.4516e-4) < 1e-15
+
+    def test_count_scales_area_linearly(self):
+        """An N-element injector has N times the flow area of one hole."""
+        assert abs(orifice_area_m2(0.199, 4) - 4 * orifice_area_m2(0.199)) < 1e-15
 
 
 # -- Oxidizer / Fuel Mixture Ratio ----------------------------

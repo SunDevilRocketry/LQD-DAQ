@@ -12,6 +12,7 @@ Sensor simulation:
   - tc_differential:   stable with small noise, near -160 C
   - lc_direct:         zero until both stepper mains are open, then ramps
   - photogate_counter: accumulates counts while its stepper is moving
+  - pt_differential:   orifice pressure drop, tens of psi
   - CJC (LM34):        fixed room temperature with minor drift
 """
 
@@ -29,6 +30,7 @@ from daq.manifest import (
     BINARY_DIO,
     PULSE_STEPPER,
     PT_DIRECT,
+    PT_DIFFERENTIAL,
     TC_DIFFERENTIAL,
     LC_DIRECT,
     PHOTOGATE_COUNTER,
@@ -46,6 +48,13 @@ _PT_OFFSET_V   = 0.04
 _PT_AMP_V      = 0.020
 _PT_PERIOD_S   = 12.0
 _PT_NOISE_V    = 0.002
+
+# Differential PTs measure drop across an injector orifice (tens of psi)
+_DPT_BASE_V    = 0.10     # ~50 psi at the nominal 500 psi/V calibration
+_DPT_OFFSET_V  = 0.02     # separates dpt0 from dpt1
+_DPT_AMP_V     = 0.015
+_DPT_PERIOD_S  = 9.0
+_DPT_NOISE_V   = 0.001
 
 # Thermocouples: millivolt-scale differential, LOX-ish (~-160 C).
 _TC_BASE_V     = -0.006200
@@ -120,6 +129,11 @@ class MockLabJack:
         self._pt_index = {
             spec.id: i for i, spec in enumerate(
                 s for s in self._stream_channels if s.type == PT_DIRECT
+            )
+        }
+        self._dpt_index = {
+            spec.id: i for i, spec in enumerate(
+                s for s in self._stream_channels if s.type == PT_DIFFERENTIAL
             )
         }
 
@@ -369,6 +383,15 @@ class MockLabJack:
                 _PT_AMP_V,
                 _PT_PERIOD_S + i,
                 _PT_NOISE_V,
+            )
+        if spec.type == PT_DIFFERENTIAL:
+            i = self._dpt_index.get(spec.id, 0)
+            return self._sine_sample(
+                t,
+                _DPT_BASE_V + _DPT_OFFSET_V * i,
+                _DPT_AMP_V,
+                _DPT_PERIOD_S + i,
+                _DPT_NOISE_V,
             )
         if spec.type == TC_DIFFERENTIAL:
             return self._sine_sample(

@@ -23,6 +23,10 @@ import yaml
 
 # Channel types understood by the processing pipeline.
 PT_DIRECT         = "pt_direct"
+# A physical differential transducer reading pressure drop across an
+# orifice. Electrically identical to pt_direct - one single-ended AIN,
+# same voltage->pressure calibration - but the value is a delta.
+PT_DIFFERENTIAL   = "pt_differential"
 TC_DIFFERENTIAL   = "tc_differential"
 LC_DIRECT         = "lc_direct"
 PHOTOGATE_COUNTER = "photogate_counter"
@@ -33,7 +37,13 @@ PULSE_STEPPER = "pulse_stepper"
 
 # Channel types carried by the AIN stream. photogate_counter is read
 # out-of-band (DIO_EF counter) on the same pattern as CJC.
-_STREAMED_TYPES = frozenset({PT_DIRECT, TC_DIFFERENTIAL, LC_DIRECT})
+_STREAMED_TYPES = frozenset(
+    {PT_DIRECT, PT_DIFFERENTIAL, TC_DIFFERENTIAL, LC_DIRECT}
+)
+
+# Types whose calibration lives under calibration.json's "PT" section and
+# whose threshold bands are authored in psi.
+PRESSURE_TYPES = frozenset({PT_DIRECT, PT_DIFFERENTIAL})
 
 
 @dataclass(frozen=True)
@@ -44,7 +54,7 @@ class ChannelSpec:
     unit:     str
     cal_ref:  Optional[str] = None
     active:   bool          = True
-    ain:      Optional[str] = None   # pt_direct / lc_direct
+    ain:      Optional[str] = None   # pt_direct / pt_differential / lc_direct
     ain_pos:  Optional[str] = None   # tc_differential
     ain_neg:  Optional[str] = None   # tc_differential
     dio:      Optional[str] = None   # photogate_counter
@@ -57,7 +67,7 @@ class ChannelSpec:
     @property
     def is_wired(self) -> bool:
         """True if the manifest names a physical pin for this channel."""
-        if self.type in (PT_DIRECT, LC_DIRECT):
+        if self.type in (PT_DIRECT, PT_DIFFERENTIAL, LC_DIRECT):
             return self.ain is not None
         if self.type == TC_DIFFERENTIAL:
             return self.ain_pos is not None and self.ain_neg is not None
@@ -71,6 +81,9 @@ class ActuatorSpec:
     """One actuator as declared in actuators.yaml."""
     id:            str
     type:          str
+    # De-energised resting state ("open"/"closed"), or None where the cart's
+    # Reported to Dashboard, never used to decide anything.
+    normal:        Optional[str]   = None
     dio:           Optional[str]   = None   # binary_dio
     step_dio:      Optional[str]   = None   # pulse_stepper
     dir_dio:       Optional[str]   = None
@@ -101,10 +114,7 @@ class ChannelReading:
     One channel's latest processed value.
 
     `status` is NOMINAL | CAUTION | WARNING for a channel with threshold
-    bands configured, UNASSIGNED for one with none - which is every channel
-    on this cart today, since config.yaml's `thresholds` is deliberately
-    empty until the Liquids review supplies real bounds - and None for a
-    channel that has bands but produced no reading in this batch.
+    bands configured, UNCONFIGURED for one with none.
     """
     value:        Optional[float]
     unit:         str
@@ -166,7 +176,8 @@ def load_channels(path: str) -> list[ChannelSpec]:
 
         if cid in seen:
             raise ValueError(f"channels.yaml: duplicate channel id '{cid}'")
-        if ctype not in (PT_DIRECT, TC_DIFFERENTIAL, LC_DIRECT, PHOTOGATE_COUNTER):
+        if ctype not in (PT_DIRECT, PT_DIFFERENTIAL, TC_DIFFERENTIAL,
+                         LC_DIRECT, PHOTOGATE_COUNTER):
             raise ValueError(
                 f"channels.yaml: channel '{cid}' has unknown type '{ctype}'"
             )
@@ -210,12 +221,20 @@ def load_actuators(path: str) -> list[ActuatorSpec]:
             raise ValueError(
                 f"actuators.yaml: actuator '{aid}' has unknown type '{atype}'"
             )
+
+        normal = entry.get("normal")
+        if normal is not None and normal not in ("open", "closed"):
+            raise ValueError(
+                f"actuators.yaml: actuator '{aid}' has invalid normal "
+                f"'{normal}' (expected 'open', 'closed' or null)"
+            )
         seen.add(aid)
 
         feedback = entry.get("position_feedback") or {}
         specs.append(ActuatorSpec(
             id            = aid,
             type          = atype,
+            normal        = normal,
             dio           = entry.get("dio"),
             step_dio      = entry.get("step_dio"),
             dir_dio       = entry.get("dir_dio"),

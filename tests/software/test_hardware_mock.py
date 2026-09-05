@@ -153,7 +153,7 @@ class TestMockLabJack:
 
     def test_sensor_tags_property(self):
         tags = self.device.sensor_tags
-        assert tags == ["pt0", "pt1", "pt2", "tc0", "lc0", "lc1"]
+        assert tags == ["pt0", "pt1", "pt2", "dpt0", "dpt1", "tc0", "lc0", "lc1"]
 
     def test_noise_is_not_constant(self):
         # Two batches should not be identical (PRNG is running)
@@ -210,3 +210,41 @@ class TestMockStepper:
         settled = self.device.read_counters()["pos_lox_main"]
         after_idle = self.device.read_counters()["pos_lox_main"]
         assert after_idle == settled, "counter kept advancing while idle"
+
+
+class TestDifferentialPtSimulation:
+    """
+    A differential PT reads the drop across an injector orifice, which is
+    tens of psi. Simulating it with the absolute-PT signal put it in the
+    hundreds and produced a physically impossible mass flow downstream.
+    """
+
+    def test_orifice_dp_stays_in_a_plausible_band(self):
+        device = MockLabJack(full_channels(), full_actuators())
+        device.open()
+        device.start_stream()
+        try:
+            batch = device.stream_read()
+        finally:
+            device.stop_stream()
+            device.close()
+
+        for tag in ("dpt0", "dpt1"):
+            psi = [v * 500.0 for v in batch[tag]]     # nominal 500 psi/V
+            assert all(0.0 < p < 100.0 for p in psi), (
+                f"{tag} simulated outside a plausible orifice dP band: "
+                f"min={min(psi):.1f} max={max(psi):.1f} psi"
+            )
+
+    def test_orifice_dp_is_well_below_tank_pressure(self):
+        """The drop across an orifice is a fraction of tank pressure."""
+        device = MockLabJack(full_channels(), full_actuators())
+        device.open()
+        device.start_stream()
+        try:
+            batch = device.stream_read()
+        finally:
+            device.stop_stream()
+            device.close()
+
+        assert max(batch["dpt0"]) < min(batch["pt0"])

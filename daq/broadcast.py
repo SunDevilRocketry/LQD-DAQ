@@ -28,6 +28,7 @@ from typing import Any, Optional
 
 from daq.manifest import (
     PT_DIRECT,
+    PT_DIFFERENTIAL,
     TC_DIFFERENTIAL,
     LC_DIRECT,
     PHOTOGATE_COUNTER,
@@ -40,6 +41,7 @@ VERSION = "1.0"
 # Manifest channel type -> the sensor `type` Dashboard renders by.
 _SENSOR_TYPES = {
     PT_DIRECT:         "pressure",
+    PT_DIFFERENTIAL:   "pressure",
     TC_DIFFERENTIAL:   "temperature",
     LC_DIRECT:         "force",
     PHOTOGATE_COUNTER: "position",
@@ -93,10 +95,14 @@ def system_state_message(engine) -> dict[str, Any]:
     it is no longer live.
 
     `status` is NOMINAL | CAUTION | WARNING per Dashboard's readingStatus.ts,
-    plus UNASSIGNED for a channel with no threshold bands configured yet.
+    plus UNCONFIGURED for a channel with no threshold bands configured yet.
+
+    `derived` carries computed quantities (mass flow, mixture ratio) rather
+    than measured ones, so its entries have values but no status band.
     """
-    snap  = engine.snapshot
-    types = {spec.id: spec.type for spec in engine.channel_specs}
+    snap    = engine.snapshot
+    types   = {spec.id: spec.type for spec in engine.channel_specs}
+    normals = {spec.id: spec.normal for spec in engine.actuator_specs}
 
     sensors = {
         cid: {
@@ -109,6 +115,9 @@ def system_state_message(engine) -> dict[str, Any]:
 
     valves = {
         aid: {
+            # Resting state, straight from actuators.yaml. null until the
+            # cart's P&ID confirms it.
+            "normal": normals.get(aid),
             "status": "open" if reading.state == 1 else "closed",
             "moving": reading.moving,
         }
@@ -125,11 +134,11 @@ def system_state_message(engine) -> dict[str, Any]:
         },
         "sensors": sensors,
         "valves":  valves,
-        # Present for shape consistency, never populated. This cart has no
-        # orifice/venturi geometry data, so mass flow and mixture ratio
-        # aren't computed live; post-processing the CSV log is the answer
-        # if they're ever needed.
-        "derived": {},
+        # Injector mass flows in kg/s and mixture ratio (O/F, dimensionless),
+        # computed per batch from the differential PTs. SI on the wire, as
+        # pressures are. An entry is null when an input is missing - most
+        # often the LOX inlet temperature, which the density lookup needs.
+        "derived": dict(snap.derived or {}),
     })
 
 
