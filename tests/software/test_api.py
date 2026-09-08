@@ -9,7 +9,9 @@ Run with: python -m pytest tests/software/test_api.py -v
 """
 
 import tempfile
+import threading
 import time
+import types
 
 import pytest
 from fastapi.testclient import TestClient
@@ -373,3 +375,166 @@ class TestDataFreshnessAPI:
             engine.stop()
             logger.close()
             api_module.set_engine(prev_engine, prev_logger)
+
+
+# -- Foreground Write Mutex ------------------------
+
+class _BlockingStubEngine:
+    """
+    Test double that blocks on an Event to hold `_control_lock` open.
+
+    The default mock engine returns too quickly to test concurrent calls reliably.
+    """
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = []
+
+    def set_state_listener(self, listener):
+        pass
+
+    def _block(self, name, result=None):
+        self.calls.append(name)
+        self.entered.set()
+        self.release.wait(timeout=5.0)
+        return result
+
+    def write_actuator(self, name, state):
+        self._block("write_actuator")
+
+    def fire(self):
+        self._block("fire")
+
+    def abort(self):
+        self._block("abort")
+
+    def all_safe(self):
+        self._block("all_safe")
+
+    def start_sequence(self):
+        return self._block(
+            "start_sequence",
+            {"step": None, "server_time_ms": 0, "sequence_time_ms": 0},
+        )
+
+    @property
+    def snapshot(self):
+        return types.SimpleNamespace(sequence_active=False, sequence_name="")
+
+
+@pytest.fixture
+def stub_client():
+    """
+    Temporarily replaces the engine with _BlockingStubEngine, restoring 
+    OG state on teardown.
+    """
+    prev_engine, prev_logger = api_module._engine, api_module._logger
+    stub = _BlockingStubEngine()
+    api_module.set_engine(stub)
+    try:
+        yield TestClient(app), stub
+    finally:
+        api_module.set_engine(prev_engine, prev_logger)
+
+
+class TestControlLockSynchronization:
+    """
+    /actuator, /fire, and /sequence/* share one foreground mutex and
+    discard (204) a request that arrives while another is being serviced.
+    /abort and /safe reserve the same mutex but always wait their turn.
+    """
+
+    def test_actuator_busy_returns_204(self, stub_client):
+        client, stub = stub_client
+        result = {}
+
+        def call_first():
+            result["r1"] = client.post(
+                "/actuator", json={"name": "lox_main", "state": 1}
+            )
+
+        t1 = threading.Thread(target=call_first)
+        t1.start()
+        assert stub.entered.wait(timeout=2.0), "first call never entered the guard"
+
+        r2 = client.post("/actuator", json={"name": "lox_main", "state": 1})
+        assert r2.status_code == 204
+
+        stub.release.set()
+        t1.join(timeout=2.0)
+        assert result["r1"].status_code == 200
+
+    def test_actuator_busy_blocks_sequence_start_with_204(self, stub_client):
+        """One lock shared across the whole discard group, not per-route:
+        an /actuator command in flight also discards /sequence/start."""
+        client, stub = stub_client
+
+        t1 = threading.Thread(
+            target=lambda: client.post(
+                "/actuator", json={"name": "lox_main", "state": 1}
+            )
+        )
+        t1.start()
+        assert stub.entered.wait(timeout=2.0)
+
+        r2 = client.post("/sequence/start")
+        assert r2.status_code == 204
+        assert "start_sequence" not in stub.calls
+
+        stub.release.set()
+        t1.join(timeout=2.0)
+
+    def test_abort_never_discarded_blocks_until_free(self, stub_client):
+        client, stub = stub_client
+        result = {}
+
+        t1 = threading.Thread(
+            target=lambda: client.post(
+                "/actuator", json={"name": "lox_main", "state": 1}
+            )
+        )
+        t1.start()
+        assert stub.entered.wait(timeout=2.0)
+
+        def call_abort():
+            result["r2"] = client.post("/abort")
+
+        t2 = threading.Thread(target=call_abort)
+        t2.start()
+        # /abort must be blocked on the lock...
+        # it hasn't been serviced yet while /actuator still holds it.
+        t2.join(timeout=0.3)
+        assert t2.is_alive(), "/abort returned without waiting for the lock"
+
+        stub.release.set()
+        t2.join(timeout=2.0)
+        assert result["r2"].status_code == 200
+
+        t1.join(timeout=2.0)
+
+    def test_safe_never_discarded_blocks_until_free(self, stub_client):
+        client, stub = stub_client
+        result = {}
+
+        t1 = threading.Thread(
+            target=lambda: client.post(
+                "/actuator", json={"name": "lox_main", "state": 1}
+            )
+        )
+        t1.start()
+        assert stub.entered.wait(timeout=2.0)
+
+        def call_safe():
+            result["r2"] = client.post("/safe")
+
+        t2 = threading.Thread(target=call_safe)
+        t2.start()
+        t2.join(timeout=0.3)
+        assert t2.is_alive(), "/safe returned without waiting for the lock"
+
+        stub.release.set()
+        t2.join(timeout=2.0)
+        assert result["r2"].status_code == 200
+
+        t1.join(timeout=2.0)
