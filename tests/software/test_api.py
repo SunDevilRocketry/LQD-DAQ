@@ -441,11 +441,12 @@ def stub_client():
 class TestControlLockSynchronization:
     """
     /actuator, /fire, and /sequence/* share one foreground mutex and
-    discard (204) a request that arrives while another is being serviced.
-    /abort and /safe reserve the same mutex but always wait their turn.
+    discard (423) a request that arrives while another is being serviced.
+    /abort and /safe reserve the same mutex but always wait their turn -
+    never discarded.
     """
 
-    def test_actuator_busy_returns_204(self, stub_client):
+    def test_actuator_busy_returns_423(self, stub_client):
         client, stub = stub_client
         result = {}
 
@@ -459,13 +460,13 @@ class TestControlLockSynchronization:
         assert stub.entered.wait(timeout=2.0), "first call never entered the guard"
 
         r2 = client.post("/actuator", json={"name": "lox_main", "state": 1})
-        assert r2.status_code == 204
+        assert r2.status_code == 423
 
         stub.release.set()
         t1.join(timeout=2.0)
         assert result["r1"].status_code == 200
 
-    def test_actuator_busy_blocks_sequence_start_with_204(self, stub_client):
+    def test_actuator_busy_blocks_sequence_start_with_423(self, stub_client):
         """One lock shared across the whole discard group, not per-route:
         an /actuator command in flight also discards /sequence/start."""
         client, stub = stub_client
@@ -479,7 +480,7 @@ class TestControlLockSynchronization:
         assert stub.entered.wait(timeout=2.0)
 
         r2 = client.post("/sequence/start")
-        assert r2.status_code == 204
+        assert r2.status_code == 423
         assert "start_sequence" not in stub.calls
 
         stub.release.set()
