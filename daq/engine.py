@@ -31,6 +31,7 @@ import time
 import threading
 import traceback
 from collections import deque
+from dataclasses import dataclass
 from typing import Optional
 
 import yaml
@@ -134,7 +135,7 @@ class EngineState:
         "derived",      # dict[str, float | None] - computed, not measured
         "actuators",    # dict[str, ActuatorReading]
         # Hardware & loop state
-        "streaming", "sequence_active", "sequence_name",
+        "streaming", "sequence_active", "sequence_name", "sequence_step",
         "using_mock", "stream_hz",
         "cjc_celsius",
     )
@@ -154,9 +155,23 @@ class SequenceRefused(RuntimeError):
     """
     A sequence cannot run, determined before it starts.
 
-    Raised on the caller's thread - by _validate_sequence(), so a caller 
+    Raised on the caller's thread - by _validate_sequence(), so a caller
     (e.g. POST /fire) can report the failure when sequence moves nothing.
     """
+
+
+@dataclass(frozen=True)
+class FireStep:
+    """
+    One named phase of sequences/fire.yaml.
+
+    start_t is the phase's earliest action time - what /sequence/step jumps
+    to. actions keeps every original (elapsed_s, actuator, state) triple
+    from the phase, unmerged, for GET /sequence's dump.
+    """
+    name:    str
+    start_t: float
+    actions: tuple[tuple[float, str, int], ...]
 
 
 class Engine:
@@ -236,6 +251,12 @@ class Engine:
         self._sequence_active    = False
         self._sequence_name      = ""
         self._sequence_t0:       Optional[float] = None
+
+        # Fire-only pause/seek state. abort.yaml doesn't touch.
+        self._pause_flag         = threading.Event()
+        self._fire_position_s:   float = 0.0
+        self._fire_next_idx:     int = 0
+        self._fire_steps:        Optional[list[FireStep]] = None
 
         # Optional callback fired whenever there is new state worth pushing.
         # Kept as a plain callable so the engine stays free of any asyncio
@@ -546,21 +567,194 @@ class Engine:
         """
         Spawns the fire autosequence thread if the system is idle.
 
+        Always starts from the top (T=0), unlike start_sequence() which
+        resumes wherever a prior /sequence/stop left the position. This is
+        the "real" hotfire trigger - callers use start_sequence() only for
+        the rehearsal/resume flow behind POST /sequence/start.
+
         Raises:
             SequenceRefused: If fire.yaml cannot be loaded, or commands an
                              actuator this cart cannot drive. Raised before
                              anything starts.
         """
         seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        steps, post_s = self._validate_sequence("fire", seq_path)
+        steps, post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        with self._lock:
+            self._fire_steps      = fire_steps
+            self._fire_position_s = 0.0
+            self._fire_next_idx   = 0
         if not self._start_sequence("fire", steps, post_s, is_fire=True):
             self._log("Fire command ignored: autosequence already active")
+
+    def dump_fire_sequence(self) -> list[dict]:
+        """
+        Named-phase dump of sequences/fire.yaml, for GET /sequence.
+
+        Raises:
+            SequenceRefused: Same conditions as fire() - unreadable file,
+                             or a step commanding an actuator this cart
+                             can't drive.
+        """
+        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
+        _steps, _post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        return [
+            {
+                "name":     step.name,
+                "start_s":  step.start_t,
+                "actions":  [list(a) for a in step.actions],
+            }
+            for step in fire_steps
+        ]
+
+    def sequence_status(self) -> dict:
+        """
+        Current fire-sequence position: step name, backend UTC time (ms),
+        and sequence-relative time (ms). Shared return shape for every
+        /sequence/* control endpoint s.t. dashboard can compute latency
+        and offset its own countdown display.
+        """
+        with self._lock:
+            if (
+                self._sequence_active
+                and self._sequence_name == "fire"
+                and self._sequence_t0 is not None
+            ):
+                elapsed = time.perf_counter() - self._sequence_t0
+            else:
+                elapsed = self._fire_position_s
+            fire_steps = self._fire_steps
+        step = self._step_name_for_position(fire_steps, elapsed) if fire_steps else None
+        return {
+            "step":              step,
+            "server_time_ms":    int(time.time() * 1000),
+            "sequence_time_ms":  int(round(elapsed * 1000)),
+        }
+
+    def start_sequence(self) -> dict:
+        """
+        Resumes forward execution of the fire sequence from wherever the
+        position pointer currently sits (0.0 if untouched since the last
+        completion/abort, or wherever /sequence/stop or a prior
+        /sequence/time / /sequence/step made while stopped left it).
+
+        From that position onward this behaves exactly like fire() except
+        not resetting to position 0 first.
+
+        Raises:
+            SequenceRefused: fire.yaml can't be loaded or driven.
+            RuntimeError: a sequence (fire or abort) is already active.
+        """
+        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
+        steps, post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        with self._lock:
+            self._fire_steps = fire_steps
+            start_idx        = self._fire_next_idx
+            start_elapsed    = self._fire_position_s
+        started = self._start_sequence(
+            "fire", steps, post_s, is_fire=True,
+            start_idx=start_idx, start_elapsed=start_elapsed,
+        )
+        if not started:
+            raise RuntimeError("A sequence is already active")
+        return self.sequence_status()
+
+    def stop_sequence(self) -> dict:
+        """
+        Pauses the fire sequence in place: no abort.yaml, no all_safe(),
+        no interruption to an in-progress CSV recording. Position freezes
+        exactly where the last applied action left it, ready to resume
+        from start_sequence().
+
+        Raises:
+            RuntimeError: no fire sequence is currently active.
+        """
+        with self._lock:
+            if not (self._sequence_active and self._sequence_name == "fire"):
+                raise RuntimeError("No fire sequence is active")
+        self._pause_flag.set()
+        thread = self._sequence_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._pause_flag.clear()
+        return self.sequence_status()
+
+    def set_sequence_time(self, seconds: float) -> dict:
+        """
+        Repositions the fire-sequence clock while stopped.
+
+        Display/rehearsal only!!: this never itself writes to a real
+        actuator: only the forward tick after start_sequence() does that,
+        from this new position onward.
+
+        Raises:
+            SequenceRefused: fire.yaml can't be loaded or driven.
+            RuntimeError: a fire sequence is currently active - stop it
+                          first.
+        """
+        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
+        steps, _post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        with self._lock:
+            if self._sequence_active and self._sequence_name == "fire":
+                raise RuntimeError(
+                    "Cannot set sequence time while running - stop it first"
+                )
+            seconds = max(0.0, float(seconds))
+            self._fire_steps      = fire_steps
+            self._fire_position_s = seconds
+            self._fire_next_idx   = sum(1 for t, _, _ in steps if t < seconds)
+        return self.sequence_status()
+
+    def jump_to_step(self, step_name: str) -> dict:
+        """
+        Jump to a named step's start time (display/rehearsal only - see
+        set_sequence_time()).
+
+        Raises:
+            SequenceRefused: fire.yaml can't be loaded or driven.
+            RuntimeError: a fire sequence is currently active - stop it
+                          first.
+            KeyError: step_name doesn't match any step in fire.yaml.
+        """
+        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
+        _steps, _post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        match = next((s for s in fire_steps if s.name == step_name), None)
+        if match is None:
+            raise KeyError(step_name)
+        return self.set_sequence_time(match.start_t)
+
+    @staticmethod
+    def _step_name_for_position(
+        fire_steps: list[FireStep], elapsed: float
+    ) -> Optional[str]:
+        """Name of the last phase whose start_t <= elapsed; None before the
+        first phase's start time (never-started / position 0)."""
+        name = None
+        for step in fire_steps:
+            if step.start_t <= elapsed:
+                name = step.name
+            else:
+                break
+        return name
+
+    def _current_fire_step_name(self) -> Optional[str]:
+        """sequence_step for the live snapshot - see EngineState."""
+        if self._fire_steps is None:
+            return None
+        if (
+            self._sequence_active
+            and self._sequence_name == "fire"
+            and self._sequence_t0 is not None
+        ):
+            elapsed = time.perf_counter() - self._sequence_t0
+        else:
+            elapsed = self._fire_position_s
+        return self._step_name_for_position(self._fire_steps, elapsed)
 
     def abort(self) -> None:
         """
         Terminates any active sequence and runs the abort sequence.
 
-        Guarantees that the abort thread is spawned safely without 
+        Guarantees that the abort thread is spawned safely w/o 
         double-activation conflicts.
         """
         self._abort_flag.set()
@@ -914,6 +1108,7 @@ class Engine:
         object.__setattr__(new_snap, "actuators",       dict(self._device.actuator_states()))
         object.__setattr__(new_snap, "sequence_active", self._sequence_active)
         object.__setattr__(new_snap, "sequence_name",   self._sequence_name)
+        object.__setattr__(new_snap, "sequence_step",   self._current_fire_step_name())
 
         with self._lock:
             self._snapshot = new_snap
@@ -983,6 +1178,8 @@ class Engine:
         post_s: float,
         is_fire: bool,
         force: bool = False,
+        start_idx: int = 0,
+        start_elapsed: float = 0.0,
     ) -> bool:
         """
         Spawns a new background thread to execute an autosequence.
@@ -993,6 +1190,9 @@ class Engine:
                    to preempt). If False (default), refuses to start a second
                    sequence on top of a live one - callers should check the
                    return value rather than assuming success.
+            start_idx/start_elapsed: Resume a fire sequence mid-timeline
+                   (see start_sequence()). Always 0/0.0 for fire()'s own
+                   from-the-top launch and for abort.yaml.
 
         Returns:
             True if the sequence thread was started, False if refused
@@ -1014,9 +1214,10 @@ class Engine:
             self._sequence_name   = name
 
         self._abort_flag.clear()
+        self._pause_flag.clear()
         self._sequence_thread = threading.Thread(
             target=self._run_sequence,
-            args=(name, steps, post_s, is_fire),
+            args=(name, steps, post_s, is_fire, start_idx, start_elapsed),
             name=f"daq-seq-{name}",
             daemon=True,
         )
@@ -1029,21 +1230,28 @@ class Engine:
         steps: list[tuple[float, str, int]],
         post_s: float,
         is_fire: bool,
+        start_idx: int = 0,
+        start_elapsed: float = 0.0,
     ) -> None:
         """
         Execute an already-validated autosequence step by step.
 
         Loading check happen in _validate_sequence() on the caller's thread.
+
+        start_idx/start_elapsed resume a fire sequence from wherever
+        stop_sequence() (or a set_sequence_time()/jump_to_step() made while
+        stopped) last left it - see start_sequence(). abort.yaml always
+        runs with the defaults (0, 0.0).
         """
         self._log(f"Sequence '{name}' starting")
 
-        if is_fire and self._logger:
+        if is_fire and self._logger and not self._logger.is_recording:
             self._logger.start_recording(prefix="hotfire")
 
-        t0 = time.perf_counter()
+        t0 = time.perf_counter() - start_elapsed
         with self._lock:
             self._sequence_t0 = t0
-        idx = 0
+        idx = start_idx
 
         while idx < len(steps):
             # Exit thread immediately on abort flag (applicable to fire sequences only)
@@ -1053,6 +1261,14 @@ class Engine:
                     "abort() will handle the abort sequence launch."
                 )
                 self._sequence_done()
+                return
+
+            # stop_sequence(): pause in place, resumable from here via
+            # start_sequence(). Distinct from abort - no abort.yaml, no
+            # all_safe(), recording keeps running.
+            if self._pause_flag.is_set() and is_fire:
+                self._log(f"Sequence '{name}' paused at T+{steps[idx][0]:.2f}s")
+                self._sequence_paused()
                 return
 
             elapsed   = time.perf_counter() - t0
@@ -1068,6 +1284,10 @@ class Engine:
                 except Exception as exc:
                     self._log(f"Actuator write error: {exc}")
                 idx += 1
+                if is_fire:
+                    with self._lock:
+                        self._fire_next_idx   = idx
+                        self._fire_position_s = target_t
             else:
                 # Sleep briefly to prevent high CPU utilization while awaiting timing targets
                 time.sleep(0.0005)
@@ -1089,7 +1309,30 @@ class Engine:
         self._sequence_done()
 
     def _sequence_done(self) -> None:
-        """Resets the active sequence flags in the shared state."""
+        """
+        Resets the active sequence flags in the shared state on natural
+        completion, or an abort preempting a running fire.
+
+        Also resets the fire position pointer to the top: resuming after
+        either of those w/o an explicit operator re-jump would be a
+        safety surprise.
+        Contrast _sequence_paused(), used by stop_sequence(), which leaves
+        the position exactly where it was.
+        """
+        with self._lock:
+            self._sequence_active  = False
+            self._sequence_name    = ""
+            self._sequence_t0      = None
+            self._fire_position_s  = 0.0
+            self._fire_next_idx    = 0
+
+    def _sequence_paused(self) -> None:
+        """
+        Resets only the "active" flags for stop_sequence()'s pause - the
+        fire position pointer stays exactly where execution left it (kept
+        current throughout _run_sequence's loop), ready for
+        start_sequence() to resume from.
+        """
         with self._lock:
             self._sequence_active = False
             self._sequence_name   = ""
@@ -1127,6 +1370,84 @@ class Engine:
         steps  = [(float(s[0]), str(s[1]), int(s[2])) for s in raw]
         steps.sort(key=lambda s: s[0])
         return steps, post_s
+
+    def _validate_fire_sequence(
+        self, name: str, path: str
+    ) -> tuple[list[tuple[float, str, int]], float, list[FireStep]]:
+        """
+        Load fire.yaml's named-phase schema and confirm this cart can
+        actually drive it.
+
+        Raises:
+            SequenceRefused: If the file cannot be parsed, or any step
+                             commands an actuator this cart cannot drive.
+        """
+        try:
+            steps, post_s, fire_steps = self._load_fire_sequence(path)
+        except Exception as exc:
+            raise SequenceRefused(
+                f"Sequence '{name}' could not be loaded: {exc}"
+            ) from exc
+
+        undrivable = self._undrivable_steps(steps)
+        if undrivable:
+            raise SequenceRefused(
+                f"Sequence '{name}' REFUSED: cannot drive "
+                f"{', '.join(undrivable)} - not wired in actuators.yaml. "
+                f"Every step for these would have failed and the sequence "
+                f"would have reported completion having moved nothing."
+            )
+        return steps, post_s, fire_steps
+
+    def _load_fire_sequence(
+        self, path: str
+    ) -> tuple[list[tuple[float, str, int]], float, list[FireStep]]:
+        """
+        Parse fire.yaml's named-phase schema.
+
+        Each phase's actions keep their own original times - grouping into
+        a named phase never merges or renumbers them. A phase's start_t
+        (its jump target) is its earliest action time, and start_t must be
+        non-decreasing across phases in file order, or a step name would
+        not resolve to a unknown position.
+
+        Returns:
+            (steps, post_record_seconds, fire_steps)
+            steps:      flattened, time-sorted (elapsed_s, actuator, state)
+                        triples.
+            fire_steps: named phases in start_t order.
+        """
+        with open(path) as f:
+            data = yaml.safe_load(f)
+
+        post_s    = float(data.get("post_record_seconds", 5.0))
+        raw_steps = data.get("steps", [])
+
+        flat: list[tuple[float, str, int]] = []
+        fire_steps: list[FireStep] = []
+        last_start_t = float("-inf")
+        for phase in raw_steps:
+            name = str(phase["name"])
+            raw_actions = phase.get("actions", [])
+            if not raw_actions:
+                raise ValueError(f"step '{name}' has no actions")
+
+            actions = tuple(
+                (float(a[0]), str(a[1]), int(a[2])) for a in raw_actions
+            )
+            flat.extend(actions)
+
+            start_t = min(t for t, _, _ in actions)
+            if start_t < last_start_t:
+                raise ValueError(
+                    f"step '{name}' starts at {start_t}s, before the "
+                    f"preceding step's start time {last_start_t}s"
+                )
+            last_start_t = start_t
+            fire_steps.append(FireStep(name=name, start_t=start_t, actions=actions))
+
+        flat.sort(key=lambda s: s[0])
+        return flat, post_s, fire_steps
 
     # --------------------------------------------------------
     # Calibration persistence
