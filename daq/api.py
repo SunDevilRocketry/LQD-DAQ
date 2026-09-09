@@ -18,10 +18,15 @@ Endpoints:
   GET  /actuators       - current actuator states
   GET  /events          - recent event log (SR 3.5 debug console)
   GET  /logger          - logger status and current file path
+  GET  /sequence        - named-phase dump of the fire sequence
   POST /actuator        - send a single manual actuator command
   POST /safe            - all safe (de-energise everything)
-  POST /fire            - start the fire autosequence
+  POST /fire            - start the fire autosequence (always from T=0)
   POST /abort           - abort any running sequence
+  POST /sequence/start  - resume the fire sequence from its current position
+  POST /sequence/stop   - pause the fire sequence in place (not an abort)
+  POST /sequence/time   - seek the fire sequence clock (forward-only while running)
+  POST /sequence/step   - seek to a named fire-sequence step (forward-only while running)
   POST /tare            - tare load cells
   POST /calibration     - update a sensor calibration coefficient
   POST /log/start       - start manual CSV recording
@@ -129,6 +134,14 @@ class LogStartRequest(BaseModel):
     prefix: str = "manual_log"
 
 
+class SequenceTimeRequest(BaseModel):
+    seconds: float
+
+
+class SequenceStepRequest(BaseModel):
+    name: str
+
+
 # --------------------------------------------------------
 # Internal Helpers
 # --------------------------------------------------------
@@ -171,6 +184,7 @@ def get_status():
         "stream_hz":          snap.stream_hz,
         "sequence_active":    snap.sequence_active,
         "sequence_name":      snap.sequence_name,
+        "sequence_step":      snap.sequence_step,
         "unwired_actuators":  eng.unwired_actuators,
         "stale":              eng.is_data_stale,
         "data_age_s":         _data_age_s(eng),
@@ -299,6 +313,16 @@ def get_logger_status():
     }
 
 
+@app.get("/sequence")
+def get_sequence():
+    """Named-phase dump of sequences/fire.yaml, for rehearsal and step lookups."""
+    eng = _require_engine()
+    try:
+        return {"steps": eng.dump_fire_sequence()}
+    except SequenceRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
 # --------------------------------------------------------
 # Control Endpoints
 # --------------------------------------------------------
@@ -373,6 +397,66 @@ def post_abort():
     return {"ok": True}
 
 
+@app.post("/sequence/start")
+def post_sequence_start():
+    """
+    Resumes the fire sequence from wherever it's currently positioned
+    (T=0 if untouched, or wherever /sequence/stop last left it).
+
+    Unlike POST /fire, this does not reset position to 0 first. Refused
+    (409) if a sequence was aborted since - only POST /fire can restart
+    from there.
+    """
+    eng = _require_engine()
+    try:
+        return eng.start_sequence()
+    except (SequenceRefused, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/sequence/stop")
+def post_sequence_stop():
+    """
+    Pauses the fire sequence in place. No abort.yaml runs,
+    hardware is left exactly where it sits, and CSV recording continues.
+    """
+    eng = _require_engine()
+    try:
+        return eng.stop_sequence()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/sequence/time")
+def post_sequence_time(req: SequenceTimeRequest):
+    """
+    Seeks the fire sequence's clock. While stopped: display/rehearsal
+    only, no hardware effect. While running: forward-only fires every 
+    action between the current position and the target, then keeps 
+    ticking from there. Refused (409) for a backward seek while running.
+    """
+    eng = _require_engine()
+    try:
+        return eng.set_sequence_time(req.seconds)
+    except (SequenceRefused, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/sequence/step")
+def post_sequence_step(req: SequenceStepRequest):
+    """
+    Seeks the fire sequence's clock to a named step's start time. Same
+    stopped/running behavior as /sequence/time.
+    """
+    eng = _require_engine()
+    try:
+        return eng.jump_to_step(req.name)
+    except (SequenceRefused, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except KeyError as exc:
+        raise HTTPException(status_code=422, detail=f"Unknown step: {exc}")
+
+
 @app.post("/tare")
 def post_tare():
     """Captures load cell baseline readings as tare offsets."""
@@ -387,7 +471,7 @@ def post_calibration(update: CalibrationUpdate):
     Update a sensor calibration coefficient at runtime.
 
     Changes take effect on the next processed scan batch.
-    Does not persist to calibration.json - call /calibration/save for that.
+    Does not persist to calibration.json: must call /calibration/save for that.
 
     Body: {"tag": "pt0", "slope": 128.0, "intercept": -62.8}
     """

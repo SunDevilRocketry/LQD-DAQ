@@ -8,34 +8,55 @@
 #   lox_press, fuel_press, lox_purge, fuel_purge,
 #   lox_main, fuel_main, lox_vent, fuel_vent, ignition
 #
-# Times are relative to T=0 (moment FIRE is confirmed).
-#
-# Format is as follows: [elapsed_seconds, actuator_name, state]
+# Format: each step has a `name` (unique, used by POST /sequence/step) and
+# an `actions` list of [elapsed_seconds, actuator_name, state] triples, all
+# relative to T=0 (moment FIRE is confirmed). A step's "start time" - what
+# /sequence/step jumps to - is the earliest action time within it. Actions
+# within a step keep their own individual times; grouping into a step does
+# not merge or renumber them.
 #
 # !! TIMINGS BELOW ARE PLACEHOLDERS, NOT A REVIEWED LEGACY-CART TIMELINE !!
 # They are LQD-DAQ's timeline with the actuator names remapped to this
 # cart's ids, kept so the sequence executor has a runnable file. This cart
-# is a different engine. The real timeline (lox_main & fuel_main that are 
+# is a different engine. The real timeline (lox_main & fuel_main that are
 # stepper moves, so instant shut off is impossible). Awaiting liquid review.
 
 post_record_seconds: 5.0
 
 steps:
-  - [1.10,  "lox_purge",  1]
-  - [1.10,  "fuel_purge", 1]
-  - [4.00,  "ignition",   1]
-  - [4.50,  "ignition",   0]
-  - [4.90,  "lox_purge",  0]
-  - [4.90,  "fuel_purge", 0]
-  - [5.00,  "lox_main",   1]
-  - [5.05,  "fuel_main",  1]
-  - [15.00, "lox_main",   0]
-  - [15.10, "lox_purge",  1]
-  - [15.10, "fuel_main",  0]
-  - [15.20, "fuel_purge", 1]
-  - [16.00, "lox_press",  0]
-  - [16.00, "fuel_press", 0]
-  - [16.00, "lox_vent",   0]
-  - [16.00, "fuel_vent",  0]
-  - [21.00, "lox_purge",  0]
-  - [21.00, "fuel_purge", 0]
+  - name: purge_open
+    actions:
+      - [1.10, "lox_purge",  1]
+      - [1.10, "fuel_purge", 1]
+  - name: ignition_on
+    actions:
+      - [4.00, "ignition", 1]
+  - name: ignition_off
+    actions:
+      - [4.50, "ignition", 0]
+  - name: purge_close
+    actions:
+      - [4.90, "lox_purge",  0]
+      - [4.90, "fuel_purge", 0]
+  - name: main_valves_open
+    actions:
+      - [5.00, "lox_main",  1]
+      - [5.05, "fuel_main", 1]
+  - name: main_valves_close
+    actions:
+      - [15.00, "lox_main",  0]
+      - [15.10, "fuel_main", 0]
+  - name: purge_reopen
+    actions:
+      - [15.10, "lox_purge",  1]
+      - [15.20, "fuel_purge", 1]
+  - name: press_vent_close
+    actions:
+      - [16.00, "lox_press",  0]
+      - [16.00, "fuel_press", 0]
+      - [16.00, "lox_vent",   0]
+      - [16.00, "fuel_vent",  0]
+  - name: purge_final_close
+    actions:
+      - [21.00, "lox_purge",  0]
+      - [21.00, "fuel_purge", 0]
