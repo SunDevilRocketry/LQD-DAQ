@@ -25,8 +25,8 @@ Endpoints:
   POST /abort           - abort any running sequence
   POST /sequence/start  - resume the fire sequence from its current position
   POST /sequence/stop   - pause the fire sequence in place (not an abort)
-  POST /sequence/time   - seek the fire sequence clock (stopped only)
-  POST /sequence/step   - seek to a named fire-sequence step (stopped only)
+  POST /sequence/time   - seek the fire sequence clock (forward-only while running)
+  POST /sequence/step   - seek to a named fire-sequence step (forward-only while running)
   POST /tare            - tare load cells
   POST /calibration     - update a sensor calibration coefficient
   POST /log/start       - start manual CSV recording
@@ -403,7 +403,9 @@ def post_sequence_start():
     Resumes the fire sequence from wherever it's currently positioned
     (T=0 if untouched, or wherever /sequence/stop last left it).
 
-    Unlike POST /fire, this does not reset position to 0 first.
+    Unlike POST /fire, this does not reset position to 0 first. Refused
+    (409) if a sequence was aborted since - only POST /fire can restart
+    from there.
     """
     eng = _require_engine()
     try:
@@ -428,9 +430,10 @@ def post_sequence_stop():
 @app.post("/sequence/time")
 def post_sequence_time(req: SequenceTimeRequest):
     """
-    Seeks the fire sequence's clock. Display/rehearsal only - never writes
-    to a real actuator itself. Refused (409) unless the sequence is
-    currently stopped.
+    Seeks the fire sequence's clock. While stopped: display/rehearsal
+    only, no hardware effect. While running: forward-only fires every 
+    action between the current position and the target, then keeps 
+    ticking from there. Refused (409) for a backward seek while running.
     """
     eng = _require_engine()
     try:
@@ -442,9 +445,8 @@ def post_sequence_time(req: SequenceTimeRequest):
 @app.post("/sequence/step")
 def post_sequence_step(req: SequenceStepRequest):
     """
-    Seeks the fire sequence's clock to a named step's start time.
-    Display/rehearsal only, same as /sequence/time. Refused (409) unless
-    the sequence is currently stopped.
+    Seeks the fire sequence's clock to a named step's start time. Same
+    stopped/running behavior as /sequence/time.
     """
     eng = _require_engine()
     try:
