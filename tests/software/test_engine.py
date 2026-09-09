@@ -754,11 +754,11 @@ class TestFireRefusalReachesTheCaller:
 
 class TestFireSequencing:
     """
-    POST /sequence/* adds a pausable/seekable runner for fire.yaml. Seeking 
-    only moves the playhead w/o touching hardware; only start_sequence()
-    ticks perform hardware writes.
+    POST /sequence/* is a pausable/seekable runner for fire.yaml. While
+    stopped, seeking only moves the playhead (no hardware effect). While
+    running, a forward seek fires every action it skips over; a backward seek is refused.
 
-    Scheduled gamma 100s out so sequences stay active until explicitly stopped 
+    Scheduled gamma 100s out so sequences stay active until explicitly stopped
     or aborted during tests.
     """
 
@@ -776,10 +776,10 @@ class TestFireSequencing:
     }
 
     @classmethod
-    def _engine(cls, tmp_path, logger=None):
+    def _engine(cls, tmp_path, logger=None, fire_steps=None):
         seq_dir = tmp_path / "sequences"
         seq_dir.mkdir(exist_ok=True)
-        (seq_dir / "fire.yaml").write_text(yaml.safe_dump(cls.FIRE_STEPS))
+        (seq_dir / "fire.yaml").write_text(yaml.safe_dump(fire_steps or cls.FIRE_STEPS))
         (seq_dir / "abort.yaml").write_text(yaml.safe_dump(cls.ABORT_STEPS))
         return make_engine(sequence_dir=str(seq_dir), logger=logger)
 
@@ -807,20 +807,45 @@ class TestFireSequencing:
         assert status["step"] == "beta"
         assert status["sequence_time_ms"] == 50
 
-    def test_time_and_step_refused_while_running(self, tmp_path):
+    def test_backward_jump_refused_while_running(self, tmp_path):
         # engine.snapshot only updates via the acquisition loop (start()),
         # which isn't running here - check the live flag directly instead,
         # matching TestUnwiredActuatorGate's convention.
         engine = self._engine(tmp_path)
         engine.start_sequence()
+        time.sleep(0.1)  # well past alpha/beta, clearly ahead of T+0
         try:
             assert engine._sequence_active is True
             with pytest.raises(RuntimeError):
                 engine.set_sequence_time(0.0)
             with pytest.raises(RuntimeError):
-                engine.jump_to_step("alpha")
+                engine.jump_to_step("alpha")  # alpha is behind the current position
         finally:
             engine.stop_sequence()
+
+    def test_forward_jump_while_running_replays_skipped_actions(self, tmp_path):
+        engine = self._engine(tmp_path)
+        calls = []
+        orig_write = engine._device.write_actuator
+        def spy(name, state):
+            calls.append((name, state))
+            return orig_write(name, state)
+        engine._device.write_actuator = spy
+
+        engine.start_sequence()
+        status = engine.set_sequence_time(50.0)  # immediately, before alpha/beta tick naturally
+
+        # alpha + beta's two actions fired as part of the jump; gamma (100s
+        # out) did not.
+        assert set(calls) == {("lox_vent", 1), ("lox_purge", 1), ("fuel_vent", 1)}
+        assert status["step"] == "beta"
+        # A few microseconds pass between the jump landing and this status
+        # read, so it's ~50000ms.
+        assert 50000 <= status["sequence_time_ms"] < 50050
+
+        # Ticking resumed live from the new position, not left stopped.
+        assert engine._sequence_active is True
+        engine.stop_sequence()
 
     def test_step_unknown_name_raises_keyerror(self, tmp_path):
         engine = self._engine(tmp_path)
@@ -863,7 +888,7 @@ class TestFireSequencing:
 
         assert calls == first_round, "resuming replayed an already-applied action"
 
-    def test_abort_still_preempts_mid_run_fire_and_resets_position(self, tmp_path):
+    def test_abort_still_preempts_mid_run_fire_and_invalidates_position(self, tmp_path):
         engine = self._engine(tmp_path)
         engine.fire()
         time.sleep(0.15)  # alpha + beta applied, sitting on gamma (100s out)
@@ -873,9 +898,46 @@ class TestFireSequencing:
             engine._sequence_thread.join(timeout=2.0)
 
         assert any("ABORT" in e or "[abort]" in e for e in engine.event_log)
-        assert engine._fire_position_s == 0.0
-        assert engine._fire_next_idx == 0
+        # Frozen where it was (not reset to 0) and invalidated - resumable
+        # only via a fresh fire().
+        assert engine._fire_position_s == pytest.approx(0.06, abs=0.02)
+        assert engine._fire_invalidated is True
         assert engine._sequence_active is False
+        with pytest.raises(RuntimeError):
+            engine.start_sequence()
+
+    def test_fire_after_abort_clears_invalidation(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine.fire()
+        time.sleep(0.15)
+        engine.abort()
+        if engine._sequence_thread:
+            engine._sequence_thread.join(timeout=2.0)
+        assert engine._fire_invalidated is True
+
+        engine.fire()  # fresh fire clears the invalidation and starts at T=0
+        assert engine._fire_invalidated is False
+        time.sleep(0.05)
+        assert engine._sequence_active is True
+        engine.stop_sequence()
+
+    def test_natural_completion_keeps_the_clock_running(self, tmp_path):
+        """After the last scripted action, elapsed keeps counting up (like
+        a real launch clock after liftoff) instead of freezing or
+        resetting."""
+        engine = self._engine(tmp_path, fire_steps={
+            "post_record_seconds": 0,
+            "steps": [{"name": "only", "actions": [[0.01, "lox_vent", 1]]}],
+        })
+        engine.fire()
+        time.sleep(0.1)  # completes within this window
+        assert engine._sequence_active is False
+        assert engine._fire_invalidated is False
+
+        status1 = engine.sequence_status()
+        time.sleep(0.1)
+        status2 = engine.sequence_status()
+        assert status2["sequence_time_ms"] > status1["sequence_time_ms"]
 
 
 class _StubLogger:

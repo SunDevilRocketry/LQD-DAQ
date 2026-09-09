@@ -1291,12 +1291,17 @@ class Engine:
                 )
             self._sequence_active = True
             self._sequence_name   = name
+            # Set synchronously so sequence_status() doesn't race thread startup.
+            t0 = time.perf_counter() - start_elapsed
+            self._sequence_t0 = t0
+            if is_fire:
+                self._fire_t0 = t0
 
         self._abort_flag.clear()
         self._pause_flag.clear()
         self._sequence_thread = threading.Thread(
             target=self._run_sequence,
-            args=(name, steps, post_s, is_fire, start_idx, start_elapsed),
+            args=(name, steps, post_s, is_fire, start_idx, t0),
             name=f"daq-seq-{name}",
             daemon=True,
         )
@@ -1309,29 +1314,24 @@ class Engine:
         steps: list[tuple[float, str, int]],
         post_s: float,
         is_fire: bool,
-        start_idx: int = 0,
-        start_elapsed: float = 0.0,
+        start_idx: int,
+        t0: float,
     ) -> None:
         """
         Execute an already-validated autosequence step by step.
 
         Loading check happen in _validate_sequence() on the caller's thread.
 
-        start_idx/start_elapsed resume a fire sequence from wherever
-        stop_sequence() (or a set_sequence_time()/jump_to_step() made while
-        stopped) last left it - see start_sequence(). abort.yaml always
-        runs with the defaults (0, 0.0).
+        start_idx/t0 resume a fire sequence from wherever stop_sequence()
+        (or a set_sequence_time()/jump_to_step() made while stopped) last
+        left it - see start_sequence(). abort.yaml always runs with the
+        defaults (0, perf_counter()).
         """
         self._log(f"Sequence '{name}' starting")
 
         if is_fire and self._logger and not self._logger.is_recording:
             self._logger.start_recording(prefix="hotfire")
 
-        t0 = time.perf_counter() - start_elapsed
-        with self._lock:
-            self._sequence_t0 = t0
-            if is_fire:
-                self._fire_t0 = t0
         idx = start_idx
 
         while idx < len(steps):
