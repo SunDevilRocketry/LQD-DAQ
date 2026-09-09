@@ -236,12 +236,35 @@ class TestAPI:
         assert "purge_open" in names
         assert "purge_final_close" in names
 
-    def test_sequence_time_rejected_while_running(self, api_client):
+    def test_sequence_time_backward_rejected_while_running(self, api_client):
         _ensure_idle(api_client)
         _start_reliably(api_client, "/fire")
-        r = api_client.post("/sequence/time", json={"seconds": 0})
-        assert r.status_code == 409
-        api_client.post("/sequence/stop")   # fast: no abort.yaml tail to drain
+        try:
+            time.sleep(0.05)  # clearly past T=0, so seconds=0 below is unambiguously backward
+            r = api_client.post("/sequence/time", json={"seconds": 0})
+            assert r.status_code == 409
+        finally:
+            api_client.post("/sequence/stop")   # fast: no abort.yaml tail to drain
+
+    def test_sequence_time_forward_while_running_replays_and_keeps_ticking(self, api_client):
+        _ensure_idle(api_client)
+        _start_reliably(api_client, "/fire")
+        try:
+            r = api_client.post("/sequence/time", json={"seconds": 5.0})
+            assert r.status_code == 200
+            assert r.json()["sequence_time_ms"] >= 5000
+
+            # The jump fires main_valves_open (T+5.0s) immediately.
+            # Wait for the acquisition loop to publish the updated writes to /actuators.
+            time.sleep(0.3)
+            actuators = api_client.get("/actuators").json()
+            assert actuators["lox_main"]["state"] == 1
+
+            # Ticking resumed live from the new position, not left stopped.
+            status = api_client.get("/status").json()
+            assert status["sequence_active"] is True
+        finally:
+            api_client.post("/sequence/stop")
 
     def test_sequence_step_unknown_name_422(self, api_client):
         # An unknown name is rejected before any running-state check, so
@@ -271,6 +294,19 @@ class TestAPI:
         r = api_client.post("/sequence/start")
         assert r.status_code == 409
         api_client.post("/sequence/stop")   # fast: no abort.yaml tail to drain
+
+    def test_sequence_start_refused_after_abort_until_fresh_fire(self, api_client):
+        _ensure_idle(api_client)
+        _start_reliably(api_client, "/fire")
+        time.sleep(0.1)
+        api_client.post("/abort")
+        _wait_until_idle(api_client)  # abort.yaml's own ~10s tail
+
+        r = api_client.post("/sequence/start")
+        assert r.status_code == 409
+
+        _start_reliably(api_client, "/fire")   # fresh fire clears the invalidation
+        api_client.post("/sequence/stop")
 
     def test_snapshot_does_not_error_under_concurrent_polls(self, api_client):
         """10 rapid-fire polls should all return 200."""
