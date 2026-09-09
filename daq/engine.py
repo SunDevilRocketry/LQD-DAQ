@@ -257,6 +257,12 @@ class Engine:
         self._fire_position_s:   float = 0.0
         self._fire_next_idx:     int = 0
         self._fire_steps:        Optional[list[FireStep]] = None
+        # Live fire UI clock anchor (distinct from internal _sequence_t0).
+        # Kept after completion so the clock keeps running; cleared on pause/abort to freeze.
+        self._fire_t0:           Optional[float] = None
+        # True after an abort preempts a fire; cleared only by fire(). While
+        # set, start_sequence() refuses to resume.
+        self._fire_invalidated:  bool = False
 
         # Optional callback fired whenever there is new state worth pushing.
         # Kept as a plain callable so the engine stays free of any asyncio
@@ -583,6 +589,7 @@ class Engine:
             self._fire_steps      = fire_steps
             self._fire_position_s = 0.0
             self._fire_next_idx   = 0
+            self._fire_invalidated = False
         if not self._start_sequence("fire", steps, post_s, is_fire=True):
             self._log("Fire command ignored: autosequence already active")
 
@@ -612,14 +619,13 @@ class Engine:
         and sequence-relative time (ms). Shared return shape for every
         /sequence/* control endpoint s.t. dashboard can compute latency
         and offset its own countdown display.
+
+        Keeps counting past the last action after natural completion
+        (_fire_t0 stays set); freezes on pause or abort (_fire_t0 nulled).
         """
         with self._lock:
-            if (
-                self._sequence_active
-                and self._sequence_name == "fire"
-                and self._sequence_t0 is not None
-            ):
-                elapsed = time.perf_counter() - self._sequence_t0
+            if self._fire_t0 is not None:
+                elapsed = time.perf_counter() - self._fire_t0
             else:
                 elapsed = self._fire_position_s
             fire_steps = self._fire_steps
@@ -642,8 +648,14 @@ class Engine:
 
         Raises:
             SequenceRefused: fire.yaml can't be loaded or driven.
-            RuntimeError: a sequence (fire or abort) is already active.
+            RuntimeError: a sequence (fire or abort) is already active, or
+                          the position was invalidated by an abort.
         """
+        with self._lock:
+            if self._fire_invalidated:
+                raise RuntimeError(
+                    "Sequence was aborted - use /fire to restart from the top"
+                )
         seq_path = os.path.join(self._sequence_dir, "fire.yaml")
         steps, post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
         with self._lock:
@@ -740,12 +752,8 @@ class Engine:
         """sequence_step for the live snapshot - see EngineState."""
         if self._fire_steps is None:
             return None
-        if (
-            self._sequence_active
-            and self._sequence_name == "fire"
-            and self._sequence_t0 is not None
-        ):
-            elapsed = time.perf_counter() - self._sequence_t0
+        if self._fire_t0 is not None:
+            elapsed = time.perf_counter() - self._fire_t0
         else:
             elapsed = self._fire_position_s
         return self._step_name_for_position(self._fire_steps, elapsed)
@@ -754,9 +762,15 @@ class Engine:
         """
         Terminates any active sequence and runs the abort sequence.
 
-        Guarantees that the abort thread is spawned safely w/o 
+        Guarantees that the abort thread is spawned safely w/o
         double-activation conflicts.
+
+        Always invalidates the fire position - start_sequence() refuses to
+        resume from it afterward, whether or not a fire was actually
+        running when this was called. Only fire() clears the invalidation.
         """
+        with self._lock:
+            self._fire_invalidated = True
         self._abort_flag.set()
 
         # Wait for the running sequence thread to notice the flag and exit.
@@ -1251,6 +1265,8 @@ class Engine:
         t0 = time.perf_counter() - start_elapsed
         with self._lock:
             self._sequence_t0 = t0
+            if is_fire:
+                self._fire_t0 = t0
         idx = start_idx
 
         while idx < len(steps):
@@ -1260,7 +1276,10 @@ class Engine:
                     "Sequence aborted - exiting. "
                     "abort() will handle the abort sequence launch."
                 )
-                self._sequence_done()
+                # Freeze in place, same as a pause - abort() has already
+                # set _fire_invalidated so start_sequence() won't resume
+                # from this frozen position.
+                self._sequence_paused()
                 return
 
             # stop_sequence(): pause in place, resumable from here via
@@ -1306,37 +1325,36 @@ class Engine:
             self._logger.stop_recording()
 
         self._log(f"Sequence '{name}' finished")
-        self._sequence_done()
+        if is_fire:
+            self._sequence_completed()
+        else:
+            self._sequence_paused()
 
-    def _sequence_done(self) -> None:
+    def _sequence_completed(self) -> None:
         """
-        Resets the active sequence flags in the shared state on natural
-        completion, or an abort preempting a running fire.
+        Normal completion: all actions executed; thread exiting cleanly.
 
-        Also resets the fire position pointer to the top: resuming after
-        either of those w/o an explicit operator re-jump would be a
-        safety surprise.
-        Contrast _sequence_paused(), used by stop_sequence(), which leaves
-        the position exactly where it was.
-        """
-        with self._lock:
-            self._sequence_active  = False
-            self._sequence_name    = ""
-            self._sequence_t0      = None
-            self._fire_position_s  = 0.0
-            self._fire_next_idx    = 0
-
-    def _sequence_paused(self) -> None:
-        """
-        Resets only the "active" flags for stop_sequence()'s pause - the
-        fire position pointer stays exactly where execution left it (kept
-        current throughout _run_sequence's loop), ready for
-        start_sequence() to resume from.
+        Leaves _fire_t0 intact so the clock keeps counting up until the next
+        fire() or abort(). Position fields are left as-is.
         """
         with self._lock:
             self._sequence_active = False
             self._sequence_name   = ""
             self._sequence_t0     = None
+
+    def _sequence_paused(self) -> None:
+        """
+        Freezes the fire clock (pause, abort preemption, or abort.yaml completion).
+
+        Nulls _fire_t0 so status queries fall back to _fire_position_s. Position
+        fields are left as-is (tracked by _run_sequence); abort() separately
+        flags resumability via _fire_invalidated.
+        """
+        with self._lock:
+            self._sequence_active = False
+            self._sequence_name   = ""
+            self._sequence_t0     = None
+            self._fire_t0         = None
 
     def _undrivable_steps(
         self, steps: list[tuple[float, str, int]]
