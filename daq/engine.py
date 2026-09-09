@@ -692,28 +692,93 @@ class Engine:
 
     def set_sequence_time(self, seconds: float) -> dict:
         """
-        Repositions the fire-sequence clock while stopped.
+        Repositions the fire-sequence clock.
 
-        Display/rehearsal only!!: this never itself writes to a real
-        actuator: only the forward tick after start_sequence() does that,
-        from this new position onward.
+        While stopped: display/rehearsal only - repositions the pointer
+        w/o writing to any actuator. Only the forward tick after
+        start_sequence() drives real hardware, from this new position on.
+
+        While running: forward-only. Instantly fires every actuator action
+        between the current position and the target (no waiting for the
+        real-time tick), then keeps ticking forward live from there. 
+        Backward is refused given "unfiring" is unsafe.
 
         Raises:
             SequenceRefused: fire.yaml can't be loaded or driven.
-            RuntimeError: a fire sequence is currently active - stop it
-                          first.
+            RuntimeError: while running, seconds is behind the current
+                          position. While stopped, never raised.
         """
+        seconds = max(0.0, float(seconds))
+        with self._lock:
+            active = self._sequence_active and self._sequence_name == "fire"
+        if active:
+            return self._jump_while_active(seconds)
+
         seq_path = os.path.join(self._sequence_dir, "fire.yaml")
         steps, _post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
         with self._lock:
-            if self._sequence_active and self._sequence_name == "fire":
-                raise RuntimeError(
-                    "Cannot set sequence time while running - stop it first"
-                )
-            seconds = max(0.0, float(seconds))
             self._fire_steps      = fire_steps
             self._fire_position_s = seconds
             self._fire_next_idx   = sum(1 for t, _, _ in steps if t < seconds)
+        return self.sequence_status()
+
+    def _jump_while_active(self, target_seconds: float) -> dict:
+        """
+        Forward-jump a running fire sequence: pauses the live thread,
+        fires every skipped actuator action immediately, then resumes
+        ticking live from the new position.
+
+        Once the thread has actually exited,
+        _fire_next_idx/_fire_position_s are a consistent snapshot of
+        what's been applied, safe to read and advance from this thread.
+
+        Raises:
+            RuntimeError: target_seconds is behind the current live
+                          position.
+        """
+        with self._lock:
+            current = (
+                time.perf_counter() - self._fire_t0
+                if self._fire_t0 is not None else self._fire_position_s
+            )
+            if target_seconds < current:
+                raise RuntimeError(
+                    "Cannot jump backward while running - stop the sequence first"
+                )
+
+        self._pause_flag.set()
+        thread = self._sequence_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._pause_flag.clear()
+
+        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
+        steps, post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        with self._lock:
+            self._fire_steps = fire_steps
+            idx = self._fire_next_idx
+
+        while idx < len(steps) and steps[idx][0] <= target_seconds:
+            target_t, act_name, state = steps[idx]
+            try:
+                self._device.write_actuator(act_name, state)
+                self._log(
+                    f"[fire] T+{target_t:.2f}s  "
+                    f"{act_name} -> {'OPEN' if state else 'CLOSED'} (jump)"
+                )
+            except Exception as exc:
+                self._log(f"Actuator write error: {exc}")
+            idx += 1
+            with self._lock:
+                self._fire_next_idx   = idx
+                self._fire_position_s = target_t
+
+        started = self._start_sequence(
+            "fire", steps, post_s, is_fire=True,
+            start_idx=self._fire_next_idx, start_elapsed=target_seconds,
+        )
+        if not started:
+            raise RuntimeError("A sequence is already active")
         return self.sequence_status()
 
     def jump_to_step(self, step_name: str) -> dict:
