@@ -527,24 +527,24 @@ class Engine:
                     "Send ABORT first."
                 )
 
-        if self._is_stepper(name):
-            reading = self._device.actuator_states().get(name)
-            if reading is not None:
-                if reading.state == state:
-                    self._log(
-                        f"Manual: {name} already "
-                        f"{'OPEN' if state else 'CLOSED'} - command ignored "
-                        f"rather than re-running the step burst"
-                    )
-                    return
-                if reading.moving:
-                    raise RuntimeError(
-                        f"'{name}' is still executing a move - wait for it to "
-                        f"finish, or send ABORT to reverse it now"
-                    )
+            if self._is_stepper(name):
+                reading = self._device.actuator_states().get(name)
+                if reading is not None:
+                    if reading.state == state:
+                        self._log(
+                            f"Manual: {name} already "
+                            f"{'OPEN' if state else 'CLOSED'} - command ignored "
+                            f"rather than re-running the step burst"
+                        )
+                        return
+                    if reading.moving:
+                        raise RuntimeError(
+                            f"'{name}' is still executing a move - wait for it to "
+                            f"finish, or send ABORT to reverse it now"
+                        )
 
-        self._device.write_actuator(name, state)
-        self._log(f"Manual: {name} -> {'OPEN' if state else 'CLOSED'}")
+            self._device.write_actuator(name, state)
+            self._log(f"Manual: {name} -> {'OPEN' if state else 'CLOSED'}")
 
     def _is_stepper(self, name: str) -> bool:
         """True if `name` is a pulse_stepper in this cart's manifest."""
