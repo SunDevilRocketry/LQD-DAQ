@@ -19,7 +19,14 @@ import pytest
 import yaml
 
 from daq.calculations import psi_to_pa
-from daq.engine import SequenceRefused
+from daq.engine import (
+    FIRE_ABORTED,
+    FIRE_COMPLETED,
+    FIRE_IDLE,
+    FIRE_PAUSED,
+    FIRE_RUNNING,
+    SequenceRefused,
+)
 from daq.manifest import load_actuators
 
 from tests.software._helpers import (
@@ -796,8 +803,10 @@ class TestFireSequencing:
     def test_current_step_is_none_before_first_phase_start_time(self, tmp_path):
         engine = self._engine(tmp_path)
         assert engine.snapshot.sequence_step is None  # never started
+        assert engine.snapshot.sequence_state == FIRE_IDLE
         status = engine.sequence_status()
         assert status["step"] is None
+        assert status["state"] == FIRE_IDLE
 
     def test_jump_to_step_seeks_to_earliest_action_in_group(self, tmp_path):
         engine = self._engine(tmp_path)
@@ -863,9 +872,11 @@ class TestFireSequencing:
         status = engine.stop_sequence()
 
         assert engine._sequence_active is False
+        assert engine._fire_state == FIRE_PAUSED
         assert all_safe_calls == []
         assert logger.stop_calls == 0
         assert status["step"] == "beta"
+        assert status["state"] == FIRE_PAUSED
 
     def test_stop_then_start_resumes_without_replaying_earlier_actions(self, tmp_path):
         engine = self._engine(tmp_path)
@@ -903,6 +914,7 @@ class TestFireSequencing:
         assert engine._fire_position_s == pytest.approx(0.06, abs=0.02)
         assert engine._fire_invalidated is True
         assert engine._sequence_active is False
+        assert engine._fire_state == FIRE_ABORTED
         with pytest.raises(RuntimeError):
             engine.start_sequence()
 
@@ -914,9 +926,11 @@ class TestFireSequencing:
         if engine._sequence_thread:
             engine._sequence_thread.join(timeout=2.0)
         assert engine._fire_invalidated is True
+        assert engine._fire_state == FIRE_ABORTED
 
         engine.fire()  # fresh fire clears the invalidation and starts at T=0
         assert engine._fire_invalidated is False
+        assert engine._fire_state == FIRE_RUNNING
         time.sleep(0.05)
         assert engine._sequence_active is True
         engine.stop_sequence()
@@ -933,11 +947,13 @@ class TestFireSequencing:
         time.sleep(0.1)  # completes within this window
         assert engine._sequence_active is False
         assert engine._fire_invalidated is False
+        assert engine._fire_state == FIRE_COMPLETED
 
         status1 = engine.sequence_status()
         time.sleep(0.1)
         status2 = engine.sequence_status()
         assert status2["sequence_time_ms"] > status1["sequence_time_ms"]
+        assert status1["state"] == FIRE_COMPLETED == status2["state"]
 
 
 class _StubLogger:

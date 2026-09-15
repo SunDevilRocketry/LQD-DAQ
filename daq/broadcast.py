@@ -131,6 +131,7 @@ def system_state_message(engine) -> dict[str, Any]:
             "active":    bool(snap.sequence_active),
             "name":      snap.sequence_name or None,
             "elapsed_s": engine.sequence_elapsed_s,
+            "state":     snap.sequence_state,  # Fire lifecycle (idle/running/paused/completed/aborted) 
         },
         "sensors": sensors,
         "valves":  valves,

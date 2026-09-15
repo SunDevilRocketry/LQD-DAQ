@@ -162,7 +162,8 @@ class TestEnvelope:
         payload = system_state_message(engine)["payload"]
         for key in ("streaming", "is_stale", "sequence", "sensors", "valves", "derived"):
             assert key in payload, f"missing payload key: {key}"
-        assert set(payload["sequence"]) == {"active", "name", "elapsed_s"}
+        assert set(payload["sequence"]) == {"active", "name", "elapsed_s", "state"}
+        assert payload["sequence"]["state"] == "idle"  # fresh engine, fire never run
 
     def test_derived_is_present_but_empty(self):
         """Kept for shape consistency; this cart has no orifice geometry."""

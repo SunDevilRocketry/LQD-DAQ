@@ -111,6 +111,14 @@ _MAX_CONSECUTIVE_READ_ERRORS = 3
 _RECONNECT_BACKOFF_S         = 1.0    # multiplied by attempt number, capped below
 _RECONNECT_BACKOFF_CAP_S     = 10.0
 
+# Fire-sequence lifecycle, reported alongside sequence_active/name/step so a
+# dashboard can tell *why* active is false.
+FIRE_IDLE      = "idle"
+FIRE_RUNNING   = "running"
+FIRE_PAUSED    = "paused"
+FIRE_COMPLETED = "completed"
+FIRE_ABORTED   = "aborted"
+
 
 class EngineState:
     """
@@ -136,6 +144,7 @@ class EngineState:
         "actuators",    # dict[str, ActuatorReading]
         # Hardware & loop state
         "streaming", "sequence_active", "sequence_name", "sequence_step",
+        "sequence_state",
         "using_mock", "stream_hz",
         "cjc_celsius",
     )
@@ -148,6 +157,7 @@ class EngineState:
         object.__setattr__(self, "actuators", {})
         object.__setattr__(self, "streaming", False)
         object.__setattr__(self, "sequence_active", False)
+        object.__setattr__(self, "sequence_state", FIRE_IDLE)
         object.__setattr__(self, "using_mock", USING_MOCK)
 
 
@@ -263,10 +273,13 @@ class Engine:
         # True after an abort preempts a fire; cleared only by fire(). While
         # set, start_sequence() refuses to resume.
         self._fire_invalidated:  bool = False
+        # Reported lifecycle state for the fire sequence specifically.
+        # Transitions: _start_sequence() -> RUNNING,
+        # _run_sequence()'s pause/abort branches -> PAUSED/ABORTED,
+        # _sequence_completed() -> COMPLETED.
+        self._fire_state:        str = FIRE_IDLE
 
         # Optional callback fired whenever there is new state worth pushing.
-        # Kept as a plain callable so the engine stays free of any asyncio
-        # or transport concern | api.py is what turns this into SSE.
         self._state_listener = None
 
         # Hardware streaming thread state
@@ -622,6 +635,9 @@ class Engine:
 
         Keeps counting past the last action after natural completion
         (_fire_t0 stays set); freezes on pause or abort (_fire_t0 nulled).
+
+        `state` is the fire lifecycle (FIRE_* - idle/running/paused/
+        completed/aborted).
         """
         with self._lock:
             if self._fire_t0 is not None:
@@ -629,9 +645,11 @@ class Engine:
             else:
                 elapsed = self._fire_position_s
             fire_steps = self._fire_steps
+            state = self._fire_state
         step = self._step_name_for_position(fire_steps, elapsed) if fire_steps else None
         return {
             "step":              step,
+            "state":             state,
             "server_time_ms":    int(time.time() * 1000),
             "sequence_time_ms":  int(round(elapsed * 1000)),
         }
@@ -1188,6 +1206,7 @@ class Engine:
         object.__setattr__(new_snap, "sequence_active", self._sequence_active)
         object.__setattr__(new_snap, "sequence_name",   self._sequence_name)
         object.__setattr__(new_snap, "sequence_step",   self._current_fire_step_name())
+        object.__setattr__(new_snap, "sequence_state",  self._fire_state)
 
         with self._lock:
             self._snapshot = new_snap
@@ -1296,6 +1315,7 @@ class Engine:
             self._sequence_t0 = t0
             if is_fire:
                 self._fire_t0 = t0
+                self._fire_state = FIRE_RUNNING
 
         self._abort_flag.clear()
         self._pause_flag.clear()
@@ -1344,6 +1364,8 @@ class Engine:
                 # Freeze in place, same as a pause - abort() has already
                 # set _fire_invalidated so start_sequence() won't resume
                 # from this frozen position.
+                with self._lock:
+                    self._fire_state = FIRE_ABORTED
                 self._sequence_paused()
                 return
 
@@ -1352,6 +1374,8 @@ class Engine:
             # all_safe(), recording keeps running.
             if self._pause_flag.is_set() and is_fire:
                 self._log(f"Sequence '{name}' paused at T+{steps[idx][0]:.2f}s")
+                with self._lock:
+                    self._fire_state = FIRE_PAUSED
                 self._sequence_paused()
                 return
 
@@ -1406,6 +1430,7 @@ class Engine:
             self._sequence_active = False
             self._sequence_name   = ""
             self._sequence_t0     = None
+            self._fire_state      = FIRE_COMPLETED
 
     def _sequence_paused(self) -> None:
         """

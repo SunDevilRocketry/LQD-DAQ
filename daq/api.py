@@ -217,6 +217,7 @@ def get_status():
         "sequence_active":    snap.sequence_active,
         "sequence_name":      snap.sequence_name,
         "sequence_step":      snap.sequence_step,
+        "sequence_state":     snap.sequence_state,
         "unwired_actuators":  eng.unwired_actuators,
         "stale":              eng.is_data_stale,
         "data_age_s":         _data_age_s(eng),

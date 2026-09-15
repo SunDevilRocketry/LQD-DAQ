@@ -278,7 +278,7 @@ class TestAPI:
         _ensure_idle(api_client)
 
         body = _start_reliably(api_client, "/sequence/start")
-        assert set(body) == {"step", "server_time_ms", "sequence_time_ms"}
+        assert set(body) == {"step", "state", "server_time_ms", "sequence_time_ms"}
 
         r_stop = api_client.post("/sequence/stop")
         assert r_stop.status_code == 200
