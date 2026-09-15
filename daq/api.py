@@ -33,15 +33,21 @@ Endpoints:
   POST /log/stop        - stop manual CSV recording
 
 All endpoints return JSON. Errors return {"error": "description"}.
+
+/actuator, /fire, and /sequence/* share a single mutex and return 423
+Locked if busy instead of queuing. /safe and /abort use the same
+mutex but block until acquired so safety commands are never dropped.
 """
 
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
+from contextlib import contextmanager
 from typing import Optional, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -63,6 +69,32 @@ _engine = None
 _logger = None
 
 _broadcaster = Broadcaster()
+
+
+# Serializes API write handlers; always acquired before Engine._lock to avoid deadlocks.
+_control_lock = threading.Lock()
+
+
+class _ControlLockBusy(Exception):
+    """Internal signal only: non-blocking acquire of _control_lock failed."""
+
+
+@contextmanager
+def _control_guard(*, blocking: bool):
+    """Context manager for _control_lock.
+
+    blocking=False:
+        Raises _ControlLockBusy if contended (used by droppable routes:
+        /actuator, /fire, /sequence/*; callers return 423).
+    blocking=True:
+        Blocks until acquired (used by critical routes: /abort, /safe).
+    """
+    if not _control_lock.acquire(blocking=blocking):
+        raise _ControlLockBusy()
+    try:
+        yield
+    finally:
+        _control_lock.release()
 
 
 def set_engine(engine, logger=None) -> None:
@@ -336,12 +368,18 @@ def post_actuator(cmd: ActuatorCommand):
     The GUI should reflect the blocked state immediately per SR 3.2.4.
 
     Body: {"name": "lox_main", "state": 1}
+
+    Returns 423 Locked instead of running at all if another guarded
+    command is being serviced.
     """
     eng = _require_engine()
     if cmd.state not in (0, 1):
         raise HTTPException(status_code=422, detail="state must be 0 or 1")
     try:
-        eng.write_actuator(cmd.name, cmd.state)
+        with _control_guard(blocking=False):
+            eng.write_actuator(cmd.name, cmd.state)
+    except _ControlLockBusy:
+        return Response(status_code=423)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except KeyError as exc:
@@ -353,7 +391,8 @@ def post_actuator(cmd: ActuatorCommand):
 def post_safe():
     """Immediately aborts active sequences and de-energizes all hardware outputs."""
     eng = _require_engine()
-    eng.all_safe()
+    with _control_guard(blocking=True):
+        eng.all_safe()
     return {"ok": True}
 
 
@@ -368,6 +407,9 @@ def post_fire():
 
     Raises:
         409: A sequence is already active, or this one was refused.
+
+    Returns 423 Locked instead of running at all if another guarded
+    command is being serviced.
     """
     eng = _require_engine()
     snap = eng.snapshot
@@ -377,7 +419,10 @@ def post_fire():
             detail=f"Sequence '{snap.sequence_name}' already running"
         )
     try:
-        eng.fire()
+        with _control_guard(blocking=False):
+            eng.fire()
+    except _ControlLockBusy:
+        return Response(status_code=423)
     except SequenceRefused as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     return {"ok": True, "sequence": "fire"}
@@ -391,9 +436,13 @@ def post_abort():
     Always succeeds. If abort.yaml is unrunnable the hardware is still
     de-energised, so there is no failure to report to the caller - check
     /events for whether the ordered closure or the fallback ran.
+
+    Always waits its turn on the guard shared with /actuator, /fire, and
+    /sequence/* and is never discarded b/c of aborts.
     """
     eng = _require_engine()
-    eng.abort()
+    with _control_guard(blocking=True):
+        eng.abort()
     return {"ok": True}
 
 
@@ -406,10 +455,16 @@ def post_sequence_start():
     Unlike POST /fire, this does not reset position to 0 first. Refused
     (409) if a sequence was aborted since - only POST /fire can restart
     from there.
+
+    Returns 423 Locked instead of running at all if another guarded
+    command is being serviced.
     """
     eng = _require_engine()
     try:
-        return eng.start_sequence()
+        with _control_guard(blocking=False):
+            return eng.start_sequence()
+    except _ControlLockBusy:
+        return Response(status_code=423)
     except (SequenceRefused, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -419,10 +474,16 @@ def post_sequence_stop():
     """
     Pauses the fire sequence in place. No abort.yaml runs,
     hardware is left exactly where it sits, and CSV recording continues.
+
+    Returns 423 Locked instead of running at all if another guarded
+    command is being serviced.
     """
     eng = _require_engine()
     try:
-        return eng.stop_sequence()
+        with _control_guard(blocking=False):
+            return eng.stop_sequence()
+    except _ControlLockBusy:
+        return Response(status_code=423)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -431,13 +492,19 @@ def post_sequence_stop():
 def post_sequence_time(req: SequenceTimeRequest):
     """
     Seeks the fire sequence's clock. While stopped: display/rehearsal
-    only, no hardware effect. While running: forward-only fires every 
-    action between the current position and the target, then keeps 
+    only, no hardware effect. While running: forward-only fires every
+    action between the current position and the target, then keeps
     ticking from there. Refused (409) for a backward seek while running.
+
+    Returns 423 Locked instead of running at all if another guarded
+    command is being serviced.
     """
     eng = _require_engine()
     try:
-        return eng.set_sequence_time(req.seconds)
+        with _control_guard(blocking=False):
+            return eng.set_sequence_time(req.seconds)
+    except _ControlLockBusy:
+        return Response(status_code=423)
     except (SequenceRefused, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -447,10 +514,16 @@ def post_sequence_step(req: SequenceStepRequest):
     """
     Seeks the fire sequence's clock to a named step's start time. Same
     stopped/running behavior as /sequence/time.
+
+    Returns 423 Locked instead of running at all if another guarded
+    command is being serviced.
     """
     eng = _require_engine()
     try:
-        return eng.jump_to_step(req.name)
+        with _control_guard(blocking=False):
+            return eng.jump_to_step(req.name)
+    except _ControlLockBusy:
+        return Response(status_code=423)
     except (SequenceRefused, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except KeyError as exc:
@@ -471,7 +544,7 @@ def post_calibration(update: CalibrationUpdate):
     Update a sensor calibration coefficient at runtime.
 
     Changes take effect on the next processed scan batch.
-    Does not persist to calibration.json: must call /calibration/save for that.
+    Does not persist to calibration.json - call /calibration/save for that.
 
     Body: {"tag": "pt0", "slope": 128.0, "intercept": -62.8}
     """
