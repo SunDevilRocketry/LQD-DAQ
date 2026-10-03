@@ -1,17 +1,14 @@
 # actuators.yaml
 #
-# LQD-Legacy-DAQ actuator manifest.
+# LQD-DAQ (legacy) actuator manifest.
 #
 # type: binary_dio    - single DIO write, open(1)/closed(0). Matches
 #                        LQD-DAQ's existing write_actuator() model
 #                        unchanged.
 # type: pulse_stepper  - DM860T stepper via T7 DIO_EF Pulse Out (STEP)
 #                        + static DIO writes (DIR/ENA). Open-loop
-#                        fixed-count burst unless position_feedback
-#                        is enabled - and even then, feedback is
-#                        reported only, not used for autonomous
-#                        correction. Hardware executes; it doesn't
-#                        decide.
+#                        fixed-count burst w/ position_feedback
+#                        is enabled optional for report only.
 #
 #
 # A null physical field (dio/step_dio/...) is a placeholder.
@@ -22,56 +19,103 @@
 #         Dashboard so an operator can see commanded state against resting
 #         state.
 #
-# Sequence timing (what fires when) is deliberately NOT hardcoded here.
+# Sequence timing (what fires when) is NOT hardcoded here.
 # This file defines *what actuators exist and how to drive them* -
-# timing/sequencing is separate, dashboard-editable data (format TBD).
+# timing/sequencing is separate, dashboard-editable data.
+#
+# -- T7 DIO pin map ----------------------------------------------------
+# Source: wiring sheet on Altium and the igniter schematic.
+#
+#   FIO0  fuel STEP  (v3 PUL+)  via LJTick-DigitalOut5V   Pulse Out capable
+#   FIO1  fuel DIR   (v3 DIR+)  via LJTick-DigitalOut5V
+#   FIO2  LOX  DIR   (v1 DIR+)  via LJTick-DigitalOut5V
+#   FIO3  LOX  STEP  (v1 PUL+)  via LJTick-DigitalOut5V   Pulse Out capable
+#   FIO4  unused
+#   FIO5  fuel DM860T ALM+ input (v3ALM) - no manifest type for it yet
+#   FIO6  LOX  photogate (LOX_PG)   - channels.yaml pos_lox_main
+#   FIO7  Fuel photogate (Fuel_PG)  - channels.yaml pos_fuel_main
+#   EIO0-EIO5  solenoid relay logic inputs, in RB12 slot order
+#   EIO6  igniter ARM_n   (active-low)
+#   EIO7  igniter FIRE_n  (active-low)
+#   CIO0  LOX  DM860T ENA - placeholder only, not wired, likely to be left tied to GND or VS dependent on testing
+#   CIO1  fuel DM860T ENA - placeholder only, not wired, likely to be left tied to GND or VS dependent on testing
+#
+# Pulse Out is only available on FIO0, FIO2, FIO3, FIO4, FIO5; the interrupt
+# counter used for the photogates only on FIO0-3 and FIO6-7 (LabJack T7
+# datasheet).
+#
+# The T7-to-relay links run through the relay board's DB15 connector (the T7's
+# EIO/CIO bank). RB12 slots R0-R4 and R9 are populated and map in order to EIO0-EIO5. 
+# The solenoid order below is the slot order. The R10 input module has no manifest entry.
+#
+# binary_dio lines are active-low in hardware; the 1/0 inversion is applied
+# in daq/hardware/interface.py, so 1 = energised everywhere in this file.
 
 actuators:
   # -- Solenoids (120VAC, via Grayhill relay modules on the RB12 rack) --
   - id: lox_press
     type: binary_dio
     normal: null
-    dio: null
+    dio: EIO0          # RB12 slot R0
     relay: "70G-OAC5"
     notes: "confirm which of the 3 pilot vs. 3 direct-acting solenoids this is"
   - id: fuel_press
     type: binary_dio
     normal: null
-    dio: null
+    dio: EIO1          # RB12 slot R1
     relay: "70G-OAC5"
   - id: lox_purge
     type: binary_dio
     normal: null
-    dio: null
+    dio: EIO2          # RB12 slot R2
     relay: "70G-OAC5"
   - id: fuel_purge
     type: binary_dio
     normal: null
-    dio: null
+    dio: EIO3          # RB12 slot R3
     relay: "70G-OAC5"
   - id: lox_vent
     type: binary_dio
     normal: null
-    dio: null
+    dio: EIO4          # RB12 slot R4
     relay: "70G-OAC5"
   - id: fuel_vent
     type: binary_dio
     normal: null
-    dio: null
+    dio: EIO5          # RB12 slot R9
     relay: "70G-OAC5"
-  - id: ignition
+
+  # -- Igniter (two-input AND-gated e-match driver) --
+  # Fires only when ARM_n AND FIRE_n are both driven low. Pin HIGH, input,
+  # unplugged or T7 unpowered = safe. ARM has an ~RC on-delay (tens of ms)
+  # before the high-side FET conducts, so ignition_arm must be commanded
+  # b/f ignition_fire. The watchdog covers both lines (binary_dio).
+  - id: ignition_arm
     type: binary_dio
-    normal: null
-    dio: null
-    notes: "igniter trigger"
+    normal: closed
+    dio: EIO6
+    notes: "igniter ARM_n -> Qa gate; energise at least ~100 ms before ignition_fire"
+  - id: ignition_fire
+    type: binary_dio
+    normal: closed
+    dio: EIO7
+    notes: "igniter FIRE_n -> Qb gate; has no effect unless ignition_arm is also energised"
 
   # -- Stepper-driven main valves (DM860T + NEMA-34) --
+  # DM860T (v1) = LOX, DM860T (v3) = fuel, per the sheet's motor leads.
+  # ENA left alone since the drivers are always enabled. ena_dio is
+  # pseudo-wired to CIO0/CIO1, which connect to nothing, because
+  # ActuatorSpec.is_wired (daq/manifest.py) requires it and interface.py
+  # writes it (so all_safe()'s driver-disable has no effect here).
+  # steps_open / steps_close / pulse_freq_hz still need valve travel
+  # characterization, so the mains stay unwired (and fire is refused) until
+  # they are filled in.
   - id: lox_main
     type: pulse_stepper
     normal: null
-    step_dio: null
-    dir_dio: null
-    ena_dio: null
+    step_dio: FIO3
+    dir_dio: FIO2
+    ena_dio: CIO0      # placeholder, not wired
     steps_open: null
     steps_close: null
     pulse_freq_hz: null
@@ -84,9 +128,9 @@ actuators:
   - id: fuel_main
     type: pulse_stepper
     normal: null
-    step_dio: null
-    dir_dio: null
-    ena_dio: null
+    step_dio: FIO0
+    dir_dio: FIO1
+    ena_dio: CIO1      # placeholder, not wired
     steps_open: null
     steps_close: null
     pulse_freq_hz: null

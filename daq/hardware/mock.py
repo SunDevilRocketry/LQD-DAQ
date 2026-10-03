@@ -40,8 +40,8 @@ from daq.manifest import (
 # -- Sensor Simulation Parameters -----------------------------
 # Voltage formula: V = base + amplitude * sin(2pi * t / period) + noise
 
-# Pressure transducers. 0.50 V is ~250 psi at the PX309-2K5V nominal
-# 500 psi/V slope; each successive PT is offset a little so channels are
+# Pressure transducers. 0.50 V is ~200 psi at the PX309-2KG5V nominal
+# 400 psi/V slope; each successive PT is offset a little so channels are
 # distinguishable in a dashboard rather than drawing on top of each other.
 _PT_BASE_V     = 0.50
 _PT_OFFSET_V   = 0.04

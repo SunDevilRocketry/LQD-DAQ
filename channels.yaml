@@ -1,100 +1,122 @@
 # channels.yaml
 #
-# LQD-Legacy-DAQ channel manifest.
+# LQD-DAQ (legacy) channel manifest.
 #
-# Principle: this is data. Physical fields (ain, dio, etc.)
-# are null until confirmed on the cart by wire count - a null field is
-# a placeholder.
+# Principle: this is data. Each entry names a sensor and the T7 pin it is
+# read from. A null physical field (ain, dio, etc.) means the channel is not
+# wired, and the engine skips it.
 #
-# Tags below are pt0-pt7 / tc.. / lc.. / pos.. - placeholders following
-# how we've been referring to the legacy P&ID/sdec channels in
-# conversation.
+# Channel ids (pt0-pt3, dpt0/1, lc0/1, tc0, pos_*) follow the wiring sheet.
+# They are this cart's own tags: the POT/PFT/POI/... tags and threshold
+# shape of the main LQD-DAQ branch do not apply here.
 #
-# This is a different liquids system than LQD-DAQ's target architecture
-# do not reuse LQD-DAQ's POT/PFT/POI/... tags or its threshold shape.
-#
-# type: pt_direct       - absolute/gauge PT, single-ended AIN.
-# type: pt_differential - differential PT across an injector orifice.
-#                         Same 0-5 V wiring and same calibration form as
-#                         pt_direct; the value is a pressure drop.
+# type: pt_direct         - absolute/gauge PT, single-ended AIN.
+# type: pt_differential   - differential PT across an injector orifice.
+#                           Same 0-5 V wiring and same calibration form as
+#                           pt_direct; the value is a pressure drop.
+# type: lc_direct         - load cell conditioned by an external amplifier,
+#                           read single-ended like a PT.
+# type: tc_differential   - thermocouple on a differential AIN pair.
+# type: photogate_counter - valve-position photogate on a DIO line, read as a
+#                           DIO_EF counter outside the AIN stream.
 #
 # `unit` is the unit the channel is *reported* in (snapshot, SSE, CSV).
-# Pressures report Pa, matching the SI-internal convention the pipeline
-# already used and the magnitudes in legacy_liquids_sse_contract.md.
+# Pressures report Pa (SI-internal convention) the pipeline uses.
 # Calibration coefficients (calibration.json) and threshold bands
 # (config.yaml) stay authored in psi and are converted on load.
+#
+# -- T7 AIN pin map (DB37/CB37 side, from the wiring sheet) -------------
+#   AIN0   PT0           AIN8   PT3
+#   AIN1   LC0 signal+   AIN9   unused
+#   AIN2   TC0 +         AIN10  dPT0 (LOX injector dP)
+#   AIN3   TC0 -         AIN11  unused
+#   AIN4   PT1           AIN12  dPT1 (fuel injector dP)
+#   AIN5   LC1 signal+   AIN13  igniter continuity/arm sense (PROVISIONAL,
+#   AIN6   PT2                   not a channel yet - needs a voltage type)
+#   AIN7   unused
+# LC signal- returns to T7 GND, so LCs are read single-ended like the PTs.
+# TC0 is on the main screw terminals (AIN2/AIN3), a differential pair.
+# Photogate counters are on FIO6 (LOX) / FIO7 (fuel); see actuators.yaml for
+# the full DIO map.
 
 channels:
-  # -- Pressure transducers (Omega PX309-2K5V, 0-5V direct to T7 AIN) --
-  # All 8 assumed direct-wired for this bridge - no mux/amp stage.
-  # `type: pt_direct` today; a future `pt_muxed` type (DIO-addressed,
-  # e.g. via a CB37/CB-series breakout) is additive, not a rewrite.
+  # -- Pressure transducers (Omega PX309-2KG5V: 0-2000 psig, 0-5V, direct to T7 AIN) --
+  # Only PT0-PT3 exist on the wiring sheet; PT4-PT7 are marked inactive.
+  # All direct-wired: no mux/amp stage.
   - id: pt0
     type: pt_direct
     unit: Pa
-    ain: null
+    ain: AIN0
     cal_ref: pt0
   - id: pt1
     type: pt_direct
     unit: Pa
-    ain: null
+    ain: AIN4
     cal_ref: pt1
   - id: pt2
     type: pt_direct
     unit: Pa
-    ain: null
+    ain: AIN6
     cal_ref: pt2
   - id: pt3
     type: pt_direct
     unit: Pa
-    ain: null
+    ain: AIN8
     cal_ref: pt3
   - id: pt4
     type: pt_direct
     unit: Pa
     ain: null
     cal_ref: pt4
+    active: false
+    notes: "not on the wiring sheet"
   - id: pt5
     type: pt_direct
     unit: Pa
     ain: null
     cal_ref: pt5
+    active: false
+    notes: "not on the wiring sheet"
   - id: pt6
     type: pt_direct
     unit: Pa
     ain: null
     cal_ref: pt6
+    active: false
+    notes: "not on the wiring sheet"
   - id: pt7
     type: pt_direct
     unit: Pa
     ain: null
     cal_ref: pt7
-    active: null
+    active: false
+    notes: "not on the wiring sheet"
 
-  # -- Differential PTs (across the injector orifices) --
+  # -- Differential PTs (across the injector orifices, QDW90A) --
   # Feed lox/fuel mass flow. Orifice geometry lives in config.yaml.
   # slope/intercept in calibration.json are the pt_direct nominal values
   # as a placeholder.
   - id: dpt0
     type: pt_differential
     unit: Pa
-    ain: null
+    ain: AIN10
     cal_ref: dpt0
     notes: "LOx injector orifice dP - confirm part and full-scale range"
   - id: dpt1
     type: pt_differential
     unit: Pa
-    ain: null
+    ain: AIN12
     cal_ref: dpt1
     notes: "fuel injector orifice dP - confirm part and full-scale range"
 
   # -- Thermocouple (differential pair, LM34 CJC ref) --
-  # Connector exists on L0002; physical probe presence unconfirmed.
+  # Connector is on the T7 screw terminals (AIN2/AIN3); physical probe presence
+  # unconfirmed, so the channel is inactive.
   - id: tc0
     type: tc_differential
     unit: celsius
-    ain_pos: null
-    ain_neg: null
+    ain_pos: AIN2
+    ain_neg: AIN3
     cal_ref: tc0
     active: false
 
@@ -104,30 +126,31 @@ channels:
   - id: lc0
     type: lc_direct
     unit: lbf
-    ain: null
+    ain: AIN1
     cal_ref: lc0
     active: false
   - id: lc1
     type: lc_direct
     unit: lbf
-    ain: null
+    ain: AIN5
     cal_ref: lc1
     active: false
 
   # -- Stepper position feedback (L0004 photogate boards) --
   # Informational telemetry only, same as any other channel. Reported
-  # in EngineState like a PT/TC.
+  # in EngineState like a PT/TC. The boards are bench-tested and working;
+  # the channels stay inactive until stepper analysis consumes them.
   - id: pos_lox_main
     type: photogate_counter
     unit: counts
-    dio: null
+    dio: FIO6
     cal_ref: null
     active: false
-    notes: "L0004 board retained; operational status unconfirmed"
+    notes: "L0004 photogate, tested working; inactive until stepper analysis uses it"
   - id: pos_fuel_main
     type: photogate_counter
     unit: counts
-    dio: null
+    dio: FIO7
     cal_ref: null
     active: false
-    notes: "L0004 board retained; operational status unconfirmed"
+    notes: "L0004 photogate, tested working; inactive until stepper analysis uses it"

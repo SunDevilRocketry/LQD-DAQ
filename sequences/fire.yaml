@@ -6,7 +6,11 @@
 #
 # Actuator names must exactly match an `id` in actuators.yaml:
 #   lox_press, fuel_press, lox_purge, fuel_purge,
-#   lox_main, fuel_main, lox_vent, fuel_vent, ignition
+#   lox_main, fuel_main, lox_vent, fuel_vent, ignition_arm, ignition_fire
+#
+# The igniter fires only when BOTH ignition_arm and ignition_fire are
+# energised, and arm has an RC on-delay, so arm leads fire by about a second
+# and fire is released before arm.
 #
 # Format: each step has a `name` (unique, used by POST /sequence/step) and
 # an `actions` list of [elapsed_seconds, actuator_name, state] triples, all
@@ -15,11 +19,11 @@
 # within a step keep their own individual times; grouping into a step does
 # not merge or renumber them.
 #
-# !! TIMINGS BELOW ARE PLACEHOLDERS, NOT A REVIEWED LEGACY-CART TIMELINE !!
-# They are LQD-DAQ's timeline with the actuator names remapped to this
-# cart's ids, kept so the sequence executor has a runnable file. This cart
-# is a different engine. The real timeline (lox_main & fuel_main that are
-# stepper moves, so instant shut off is impossible). Awaiting liquid review.
+# !! TIMINGS BELOW ARE PLACEHOLDERS, NOT A REVIEWED TIMELINE !!
+# They were carried over from the main LQD-DAQ timeline with the actuator
+# names remapped to this cart's ids, so the sequence executor has a runnable
+# file. The real timeline still needs the Liquids review, in particular
+# because lox_main and fuel_main are stepper moves (no instant shut-off).
 
 post_record_seconds: 5.0
 
@@ -28,12 +32,16 @@ steps:
     actions:
       - [1.10, "lox_purge",  1]
       - [1.10, "fuel_purge", 1]
+  - name: ignition_arm
+    actions:
+      - [3.00, "ignition_arm", 1]
   - name: ignition_on
     actions:
-      - [4.00, "ignition", 1]
+      - [4.00, "ignition_fire", 1]
   - name: ignition_off
     actions:
-      - [4.50, "ignition", 0]
+      - [4.50, "ignition_fire", 0]
+      - [4.60, "ignition_arm",  0]
   - name: purge_close
     actions:
       - [4.90, "lox_purge",  0]

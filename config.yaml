@@ -1,6 +1,6 @@
 # config.yaml
 #
-# Liquids DAQ system configuration.
+# LQD-DAQ (legacy) system configuration.
 # Edit here for hardware-specific tuning and safety boundaries.
 
 # -- SERVER CONFIGURATION ------------------------------------
@@ -62,8 +62,7 @@ derived:
 #
 # Keyed by channel id from channels.yaml.
 # Bounds are authored in calibrated units: pressures (psig), temperatures
-# (°C), forces (lbf). Pressure bands are converted to Pa on load, matching
-# the Pa the pipeline reports.
+# (°C), forces (lbf). Pressure bands are converted to Pa on load.
 #
 # GUI State Mapping (Dashboard readingStatus.ts):
 #   - Within [normal]:                        NOMINAL

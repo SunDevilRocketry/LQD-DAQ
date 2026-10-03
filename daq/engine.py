@@ -76,8 +76,8 @@ DEFAULT_ACTUATORS_PATH = os.path.join(_REPO_DIR, "actuators.yaml")
 # type that calibration.json doesn't override. Slope/intercept stay in the
 # psi calibration domain for PTs (psi/V, psi), lbf for load cells.
 #
-#   pt_direct - Omega PX309-2K5V nominal transfer function: 0-2500 psig
-#               over a 0-5 V output => 500 psi/V, 0 psi offset. Nominal
+#   pt_direct - Omega PX309-2KG5V nominal transfer function: 0-2000 psig
+#               over a 0-5 V output => 400 psi/V, 0 psi offset. Nominal
 #               datasheet values.
 #   lc_direct - placeholder. The PUSHTON S1 bridge is conditioned by an
 #               external amplifier whose gain isn't recorded yet, so this
