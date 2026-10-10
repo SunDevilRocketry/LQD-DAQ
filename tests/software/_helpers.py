@@ -18,11 +18,12 @@ _REPO     = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _FIXTURES = os.path.join(_HERE, "fixtures")
 
 # The fully-wired fixture manifests, not the repo's own channels.yaml.
-# The real manifests leave most pins null and most channels inactive
-# (nothing is confirmed on the cart yet), which would leave the TC, load
-# cell, stepper and photogate paths untested.
-FULL_CHANNELS  = os.path.join(_FIXTURES, "channels_full.yaml")
-FULL_ACTUATORS = os.path.join(_FIXTURES, "actuators_full.yaml")
+# The real manifests leave the stepper pins and step counts null and the TC,
+# load cell and photogate channels inactive, which would leave those paths
+# untested.
+FULL_CHANNELS     = os.path.join(_FIXTURES, "channels_full.yaml")
+FULL_ACTUATORS    = os.path.join(_FIXTURES, "actuators_full.yaml")
+UNWIRED_ACTUATORS = os.path.join(_FIXTURES, "actuators_unwired.yaml")
 
 # The manifests actually shipped in the repo.
 REPO_CHANNELS  = os.path.join(_REPO, "channels.yaml")
@@ -49,8 +50,9 @@ def make_engine(
     """
     Create an Engine wired to mock hardware and the fixture manifests.
 
-    actuators_path defaults to the fully-wired fixture; pass REPO_ACTUATORS
-    to exercise the cart as actually shipped, with no pins assigned.
+    actuators_path defaults to the fully-wired fixture; pass
+    UNWIRED_ACTUATORS for a cart with no pins assigned, or REPO_ACTUATORS
+    for the manifest as shipped.
     """
     return Engine(
         cal_path=None,

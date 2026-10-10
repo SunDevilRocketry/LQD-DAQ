@@ -234,7 +234,7 @@ class TestAPI:
         r = api_client.get("/sequence")
         assert r.status_code == 200
         names = [s["name"] for s in r.json()["steps"]]
-        assert len(names) == 9
+        assert len(names) == 10
         assert "purge_open" in names
         assert "purge_final_close" in names
 

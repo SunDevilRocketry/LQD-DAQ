@@ -31,6 +31,7 @@ from daq.manifest import load_actuators
 
 from tests.software._helpers import (
     REPO_ACTUATORS,
+    UNWIRED_ACTUATORS,
     make_engine,
     wait_for_first_batch,
 )
@@ -167,7 +168,7 @@ class TestEngine:
         before = self.engine.snapshot.channels["pt0"].value
         assert before is not None
 
-        self.engine.update_calibration("pt0", slope=1000.0, intercept=0.0)
+        self.engine.update_calibration("pt0", slope=800.0, intercept=0.0)
         time.sleep(0.3)
         after = self.engine.snapshot.channels["pt0"].value
 
@@ -474,7 +475,7 @@ class TestUnwiredActuatorGate:
     """
 
     @staticmethod
-    def _seq_engine(tmp_path, steps, actuators_path=REPO_ACTUATORS):
+    def _seq_engine(tmp_path, steps, actuators_path=UNWIRED_ACTUATORS):
         """An engine whose sequences/ holds an abort.yaml with `steps`."""
         seq_dir = tmp_path / "sequences"
         seq_dir.mkdir()
@@ -501,11 +502,11 @@ class TestUnwiredActuatorGate:
         thread.join(timeout=timeout)
         assert not thread.is_alive(), "sequence never finished"
 
-    def test_shipped_manifest_reports_every_actuator_unwired(self):
-        engine = make_engine(actuators_path=REPO_ACTUATORS)
+    def test_unfilled_manifest_reports_every_actuator_unwired(self):
+        engine = make_engine(actuators_path=UNWIRED_ACTUATORS)
         assert set(engine.unwired_actuators) == {
             spec.id for spec in engine.actuator_specs
-        }, "the shipped actuators.yaml assigns no pins at all"
+        }, "an actuators.yaml with no pins assigned"
 
     def test_fixture_manifest_reports_nothing_unwired(self):
         assert make_engine().unwired_actuators == []
@@ -682,7 +683,7 @@ class TestFireRefusalReachesTheCaller:
     """
 
     @staticmethod
-    def _engine(tmp_path, steps, name="fire.yaml", actuators_path=REPO_ACTUATORS):
+    def _engine(tmp_path, steps, name="fire.yaml", actuators_path=UNWIRED_ACTUATORS):
         """
         fire.yaml uses the named-phase schema (_load_fire_sequence); every
         other name (abort.yaml) keeps the flat schema (_load_sequence).

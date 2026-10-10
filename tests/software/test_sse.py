@@ -227,7 +227,7 @@ class TestStreamEndpoint:
         assert valves["lox_vent"]["normal"] == "open"
         assert valves["lox_main"]["normal"] == "closed"
         # Omitted in the manifest - reaches Dashboard as null, not defaulted.
-        assert valves["ignition"]["normal"] is None
+        assert valves["ignition_arm"]["normal"] is None
 
     def test_client_unregisters_on_disconnect(self, sse_client):
         client, _ = sse_client

@@ -32,7 +32,10 @@ actuators:
     type: binary_dio
     normal: open
     dio: EIO5
-  - id: ignition
+  - id: ignition_arm
+    type: binary_dio
+    dio: CIO0
+  - id: ignition_fire
     type: binary_dio
     dio: CIO1
 

@@ -3,12 +3,12 @@
 # LQD-DAQ (legacy) channel manifest.
 #
 # Principle: this is data. Each entry names a sensor and the T7 pin it is
-# read from. A null physical field (ain, dio, etc.) means the channel is not
-# wired, and the engine skips it.
+# read from. A null physical field (ain, dio, etc.) marks an unwired channel,
+# which the engine skips.
 #
 # Channel ids (pt0-pt3, dpt0/1, lc0/1, tc0, pos_*) follow the wiring sheet.
-# They are this cart's own tags: the POT/PFT/POI/... tags and threshold
-# shape of the main LQD-DAQ branch do not apply here.
+# They are this cart's own tags, separate from the POT/PFT/POI/... scheme and
+# threshold shape of the main LQD-DAQ branch.
 #
 # type: pt_direct         - absolute/gauge PT, single-ended AIN.
 # type: pt_differential   - differential PT across an injector orifice.
@@ -31,8 +31,8 @@
 #   AIN2   TC0 +         AIN10  dPT0 (LOX injector dP)
 #   AIN3   TC0 -         AIN11  unused
 #   AIN4   PT1           AIN12  dPT1 (fuel injector dP)
-#   AIN5   LC1 signal+   AIN13  igniter continuity/arm sense (PROVISIONAL,
-#   AIN6   PT2                   not a channel yet - needs a voltage type)
+#   AIN5   LC1 signal+   AIN13  igniter continuity/arm sense (provisional,
+#   AIN6   PT2                   pending a voltage channel type)
 #   AIN7   unused
 # LC signal- returns to T7 GND, so LCs are read single-ended like the PTs.
 # TC0 is on the main screw terminals (AIN2/AIN3), a differential pair.
@@ -42,7 +42,7 @@
 channels:
   # -- Pressure transducers (Omega PX309-2KG5V: 0-2000 psig, 0-5V, direct to T7 AIN) --
   # Only PT0-PT3 exist on the wiring sheet; PT4-PT7 are marked inactive.
-  # All direct-wired: no mux/amp stage.
+  # All wired directly to the T7.
   - id: pt0
     type: pt_direct
     unit: Pa
@@ -69,28 +69,28 @@ channels:
     ain: null
     cal_ref: pt4
     active: false
-    notes: "not on the wiring sheet"
+    notes: "spare slot"
   - id: pt5
     type: pt_direct
     unit: Pa
     ain: null
     cal_ref: pt5
     active: false
-    notes: "not on the wiring sheet"
+    notes: "spare slot"
   - id: pt6
     type: pt_direct
     unit: Pa
     ain: null
     cal_ref: pt6
     active: false
-    notes: "not on the wiring sheet"
+    notes: "spare slot"
   - id: pt7
     type: pt_direct
     unit: Pa
     ain: null
     cal_ref: pt7
     active: false
-    notes: "not on the wiring sheet"
+    notes: "spare slot"
 
   # -- Differential PTs (across the injector orifices, QDW90A) --
   # Feed lox/fuel mass flow. Orifice geometry lives in config.yaml.
@@ -110,8 +110,8 @@ channels:
     notes: "fuel injector orifice dP - confirm part and full-scale range"
 
   # -- Thermocouple (differential pair, LM34 CJC ref) --
-  # Connector is on the T7 screw terminals (AIN2/AIN3); physical probe presence
-  # unconfirmed, so the channel is inactive.
+  # Connector on the T7 screw terminals (AIN2/AIN3); inactive until the probe
+  # is confirmed.
   - id: tc0
     type: tc_differential
     unit: celsius

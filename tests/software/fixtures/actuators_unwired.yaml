@@ -1,0 +1,46 @@
+# tests/software/fixtures/actuators_unwired.yaml
+#
+# Every actuator with null pins.
+
+actuators:
+  - id: lox_press
+    type: binary_dio
+    dio: null
+  - id: fuel_press
+    type: binary_dio
+    dio: null
+  - id: lox_purge
+    type: binary_dio
+    dio: null
+  - id: fuel_purge
+    type: binary_dio
+    dio: null
+  - id: lox_vent
+    type: binary_dio
+    dio: null
+  - id: fuel_vent
+    type: binary_dio
+    dio: null
+  - id: ignition_arm
+    type: binary_dio
+    dio: null
+  - id: ignition_fire
+    type: binary_dio
+    dio: null
+
+  - id: lox_main
+    type: pulse_stepper
+    step_dio: null
+    dir_dio: null
+    ena_dio: null
+    steps_open: null
+    steps_close: null
+    pulse_freq_hz: null
+  - id: fuel_main
+    type: pulse_stepper
+    step_dio: null
+    dir_dio: null
+    ena_dio: null
+    steps_open: null
+    steps_close: null
+    pulse_freq_hz: null

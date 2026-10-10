@@ -107,12 +107,12 @@ class TestMockLabJack:
         assert self.device.read_actuator("lox_vent") == 0
 
     def test_all_safe_closes_solenoids_and_stops_all_motion(self):
-        for name in ("lox_main", "fuel_main", "ignition"):
+        for name in ("lox_main", "fuel_main", "ignition_arm"):
             self.device.write_actuator(name, 1)
         self.device.all_safe()
 
         states = self.device.actuator_states()
-        assert states["ignition"].state == 0, "solenoid not cleared by all_safe()"
+        assert states["ignition_arm"].state == 0, "solenoid not cleared by all_safe()"
         for name, reading in states.items():
             assert reading.moving is False, f"{name} still moving after all_safe()"
 

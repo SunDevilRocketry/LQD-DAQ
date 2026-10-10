@@ -31,7 +31,7 @@
 #   FIO2  LOX  DIR   (v1 DIR+)  via LJTick-DigitalOut5V
 #   FIO3  LOX  STEP  (v1 PUL+)  via LJTick-DigitalOut5V   Pulse Out capable
 #   FIO4  unused
-#   FIO5  fuel DM860T ALM+ input (v3ALM) - no manifest type for it yet
+#   FIO5  fuel DM860T ALM+ input (v3ALM), reserved for an alarm input
 #   FIO6  LOX  photogate (LOX_PG)   - channels.yaml pos_lox_main
 #   FIO7  Fuel photogate (Fuel_PG)  - channels.yaml pos_fuel_main
 #   EIO0-EIO5  solenoid relay logic inputs, in RB12 slot order
@@ -40,13 +40,13 @@
 #   CIO0  LOX  DM860T ENA - placeholder only, not wired, likely to be left tied to GND or VS dependent on testing
 #   CIO1  fuel DM860T ENA - placeholder only, not wired, likely to be left tied to GND or VS dependent on testing
 #
-# Pulse Out is only available on FIO0, FIO2, FIO3, FIO4, FIO5; the interrupt
-# counter used for the photogates only on FIO0-3 and FIO6-7 (LabJack T7
+# Pulse Out is available on FIO0, FIO2, FIO3, FIO4, FIO5; the interrupt
+# counter used for the photogates on FIO0-3 and FIO6-7 (LabJack T7
 # datasheet).
 #
 # The T7-to-relay links run through the relay board's DB15 connector (the T7's
 # EIO/CIO bank). RB12 slots R0-R4 and R9 are populated and map in order to EIO0-EIO5. 
-# The solenoid order below is the slot order. The R10 input module has no manifest entry.
+# The solenoid order below is the slot order. R10 holds a 70G-IAC5 input module.
 #
 # binary_dio lines are active-low in hardware; the 1/0 inversion is applied
 # in daq/hardware/interface.py, so 1 = energised everywhere in this file.
@@ -92,30 +92,25 @@ actuators:
   # b/f ignition_fire. The watchdog covers both lines (binary_dio).
   - id: ignition_arm
     type: binary_dio
-    normal: closed
+    normal: null
     dio: EIO6
     notes: "igniter ARM_n -> Qa gate; energise at least ~100 ms before ignition_fire"
   - id: ignition_fire
     type: binary_dio
-    normal: closed
+    normal: null
     dio: EIO7
-    notes: "igniter FIRE_n -> Qb gate; has no effect unless ignition_arm is also energised"
+    notes: "igniter FIRE_n -> Qb gate; fires only while ignition_arm is also energised"
 
   # -- Stepper-driven main valves (DM860T + NEMA-34) --
   # DM860T (v1) = LOX, DM860T (v3) = fuel, per the sheet's motor leads.
-  # ENA left alone since the drivers are always enabled. ena_dio is
-  # pseudo-wired to CIO0/CIO1, which connect to nothing, because
-  # ActuatorSpec.is_wired (daq/manifest.py) requires it and interface.py
-  # writes it (so all_safe()'s driver-disable has no effect here).
-  # steps_open / steps_close / pulse_freq_hz still need valve travel
-  # characterization, so the mains stay unwired (and fire is refused) until
-  # they are filled in.
+  # DM860T ENA is left open, so the drivers stay enabled. ena_dio
+  # (CIO0/CIO1) is an unconnected stub pin.
   - id: lox_main
     type: pulse_stepper
     normal: null
     step_dio: FIO3
     dir_dio: FIO2
-    ena_dio: CIO0      # placeholder, not wired
+    ena_dio: CIO0      # unconnected stub
     steps_open: null
     steps_close: null
     pulse_freq_hz: null
@@ -130,7 +125,7 @@ actuators:
     normal: null
     step_dio: FIO0
     dir_dio: FIO1
-    ena_dio: CIO1      # placeholder, not wired
+    ena_dio: CIO1      # unconnected stub
     steps_open: null
     steps_close: null
     pulse_freq_hz: null

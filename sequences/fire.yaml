@@ -19,11 +19,10 @@
 # within a step keep their own individual times; grouping into a step does
 # not merge or renumber them.
 #
-# !! TIMINGS BELOW ARE PLACEHOLDERS, NOT A REVIEWED TIMELINE !!
-# They were carried over from the main LQD-DAQ timeline with the actuator
-# names remapped to this cart's ids, so the sequence executor has a runnable
-# file. The real timeline still needs the Liquids review, in particular
-# because lox_main and fuel_main are stepper moves (no instant shut-off).
+# !! TIMINGS BELOW ARE PLACEHOLDERS PENDING LIQUIDS REVIEW !!
+# Carried over from the main LQD-DAQ timeline with the actuator names
+# remapped to this cart's ids. lox_main and fuel_main are stepper moves, so
+# closing takes time.
 
 post_record_seconds: 5.0
 
