@@ -84,7 +84,7 @@ DEFAULT_ACTUATORS_PATH = os.path.join(_REPO_DIR, "actuators.yaml")
 #               slope is a stand-in until the module is identified.
 _DEFAULT_CAL_BY_TYPE: dict[str, dict[str, float]] = {
     PT_DIRECT: {"slope": 400.0, "intercept": 0.0},
-    PT_DIFFERENTIAL: {"slope": 500.0, "intercept": 0.0},
+    PT_DIFFERENTIAL: {"slope": 5.80151, "intercept": 0.0},
     LC_DIRECT: {"slope": 100.0, "intercept": 0.0},
 }
 
