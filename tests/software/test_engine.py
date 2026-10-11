@@ -737,6 +737,13 @@ class TestFireRefusalReachesTheCaller:
         with pytest.raises(SequenceRefused, match="could not be loaded"):
             engine.fire()
 
+    def test_dump_lists_steps_even_when_an_actuator_is_unwired(self, tmp_path):
+        """GET /sequence is read-only; only fire() refuses unwired steps."""
+        engine = self._engine(tmp_path, [[0.0, "lox_vent", 1]])
+        assert [s["name"] for s in engine.dump_fire_sequence()] == ["step_0"]
+        with pytest.raises(SequenceRefused, match="not wired"):
+            engine.fire()
+
     def test_a_drivable_fire_still_starts(self, tmp_path):
         engine = self._engine(tmp_path, [[0.0, "lox_vent", 1]],
                               actuators_path=None)

@@ -18,6 +18,7 @@ paths:
   cal_file:      "daq/calibration.json"  # Active calibration coefficients file
   channels:      "channels.yaml"         # Sensor manifest for this cart
   actuators:     "actuators.yaml"        # Actuator manifest for this cart
+  lox_table:     "daq/LOX_table_100_0-260_99R.csv"  # NIST LOX saturation density, for derived LOX mass flow
 
 # -- DATA ACQUISITION STREAM ---------------------------------
 stream:

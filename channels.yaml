@@ -110,31 +110,32 @@ channels:
     notes: "fuel injector orifice dP - confirm part and full-scale range"
 
   # -- Thermocouple (differential pair, LM34 CJC ref) --
-  # Connector on the T7 screw terminals (AIN2/AIN3); inactive until the probe
-  # is confirmed.
+  # Connector on the T7 screw terminals (AIN2/AIN3). Rough LOX-cold
+  # indicator; also feeds LOX density (config.yaml derived.lox), so LOX
+  # mass flow and mixture ratio are estimates only.
   - id: tc0
     type: tc_differential
     unit: celsius
     ain_pos: AIN2
     ain_neg: AIN3
     cal_ref: tc0
-    active: false
+    active: true
 
-  # -- Load cells (PUSHTON S1 2000kg, bridge-amplified upstream) --
-  # Amplifier module conditions the bridge output before the T7 AIN,
-  # same direct-read shape as a PT once conditioned.
+  # -- Load cells (PUSHTON S1 2000kg, via weight transmitter) --
+  # Transmitter excites the bridge and outputs 0-10 V full scale on V,
+  # read single-ended against T7 GND like a PT.
   - id: lc0
     type: lc_direct
     unit: lbf
     ain: AIN1
     cal_ref: lc0
-    active: false
+    active: true
   - id: lc1
     type: lc_direct
     unit: lbf
     ain: AIN5
     cal_ref: lc1
-    active: false
+    active: true
 
   # -- Stepper position feedback (L0004 photogate boards) --
   # Informational telemetry only, same as any other channel. Reported

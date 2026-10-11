@@ -62,9 +62,9 @@ _TC_AMP_V      = 0.000050
 _TC_PERIOD_S   = 25.0
 _TC_NOISE_V    = 0.000005
 
-# Load cells: at rest near zero, ramping to ~500 lbf (5.0 V at slope=100).
+# Load cells: at rest near zero, ramping to ~500 lbf (1.134 V at slope=440.92).
 _LC_NOISE_V       = 0.003
-_LC_FIRE_V        = 5.0
+_LC_FIRE_V        = 1.134
 _LC_RAMP_S        = 0.5
 _LC_OSC_V         = 0.1
 _LC_OSC_PERIOD_S  = 0.8
@@ -419,8 +419,8 @@ class MockLabJack:
         Simulate load cell voltage.
 
         At rest: near-zero with small noise.
-        During fire: ramp up over _LC_RAMP_S to ~500 lbf (5.0 V at
-        slope=100), then hold with thrust oscillation.
+        During fire: ramp up over _LC_RAMP_S to ~500 lbf (1.134 V at
+        slope=440.92), then hold with thrust oscillation.
         """
         if fire_elapsed is None:
             return self._noise() * _LC_NOISE_V

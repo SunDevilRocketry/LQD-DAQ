@@ -85,7 +85,7 @@ DEFAULT_ACTUATORS_PATH = os.path.join(_REPO_DIR, "actuators.yaml")
 _DEFAULT_CAL_BY_TYPE: dict[str, dict[str, float]] = {
     PT_DIRECT: {"slope": 400.0, "intercept": 0.0},
     PT_DIFFERENTIAL: {"slope": 5.80151, "intercept": 0.0},
-    LC_DIRECT: {"slope": 100.0, "intercept": 0.0},
+    LC_DIRECT: {"slope": 440.92, "intercept": 0.0},
 }
 
 # Cold Junction Compensation (CJC) sensor polling interval in seconds.
@@ -610,13 +610,19 @@ class Engine:
         """
         Named-phase dump of sequences/fire.yaml, for GET /sequence.
 
+        Read-only, so unwired actuators don't block it (fire() still
+        refuses them; /status lists them under unwired_actuators).
+
         Raises:
-            SequenceRefused: Same conditions as fire() - unreadable file,
-                             or a step commanding an actuator this cart
-                             can't drive.
+            SequenceRefused: If the file cannot be parsed.
         """
         seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        _steps, _post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        try:
+            _steps, _post_s, fire_steps = self._load_fire_sequence(seq_path)
+        except Exception as exc:
+            raise SequenceRefused(
+                f"Sequence 'fire' could not be loaded: {exc}"
+            ) from exc
         return [
             {
                 "name":     step.name,

@@ -29,6 +29,7 @@ import time
 import yaml
 import uvicorn
 
+from daq.calculations import load_lox_table
 from daq.logger import Logger
 
 
@@ -42,6 +43,7 @@ _DEFAULT_CONFIG = {
         "cal_file":     "daq/calibration.json",
         "channels":     "channels.yaml",
         "actuators":    "actuators.yaml",
+        "lox_table":    "daq/LOX_table_100_0-260_99R.csv",
     },
     "stream":  {"target_hz": 500},
     "thresholds": {},  # Allows the parser to recognize and merge this section
@@ -111,6 +113,17 @@ def main() -> None:
     # -- 3. Initialize Engine (loads the cart manifests) -----
     cal_path     = _resolve(paths["cal_file"])
     sequence_dir = _resolve(paths["sequence_dir"])
+
+    # LOX density table for derived LOX mass flow (null without it)
+    lox_table_path = _resolve(paths["lox_table"])
+    if os.path.exists(lox_table_path):
+        try:
+            n, lo, hi = load_lox_table(lox_table_path)
+            print(f"[MAIN] LOX table loaded: {n} points, {lo:.1f}–{hi:.1f} R")
+        except Exception as exc:
+            print(f"[MAIN] WARNING: LOX table load failed: {exc}")
+    else:
+        print(f"[MAIN] WARNING: LOX table not found at {lox_table_path}")
 
     engine = Engine(
         cal_path=cal_path,
