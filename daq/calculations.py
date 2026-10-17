@@ -305,8 +305,8 @@ def lox_saturation_pressure_pa(temp_celsius: float) -> Optional[float]:
     """LOX saturation pressure [Pa abs], or None outside the fit's range."""
     temp_k = temp_celsius + 273.15
 
-    # UNVERIFIED bound: NIST gives the fit as 54.36-154.33 K; 154.58 K is Tc.
-    if not (54.361 <= temp_k <= 154.58):
+    # NIST's stated range for these constants.
+    if not (54.36 <= temp_k <= 154.33):
         return None
 
     log_p_bar = _ANTOINE_A - _ANTOINE_B / (temp_k + _ANTOINE_C)

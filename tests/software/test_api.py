@@ -12,7 +12,7 @@ import daq.api as api_module
 from daq.api import app
 from daq.logger import Logger
 
-from tests.software._helpers import make_engine, wait_for_first_batch
+from tests.software._helpers import REPO_ACTUATORS, make_engine, wait_for_first_batch
 
 
 def _wait_until_idle(api_client, timeout=30.0):
@@ -69,10 +69,15 @@ class TestAPI:
         assert data["ok"] is True
         assert "stream_hz" in data
 
-    def test_status_reports_unwired_actuators(self, api_client):
-        """The fully wired fixture has none; the shipped cart lists two."""
-        data = api_client.get("/status").json()
-        assert data["unwired_actuators"] == []
+    def test_status_reports_unwired_actuators(self):
+        """The shipped manifest: both mains have no step counts yet."""
+        prev_engine, prev_logger = api_module._engine, api_module._logger
+        api_module.set_engine(make_engine(actuators_path=REPO_ACTUATORS))
+        try:
+            data = TestClient(app).get("/status").json()
+        finally:
+            api_module.set_engine(prev_engine, prev_logger)
+        assert sorted(data["unwired_actuators"]) == ["fuel_main", "lox_main"]
 
     def test_snapshot_channels_are_manifest_keyed(self, api_client):
         r = api_client.get("/snapshot")
@@ -88,11 +93,11 @@ class TestAPI:
         assert "pt7" in channels
         assert channels["pt7"]["value"] is None
 
-    def test_snapshot_has_no_derived_channels(self, api_client):
-        """Old top-level keys stay gone; derived values live under `derived`."""
-        data = api_client.get("/snapshot").json()
-        for gone in ("lox_mdot", "fuel_mdot", "mixture_ratio", "impulse_ns"):
-            assert gone not in data
+    def test_snapshot_carries_derived_values(self, api_client):
+        derived = api_client.get("/snapshot").json()["derived"]
+        assert set(derived) == {
+            "lox_mass_flow_rate_kg_s", "fuel_mass_flow_rate_kg_s", "mixture_ratio",
+        }
 
     def test_actuators_endpoint(self, api_client):
         r = api_client.get("/actuators")
@@ -113,7 +118,8 @@ class TestAPI:
         r = api_client.get("/logger")
         assert r.status_code == 200
         data = r.json()
-        assert "recording" in data
+        for key in ("recording", "rows_written", "rows_dropped", "error"):
+            assert key in data
 
     def test_actuator_command(self, api_client):
         r = api_client.post("/actuator", json={"name": "fuel_vent", "state": 1})
@@ -151,6 +157,12 @@ class TestAPI:
         assert r.status_code == 200
         assert r.json()["ok"] is True
 
+    def test_calibration_unknown_tag_422(self, api_client):
+        r = api_client.post("/calibration", json={
+            "tag": "pt0_typo", "slope": 500.0, "intercept": 0.0
+        })
+        assert r.status_code == 422
+
     def test_log_start_and_stop(self, api_client):
         r_start = api_client.post("/log/start", json={"prefix": "test_log"})
         assert r_start.status_code == 200
@@ -158,6 +170,10 @@ class TestAPI:
         time.sleep(0.1)
         r_stop = api_client.post("/log/stop")
         assert r_stop.status_code == 200
+
+    def test_log_start_bad_prefix_422(self, api_client):
+        r = api_client.post("/log/start", json={"prefix": "../escape"})
+        assert r.status_code == 422
 
     def test_log_start_conflict(self, api_client):
         api_client.post("/log/start", json={"prefix": "conflict_a"})

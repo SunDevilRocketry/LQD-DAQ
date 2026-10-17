@@ -125,7 +125,7 @@ class ActuatorCommand(BaseModel):
 
 
 class CalibrationUpdate(BaseModel):
-    """slope/intercept in the psi or lbf domain (psi/V, lbf/V). The tag isn't checked."""
+    """slope/intercept in the psi or lbf domain (psi/V, lbf/V)."""
     tag:       str
     slope:     float
     intercept: float
@@ -264,14 +264,17 @@ def get_events(last_n: int = 100):
 
 @app.get("/logger")
 def get_logger_status():
-    """Recording flag, file path, rows written, buffer depth."""
+    """Recording flag, file path, row counts, buffer depth, last disk error."""
     if _logger is None:
-        return {"recording": False, "path": None, "rows_written": 0, "buffer_depth": 0}
+        return {"recording": False, "path": None, "rows_written": 0,
+                "rows_dropped": 0, "buffer_depth": 0, "error": None}
     return {
         "recording":    _logger.is_recording,
         "path":         _logger.current_path,
         "rows_written": _logger.rows_written,
+        "rows_dropped": _logger.rows_dropped,
         "buffer_depth": _logger.buffer_depth,
+        "error":        _logger.last_error,
     }
 
 
@@ -415,15 +418,23 @@ def post_tare():
 
 @app.post("/calibration")
 def post_calibration(update: CalibrationUpdate):
-    """Set a slope/intercept from the next batch on; /calibration/save persists it."""
+    """
+    Set a slope/intercept from the next batch on (/calibration/save persists
+    it). 422 for a tag that isn't a calibrated channel.
+    """
     eng = _require_engine()
-    eng.update_calibration(update.tag, update.slope, update.intercept)
+    try:
+        eng.update_calibration(update.tag, update.slope, update.intercept)
+    except KeyError:
+        raise HTTPException(
+            status_code=422, detail=f"Unknown calibration tag: {update.tag}"
+        )
     return {"ok": True, "tag": update.tag}
 
 
 @app.post("/calibration/save")
 def post_calibration_save():
-    """Write calibration.json (drops keys it doesn't know). 501 without a path."""
+    """Update calibration.json's PT/LC entries. 501 without a path."""
     eng = _require_engine()
     try:
         eng.save_calibration()
@@ -437,7 +448,7 @@ def post_calibration_save():
 
 @app.post("/log/start")
 def post_log_start(req: LogStartRequest):
-    """Start a CSV recording; 409 if one is running. Prefix isn't sanitised."""
+    """Start a CSV recording; 409 if one is running, 422 for a bad prefix."""
     if _logger is None:
         raise HTTPException(status_code=503, detail="Logger not configured")
     if _logger.is_recording:
@@ -445,7 +456,10 @@ def post_log_start(req: LogStartRequest):
             status_code=409,
             detail=f"Already recording: {_logger.current_path}"
         )
-    path = _logger.start_recording(prefix=req.prefix)
+    try:
+        path = _logger.start_recording(prefix=req.prefix)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     return {"ok": True, "path": path}
 
 

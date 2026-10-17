@@ -4,6 +4,8 @@ tests/software/test_interface.py
 The real T7 driver with LJM writes recorded instead of sent; no device.
 """
 
+import time
+
 import pytest
 import yaml
 
@@ -159,3 +161,22 @@ class TestChannelConfig:
         assert regs["AIN1_RANGE"] == 10.0          # load cell, 0-10 V
         assert regs["AIN2_RANGE"] == 0.1 and regs["AIN2_NEGATIVE_CH"] == 3
         assert not any(name.endswith("_RESOLUTION_INDEX") for name, _ in writes)
+
+
+class TestStreamClock:
+
+    def test_stream_clock_survives_a_restart(self, monkeypatch, writes):
+        """A reconnect restarts the stream; time_s must keep counting."""
+        monkeypatch.setattr(interface.ljm, "nameToAddress", lambda name: (0, 3))
+        monkeypatch.setattr(interface.ljm, "eStreamStart", lambda *args: 500.0)
+        monkeypatch.setattr(interface.ljm, "eStreamStop", lambda handle: None)
+        device = LabJackT7(load_channels(REPO_CHANNELS), [])
+        device._handle = 1
+
+        device.start_stream()
+        started = device._stream_start
+        time.sleep(0.01)
+        device.stop_stream()
+        device.start_stream()
+
+        assert device._stream_start == started

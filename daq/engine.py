@@ -702,9 +702,14 @@ class Engine:
         """
         Stop any sequence, then run abort.yaml, or de-energise everything if
         it's missing or refused. Never raises. Blocks fire resumes until
-        the next fire(). A second abort starts a second thread.
+        the next fire(). A no-op while abort.yaml is already running.
         """
         with self._lock:
+            running = self._sequence_thread
+            if (self._sequence_active and self._sequence_name == "abort"
+                    and running is not None and running.is_alive()):
+                self._log("ABORT: abort.yaml already in progress")
+                return
             self._fire_invalidated = True
             # A paused fire has no thread to record the abort itself.
             if self._fire_state == FIRE_PAUSED:
@@ -747,14 +752,21 @@ class Engine:
             self._log("ABORT: no abort.yaml found, hardware -> all safe")
 
     def update_calibration(self, tag: str, slope: float, intercept: float) -> None:
-        """Set a channel's slope/intercept in memory (psi or lbf domain)."""
+        """
+        Set a channel's slope/intercept in memory (psi or lbf domain).
+
+        Raises:
+            KeyError: tag isn't a calibrated channel's cal_ref.
+        """
         with self._lock:
+            if tag not in self._cal:
+                raise KeyError(tag)
             self._cal[tag] = {"slope": slope, "intercept": intercept}
         self._log(f"Cal updated: {tag} slope={slope} intercept={intercept}")
 
     def save_calibration(self) -> None:
         """
-        Write calibrations to calibration.json, dropping keys it doesn't know.
+        Update calibration.json's PT/LC entries; other keys are kept.
 
         Raises:
             AttributeError: If no cal_path was provided at construction time.
@@ -774,7 +786,13 @@ class Engine:
             spec.cal_ref or spec.id
             for spec in self._channels if spec.type == LC_DIRECT
         }
-        output: dict[str, dict] = {"PT": {}, "LC": {}}
+        try:
+            with open(self._cal_path) as f:
+                output = json.load(f)
+        except (OSError, ValueError):
+            output = {}
+        output.setdefault("PT", {})
+        output.setdefault("LC", {})
 
         with self._lock:
             cal_snapshot = dict(self._cal)
@@ -1341,17 +1359,23 @@ class Engine:
     # --------------------------------------------------------
 
     def _load_calibration(self, path: str) -> None:
-        """Merge calibration.json over the defaults; unknown tags are ignored."""
+        """Merge calibration.json over the defaults; unknown tags are logged."""
         try:
             with open(path) as f:
                 saved = json.load(f)
-            for tag, coeffs in saved.get("PT", {}).items():
-                if tag in self._cal:
-                    self._cal[tag].update(coeffs)
-            for tag, coeffs in saved.get("LC", {}).items():
-                if tag in self._cal:
-                    self._cal[tag].update(coeffs)
+            unknown = []
+            for section in ("PT", "LC"):
+                for tag, coeffs in saved.get(section, {}).items():
+                    if tag in self._cal:
+                        self._cal[tag].update(coeffs)
+                    else:
+                        unknown.append(tag)
             self._log(f"Calibration loaded from {path}")
+            if unknown:
+                self._log(
+                    f"Calibration tags not in the manifest, ignored: "
+                    f"{', '.join(sorted(unknown))}"
+                )
         except Exception as exc:
             self._log(f"Calibration load warning: {exc} - using defaults")
 

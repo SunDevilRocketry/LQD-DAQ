@@ -5,6 +5,7 @@ daq/engine.py against MockLabJack: snapshots, actuators, reconnect,
 thresholds, staleness, sequences and the CJC poll.
 """
 
+import json
 import threading
 import time
 
@@ -18,12 +19,16 @@ from daq.engine import (
     FIRE_IDLE,
     FIRE_PAUSED,
     FIRE_RUNNING,
+    Engine,
     SequenceRefused,
 )
 from daq.manifest import load_actuators
 
 from tests.software._helpers import (
+    FULL_ACTUATORS,
+    FULL_CHANNELS,
     REPO_ACTUATORS,
+    REPO_CONFIG,
     UNWIRED_ACTUATORS,
     make_engine,
     wait_for_first_batch,
@@ -113,13 +118,17 @@ class TestEngine:
         snap = self.engine.snapshot
         assert snap.actuators["fuel_vent"].state == 0
 
-    def test_tare_sets_lc_near_zero(self):
+    def test_tare_zeroes_a_loaded_cell(self):
+        # The mock LC rests near 0, so offset it first or tare proves nothing.
+        self.engine.update_calibration("lc0", slope=440.92, intercept=100.0)
+        time.sleep(0.25)
+        before = self.engine.snapshot.channels["lc0"].value
+        assert before is not None and before > 50.0
+
         self.engine.tare()
-        time.sleep(0.15)
-        reading = self.engine.snapshot.channels["lc0"]
-        # Weak check: the mock LC already sits near 0 at rest.
-        if reading.value is not None:
-            assert abs(reading.value) < 5.0, f"lc0 after tare: {reading.value}"
+        time.sleep(0.25)
+        after = self.engine.snapshot.channels["lc0"].value
+        assert abs(after) < 5.0, f"lc0 after tare: {after}"
 
     def test_event_log_has_entries(self):
         log = self.engine.event_log
@@ -146,12 +155,10 @@ class TestEngine:
 
     def test_sequence_blocks_manual_commands(self):
         """While a sequence runs, manual write_actuator should raise RuntimeError."""
-        self.engine.abort()
-        time.sleep(0.02)
-        snap = self.engine.snapshot
-        if snap.sequence_active:
-            with pytest.raises(RuntimeError):
-                self.engine.write_actuator("lox_main", 1)
+        self.engine.abort()   # the fixture's abort.yaml is runnable and takes ~10 s
+        assert self.engine._sequence_active
+        with pytest.raises(RuntimeError):
+            self.engine.write_actuator("lox_main", 1)
 
     def test_update_calibration_changes_snapshot(self):
         """Doubling pt0's slope should roughly double its reading."""
@@ -616,7 +623,7 @@ class TestDerivedChannels:
         assert abs(ratio - 4.0) < 1e-9
 
     def test_shipped_config_names_the_differential_channels(self):
-        with open("config.yaml") as f:
+        with open(REPO_CONFIG) as f:
             cfg = yaml.safe_load(f)["derived"]
         assert cfg["lox"]["dp_channel"] == "dpt0"
         assert cfg["fuel"]["dp_channel"] == "dpt1"
@@ -983,6 +990,71 @@ class TestFireSequencing:
             assert engine._sequence_active
         finally:
             self._finish_abort(engine)
+
+
+class TestRepeatedAbort:
+    """A second abort while abort.yaml runs neither blocks nor starts a second thread."""
+
+    def test_second_abort_is_a_quick_no_op(self, tmp_path):
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir()
+        (seq_dir / "abort.yaml").write_text(yaml.safe_dump({
+            "post_record_seconds": 0,
+            "steps": [[0.0, "tank_depress", 0], [1.0, "lox_purge", 0]],
+        }))
+        engine = make_engine(sequence_dir=str(seq_dir))
+
+        engine.abort()
+        first = engine._sequence_thread
+        t0 = time.perf_counter()
+        engine.abort()
+        elapsed = time.perf_counter() - t0
+
+        assert elapsed < 0.2, f"second abort blocked for {elapsed:.2f} s"
+        assert engine._sequence_thread is first
+        assert any("already in progress" in e for e in engine.event_log)
+
+        first.join(timeout=5.0)
+        assert not engine._sequence_active
+
+
+class TestCalibrationFile:
+    """Updates must name a real channel; saving keeps the rest of the file."""
+
+    @staticmethod
+    def _engine(tmp_path, content):
+        cal = tmp_path / "calibration.json"
+        cal.write_text(json.dumps(content))
+        engine = Engine(
+            cal_path=str(cal), channels_path=FULL_CHANNELS,
+            actuators_path=FULL_ACTUATORS,
+        )
+        return engine, cal
+
+    def test_unknown_tag_is_refused(self, tmp_path):
+        engine, _ = self._engine(tmp_path, {"PT": {}, "LC": {}})
+        with pytest.raises(KeyError):
+            engine.update_calibration("pt0_typo", 1.0, 0.0)
+
+    def test_unknown_tag_in_file_is_logged(self, tmp_path):
+        engine, _ = self._engine(
+            tmp_path, {"PT": {"ptX": {"slope": 1.0, "intercept": 0.0}}}
+        )
+        assert any("not in the manifest" in e and "ptX" in e for e in engine.event_log)
+
+    def test_save_keeps_other_keys(self, tmp_path):
+        engine, cal = self._engine(tmp_path, {
+            "note": "keep me",
+            "PT": {"ptX": {"slope": 1.0, "intercept": 0.0}},
+            "LC": {},
+        })
+        engine.update_calibration("pt0", 410.0, -1.0)
+        engine.save_calibration()
+
+        saved = json.loads(cal.read_text())
+        assert saved["note"] == "keep me"
+        assert saved["PT"]["ptX"] == {"slope": 1.0, "intercept": 0.0}
+        assert saved["PT"]["pt0"] == {"slope": 410.0, "intercept": -1.0}
 
 class _StubLogger:
     """Minimal Logger stand-in for asserting recording start/stop calls."""

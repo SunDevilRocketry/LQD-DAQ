@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -58,6 +59,7 @@ class Logger:
 
         self._rows_written  = 0
         self._rows_dropped  = 0
+        self._last_error: Optional[str] = None
 
     # --------------------------------------------------------
     # Lifecycle Management
@@ -90,9 +92,16 @@ class Logger:
     def start_recording(self, prefix: str = "data") -> str:
         """
         Open <prefix>_<timestamp>.csv and start recording; returns its path.
+        Stops an active recording first.
 
-        Stops an active recording first. Prefix isn't sanitised.
+        Raises:
+            ValueError: prefix isn't letters, digits, '_' or '-' (it could
+                        otherwise write outside output_dir).
         """
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", prefix):
+            raise ValueError(
+                f"Invalid prefix {prefix!r}: use letters, digits, '_' or '-'"
+            )
         if self._recording:
             self.stop_recording()
 
@@ -113,6 +122,7 @@ class Logger:
             self._flush_count = 0
             self._rows_written = 0
             self._rows_dropped = 0
+            self._last_error   = None
 
         print(f"[LOGGER] Recording: {path}")
         return path
@@ -146,7 +156,7 @@ class Logger:
     def write_row(self, row: list) -> None:
         """
         Queue a row (no-op when not recording). A full buffer drops the
-        oldest row; rows_dropped counts it but nothing reports it.
+        oldest row; /logger reports the count as rows_dropped.
         """
         if not self._recording:
             return
@@ -177,6 +187,11 @@ class Logger:
         return self._rows_dropped
 
     @property
+    def last_error(self) -> Optional[str]:
+        """The disk error that stopped the current/last recording, if any."""
+        return self._last_error
+
+    @property
     def buffer_depth(self) -> int:
         return len(self._buffer)
 
@@ -196,8 +211,8 @@ class Logger:
 
     def _drain_locked(self) -> None:
         """
-        Write buffered rows. On a disk error, stop recording with a print
-        only; the API and GUI aren't told.
+        Write buffered rows. A disk error stops recording and is kept in
+        last_error for /logger.
         """
         if not self._csv_writer or not self._buffer:
             return
@@ -222,6 +237,7 @@ class Logger:
                 self._csv_file.flush()
         except OSError as exc:
             print(f"[LOGGER] Write error: {exc} - closing file handle")
+            self._last_error = f"write failed, recording stopped: {exc}"
             try:
                 self._csv_file.close()
             except OSError:

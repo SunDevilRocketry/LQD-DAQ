@@ -245,7 +245,8 @@ class LabJackT7:
 
         self._actual_hz   = int(actual)
         self._streaming   = True
-        self._stream_start = time.perf_counter()
+        if not self._stream_start:   # once, so time_s runs on across reconnects
+            self._stream_start = time.perf_counter()
         print(f"[T7] Stream started: requested {self._stream_hz} Hz, "
               f"actual {self._actual_hz} Hz, "
               f"{self._scans_per_read} scans/read")

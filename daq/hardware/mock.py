@@ -147,8 +147,10 @@ class MockLabJack:
 
     def start_stream(self) -> int:
         """Start the simulated stream; returns the rate in Hz."""
-        self._stream_start    = time.perf_counter()
-        self._next_batch_time = self._stream_start + self._batch_duration
+        now = time.perf_counter()
+        if not self._stream_start:   # once, so time runs on across restarts
+            self._stream_start = now
+        self._next_batch_time = now + self._batch_duration
         self._streaming       = True
         print(f"[MOCK] Stream started at {self._stream_hz} Hz "
               f"({self._scans_per_read} scans/read)")

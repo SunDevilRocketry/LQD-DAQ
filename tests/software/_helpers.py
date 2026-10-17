@@ -25,6 +25,7 @@ UNWIRED_ACTUATORS = os.path.join(_FIXTURES, "actuators_unwired.yaml")
 
 REPO_CHANNELS  = os.path.join(_REPO, "channels.yaml")
 REPO_ACTUATORS = os.path.join(_REPO, "actuators.yaml")
+REPO_CONFIG    = os.path.join(_REPO, "config.yaml")
 
 
 def full_channels():

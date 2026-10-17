@@ -5,6 +5,8 @@ import os
 import tempfile
 import time
 
+import pytest
+
 from daq.logger import Logger
 
 from tests.software._helpers import full_channels
@@ -84,3 +86,23 @@ class TestLogger:
         elapsed = time.perf_counter() - t0
         self.logger.stop_recording()
         assert elapsed < 1.0, f"5000 writes took {elapsed:.3f} s (too slow)"
+
+    @pytest.mark.parametrize("prefix", ["../escape", "a/b", "", "x y"])
+    def test_prefix_that_could_leave_output_dir_is_refused(self, prefix):
+        with pytest.raises(ValueError, match="Invalid prefix"):
+            self.logger.start_recording(prefix)
+        assert not self.logger.is_recording
+
+    def test_disk_error_stops_recording_and_is_reported(self):
+        self.logger.start_recording("diskfull")
+
+        class _FullDisk:
+            def writerow(self, row):
+                raise OSError(28, "No space left on device")
+
+        self.logger._csv_writer = _FullDisk()
+        self.logger.write_row(["0.1", "1.0"])
+        time.sleep(0.2)   # let the writer thread drain
+
+        assert not self.logger.is_recording
+        assert "No space left" in self.logger.last_error

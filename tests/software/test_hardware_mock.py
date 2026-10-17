@@ -87,6 +87,15 @@ class TestMockLabJack:
         avg = sum(batch["lc0"]) / len(batch["lc0"])
         assert avg > 0.5, f"lc0 didn't ramp up during fire: avg={avg}"
 
+    def test_scan_time_keeps_counting_after_a_restart(self):
+        first = self.device.stream_read()["scan_times"][-1]
+        self.device.stop_stream()
+        self.device.close()
+        self.device.open()
+        self.device.start_stream()
+        second = self.device.stream_read()["scan_times"][0]
+        assert second > first, "time_s restarted after a reconnect"
+
     def test_cjc_near_room_temp(self):
         cjc_c = self.device.read_cjc_celsius()
         assert 22.0 < cjc_c < 28.0, f"CJC temperature {cjc_c} unexpected"

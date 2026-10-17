@@ -446,6 +446,11 @@ class TestLOXSaturationPressure:
         result = lox_saturation_pressure_pa(-100.0)
         assert result is None
 
+    def test_stops_at_nists_upper_bound(self):
+        # NIST fits these constants over 54.36-154.33 K.
+        assert lox_saturation_pressure_pa(154.33 - 273.15) is not None
+        assert lox_saturation_pressure_pa(154.50 - 273.15) is None
+
     def test_below_valid_range_returns_none(self):
         # Below the triple point (~-219 C / 54 K).
         result = lox_saturation_pressure_pa(-220.0)

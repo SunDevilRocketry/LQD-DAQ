@@ -23,7 +23,7 @@ from daq.broadcast import (
     system_state_message,
 )
 
-from tests.software._helpers import make_engine
+from tests.software._helpers import make_engine, wait_for_first_batch
 
 
 _FRAME_TIMEOUT_S  = 10.0
@@ -137,10 +137,17 @@ class TestEnvelope:
         assert set(payload["sequence"]) == {"active", "name", "elapsed_s", "state"}
         assert payload["sequence"]["state"] == "idle"  # fresh engine, fire never run
 
-    def test_derived_is_present_but_empty(self):
-        """Empty only because this engine never processed a batch."""
+    def test_derived_lists_mass_flows_and_ratio(self):
         engine = make_engine()
-        assert system_state_message(engine)["payload"]["derived"] == {}
+        engine.start()
+        try:
+            wait_for_first_batch(engine)
+            derived = system_state_message(engine)["payload"]["derived"]
+        finally:
+            engine.stop()
+        assert set(derived) == {
+            "lox_mass_flow_rate_kg_s", "fuel_mass_flow_rate_kg_s", "mixture_ratio",
+        }
 
     def test_system_state_is_json_serializable(self):
         engine = make_engine()
