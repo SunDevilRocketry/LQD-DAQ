@@ -322,22 +322,16 @@ def post_safe():
 @app.post("/fire")
 def post_fire():
     """
-    Start fire.yaml. 409 if a sequence is active or fire.yaml is refused,
-    423 if the control lock is busy. Can return 200 without a launch.
+    Start fire.yaml. 409 if a sequence is running or fire.yaml is refused,
+    423 if the control lock is busy.
     """
     eng = _require_engine()
-    snap = eng.snapshot
-    if snap.sequence_active:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Sequence '{snap.sequence_name}' already running"
-        )
     try:
         with _control_guard(blocking=False):
             eng.fire()
     except _ControlLockBusy:
         return Response(status_code=423)
-    except SequenceRefused as exc:
+    except (SequenceRefused, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     return {"ok": True, "sequence": "fire"}
 

@@ -15,21 +15,19 @@ from daq.logger import Logger
 from tests.software._helpers import make_engine, wait_for_first_batch
 
 
-def _wait_until_idle(api_client, timeout=20.0):
+def _wait_until_idle(api_client, timeout=30.0):
     """
-    Block until no sequence is active (an abort cycle takes ~10 s). Needs two
-    idle reads in a row, since abort.yaml can restart between cycles.
+    Block until the engine has no active sequence and no live sequence thread
+    (an abort cycle takes ~10 s). Asks the engine, not the lagging snapshot.
     """
+    engine = api_module._engine
     deadline = time.time() + timeout
-    consecutive_idle = 0
     while time.time() < deadline:
-        if not api_client.get("/snapshot").json().get("sequence_active"):
-            consecutive_idle += 1
-            if consecutive_idle >= 2:
-                return
-        else:
-            consecutive_idle = 0
-        time.sleep(0.3)
+        thread = engine._sequence_thread
+        if not engine._sequence_active and not (thread and thread.is_alive()):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"engine still busy after {timeout} s")
 
 
 def _ensure_idle(api_client, timeout=60.0):
@@ -37,19 +35,12 @@ def _ensure_idle(api_client, timeout=60.0):
     _wait_until_idle(api_client, timeout=timeout)
 
 
-def _start_reliably(api_client, path, attempts=40, poll_interval=0.5):
-    """
-    POST /fire or /sequence/start until the sequence is really active.
-
-    Just after a thread ends it can still read as alive, and the call
-    returns 200 without starting. This retries around that bug.
-    """
-    for _ in range(attempts):
-        body = api_client.post(path).json()
-        time.sleep(poll_interval)
-        if api_client.get("/status").json().get("sequence_active"):
-            return body
-    raise AssertionError(f"POST {path} never actually started after retries")
+def _start(api_client, path):
+    """POST /fire or /sequence/start; it must answer 200 and really start."""
+    r = api_client.post(path)
+    assert r.status_code == 200, r.text
+    assert api_module._engine._sequence_active, f"POST {path}: 200 but no start"
+    return r.json()
 
 
 @pytest.fixture(scope="module")
@@ -176,11 +167,7 @@ class TestAPI:
         api_client.post("/log/stop")
 
     def test_fire_then_abort(self, api_client):
-        for _ in range(20):
-            snap = api_client.get("/snapshot").json()
-            if not snap.get("sequence_active"):
-                break
-            time.sleep(0.3)
+        _ensure_idle(api_client)
         r_fire = api_client.post("/fire")
         assert r_fire.status_code == 200, (
             f"Fire returned {r_fire.status_code}: {r_fire.json()}"
@@ -190,16 +177,11 @@ class TestAPI:
         assert r_abort.status_code == 200
 
     def test_fire_conflict(self, api_client):
-        api_client.post("/abort")   # ensure clean state
-        time.sleep(0.5)
-        api_client.post("/fire")
-        time.sleep(0.05)
-        # Fire again while running should return 409
-        snap_r = api_client.get("/snapshot")
-        if snap_r.json().get("sequence_active"):
-            r = api_client.post("/fire")
-            assert r.status_code == 409
-        api_client.post("/abort")
+        _ensure_idle(api_client)
+        _start(api_client, "/fire")
+        r = api_client.post("/fire")
+        assert r.status_code == 409
+        api_client.post("/sequence/stop")
 
     def test_sequence_get_returns_named_steps(self, api_client):
         r = api_client.get("/sequence")
@@ -211,7 +193,7 @@ class TestAPI:
 
     def test_sequence_time_backward_rejected_while_running(self, api_client):
         _ensure_idle(api_client)
-        _start_reliably(api_client, "/fire")
+        _start(api_client, "/fire")
         try:
             time.sleep(0.05)  # past T=0, so seconds=0 is a backward seek
             r = api_client.post("/sequence/time", json={"seconds": 0})
@@ -221,7 +203,7 @@ class TestAPI:
 
     def test_sequence_time_forward_while_running_replays_and_keeps_ticking(self, api_client):
         _ensure_idle(api_client)
-        _start_reliably(api_client, "/fire")
+        _start(api_client, "/fire")
         try:
             r = api_client.post("/sequence/time", json={"seconds": 5.0})
             assert r.status_code == 200
@@ -248,7 +230,7 @@ class TestAPI:
     def test_sequence_start_stop_roundtrip(self, api_client):
         _ensure_idle(api_client)
 
-        body = _start_reliably(api_client, "/sequence/start")
+        body = _start(api_client, "/sequence/start")
         assert set(body) == {"step", "state", "server_time_ms", "sequence_time_ms"}
 
         r_stop = api_client.post("/sequence/stop")
@@ -261,14 +243,14 @@ class TestAPI:
 
     def test_sequence_start_conflicts_with_active_fire(self, api_client):
         _ensure_idle(api_client)
-        _start_reliably(api_client, "/fire")
+        _start(api_client, "/fire")
         r = api_client.post("/sequence/start")
         assert r.status_code == 409
         api_client.post("/sequence/stop")   # fast: no abort.yaml tail to drain
 
     def test_sequence_start_refused_after_abort_until_fresh_fire(self, api_client):
         _ensure_idle(api_client)
-        _start_reliably(api_client, "/fire")
+        _start(api_client, "/fire")
         time.sleep(0.1)
         api_client.post("/abort")
         _wait_until_idle(api_client)  # abort.yaml's own ~10s tail
@@ -276,7 +258,7 @@ class TestAPI:
         r = api_client.post("/sequence/start")
         assert r.status_code == 409
 
-        _start_reliably(api_client, "/fire")   # fresh fire clears the invalidation
+        _start(api_client, "/fire")   # fresh fire clears the invalidation
         api_client.post("/sequence/stop")
 
     def test_snapshot_does_not_error_under_concurrent_polls(self, api_client):

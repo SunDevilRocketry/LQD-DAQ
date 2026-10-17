@@ -905,6 +905,43 @@ class TestFireSequencing:
         assert status1["state"] == FIRE_COMPLETED == status2["state"]
 
 
+    def test_fire_while_running_raises_and_keeps_position(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine.fire()
+        time.sleep(0.15)  # alpha and beta applied
+        try:
+            before = (engine._fire_next_idx, engine._fire_position_s)
+            with pytest.raises(RuntimeError, match="already running"):
+                engine.fire()
+            assert (engine._fire_next_idx, engine._fire_position_s) == before
+        finally:
+            engine.stop_sequence()
+
+    def test_fire_waits_out_a_finishing_thread(self, tmp_path):
+        """A thread already marked inactive but not yet exited must not block /fire."""
+        engine = self._engine(tmp_path)
+        finishing = threading.Thread(target=time.sleep, args=(0.2,))
+        finishing.start()
+        engine._sequence_thread = finishing
+        engine.fire()
+        try:
+            assert engine._sequence_active
+            assert engine._sequence_thread is not finishing
+        finally:
+            engine.stop_sequence()
+
+    def test_abort_of_a_paused_fire_reports_aborted(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine.fire()
+        time.sleep(0.15)
+        engine.stop_sequence()
+        assert engine.sequence_status()["state"] == FIRE_PAUSED
+
+        engine.abort()
+        assert engine.sequence_status()["state"] == FIRE_ABORTED
+        with pytest.raises(RuntimeError, match="aborted"):
+            engine.start_sequence()
+
 class _StubLogger:
     """Minimal Logger stand-in for asserting recording start/stop calls."""
 

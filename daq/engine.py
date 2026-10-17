@@ -477,15 +477,13 @@ class Engine:
 
         Raises:
             SequenceRefused: fire.yaml can't be loaded or driven.
+            RuntimeError: a sequence is already running.
         """
         steps, post_s, fire_steps = self._validate_fire()
-        with self._lock:
-            self._fire_steps      = fire_steps
-            self._fire_position_s = 0.0
-            self._fire_next_idx   = 0
-            self._fire_invalidated = False
-        if not self._start_sequence("fire", steps, post_s, is_fire=True):
-            self._log("Fire command ignored: autosequence already active")
+        if not self._start_sequence(
+            "fire", steps, post_s, is_fire=True, reset_fire=fire_steps
+        ):
+            raise RuntimeError("A sequence is already running")
 
     def dump_fire_sequence(self) -> list[dict]:
         """
@@ -695,6 +693,9 @@ class Engine:
         """
         with self._lock:
             self._fire_invalidated = True
+            # A paused fire has no thread to record the abort itself.
+            if self._fire_state == FIRE_PAUSED:
+                self._fire_state = FIRE_ABORTED
         self._abort_flag.set()
 
         old_thread = self._sequence_thread
@@ -1113,11 +1114,22 @@ class Engine:
         force: bool = False,
         start_idx: int = 0,
         start_elapsed: float = 0.0,
+        reset_fire: Optional[list[FireStep]] = None,
     ) -> bool:
         """
         Start a sequence thread. Returns False if one is alive, unless force
-        (abort). start_idx/start_elapsed resume a fire mid-timeline.
+        (abort). start_idx/start_elapsed resume a fire mid-timeline;
+        reset_fire restarts the fire position from 0 with these steps.
         """
+        # A thread that has marked itself done can still read as alive for a
+        # moment; let it exit rather than refuse.
+        prev = self._sequence_thread
+        if not force and prev is not None and prev.is_alive():
+            with self._lock:
+                finishing = not self._sequence_active
+            if finishing:
+                prev.join(timeout=0.5)
+
         with self._lock:
             thread_alive = (
                 self._sequence_thread is not None
@@ -1138,6 +1150,11 @@ class Engine:
             if is_fire:
                 self._fire_t0 = t0
                 self._fire_state = FIRE_RUNNING
+                if reset_fire is not None:
+                    self._fire_steps       = reset_fire
+                    self._fire_position_s  = 0.0
+                    self._fire_next_idx    = 0
+                    self._fire_invalidated = False
 
         self._abort_flag.clear()
         self._pause_flag.clear()
