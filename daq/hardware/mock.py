@@ -1,19 +1,11 @@
 """
 daq/hardware/mock.py
 
-Simulated LabJack T7 for development and hardware-free testing.
+Simulated LabJack T7 for hardware-free runs and tests. Same public
+interface as hardware/interface.py; keep the two in sync.
 
-Provides mathematical models of pressures, temperatures, load cells and
-photogate counters to produce realistic, responsive signals matching real
-test physics.
-
-Sensor simulation:
-  - pt_direct:         slow sine-wave drift around a realistic setpoint
-  - tc_differential:   stable with small noise, near -160 C
-  - lc_direct:         zero until both stepper mains are open, then ramps
-  - photogate_counter: accumulates counts while its stepper is moving
-  - pt_differential:   orifice pressure drop, tens of psi
-  - CJC (LM34):        fixed room temperature with minor drift
+Signals: sine drift plus noise; load cells ramp once both mains are open;
+counters advance while their stepper moves.
 """
 
 from __future__ import annotations
@@ -38,31 +30,29 @@ from daq.manifest import (
 
 
 # -- Sensor Simulation Parameters -----------------------------
-# Voltage formula: V = base + amplitude * sin(2pi * t / period) + noise
+# V = base + amplitude * sin(2pi * t / period) + noise
 
-# Pressure transducers. 0.50 V is ~200 psi at the PX309-2KG5V nominal
-# 400 psi/V slope; each successive PT is offset a little so channels are
-# distinguishable in a dashboard rather than drawing on top of each other.
+# ~200 psi at 400 psi/V; each PT offset so the traces don't overlap.
 _PT_BASE_V     = 0.50
 _PT_OFFSET_V   = 0.04
 _PT_AMP_V      = 0.020
 _PT_PERIOD_S   = 12.0
 _PT_NOISE_V    = 0.002
 
-# Differential PTs measure drop across an injector orifice (tens of psi)
-_DPT_BASE_V    = 0.10     # ~50 psi at the nominal 500 psi/V calibration
+# ~0.6 psi at the placeholder 5.80151 psi/V.
+_DPT_BASE_V    = 0.10
 _DPT_OFFSET_V  = 0.02     # separates dpt0 from dpt1
 _DPT_AMP_V     = 0.015
 _DPT_PERIOD_S  = 9.0
 _DPT_NOISE_V   = 0.001
 
-# Thermocouples: millivolt-scale differential, LOX-ish (~-160 C).
+# ~-177 C (Type T) against the mock's 25 C cold junction.
 _TC_BASE_V     = -0.006200
 _TC_AMP_V      = 0.000050
 _TC_PERIOD_S   = 25.0
 _TC_NOISE_V    = 0.000005
 
-# Load cells: at rest near zero, ramping to ~500 lbf (1.134 V at slope=440.92).
+# Fire ramp to ~500 lbf at 440.92 lbf/V.
 _LC_NOISE_V       = 0.003
 _LC_FIRE_V        = 1.134
 _LC_RAMP_S        = 0.5
@@ -70,41 +60,20 @@ _LC_OSC_V         = 0.1
 _LC_OSC_PERIOD_S  = 0.8
 _LC_FIRE_NOISE_V  = 0.005
 
-_CJC_BASE_V  = 0.770
-_CJC_DRIFT_V = 0.001
+_CJC_BASE_C  = 25.0
+_CJC_DRIFT_C = 0.1
 
 # -- Actuator Simulation Parameters ---------------------------
-# How long a commanded stepper move stays in flight when the manifest has
-# no steps/rate filled in yet. Real values override this once actuators.yaml
-# carries steps_open/steps_close/pulse_freq_hz.
-_DEFAULT_MOVE_DURATION_S = 1.5
-
-# Photogate edges per second while a stepper is moving.
-_COUNTS_PER_SECOND = 200.0
+_DEFAULT_MOVE_DURATION_S = 1.5   # used while steps/rate are null
+_COUNTS_PER_SECOND = 200.0       # photogate edges while moving
 
 # -- Timing Parameters ----------------------------------------
-
 _STREAM_HZ         = 500
-_SCANS_PER_READ    = 50
+_SCANS_PER_READ    = 50          # 10 batches/s; the T7 runs 20/s
 
 
 class MockLabJack:
-    """
-    Simulated LabJack T7.
-
-    Usage:
-        device = MockLabJack(channels, actuators)
-        device.open()
-        device.start_stream()
-
-        while running:
-            batch = device.stream_read()   # blocks ~0.1 s
-            cjc_v = device.read_cjc()
-            device.write_actuator("lox_main", state=1)
-
-        device.stop_stream()
-        device.close()
-    """
+    """Simulated LabJack T7; same public interface as LabJackT7."""
 
     def __init__(
         self,
@@ -145,8 +114,7 @@ class MockLabJack:
             spec for spec in actuators if spec.type == PULSE_STEPPER
         ]
 
-        # Deadline per stepper; a commanded move is in flight
-        # until perf_counter() passes it.
+        # Per stepper: the move is in flight until perf_counter() passes this.
         self._move_deadline: dict[str, float] = {}
         # Accumulated simulated photogate counts, keyed by channel id.
         self._counts: dict[str, float] = {spec.id: 0.0 for spec in self._counter_channels}
@@ -159,7 +127,7 @@ class MockLabJack:
         # Perf-counter instant both mains last became open, or None at rest.
         self._fire_start: float | None = None
 
-        # Uniform seed for reproducible noise generations
+        # Fixed seed: reproducible noise.
         self._rng_state: int = 0xDEADBEEF
 
     # --------------------------------------------------------
@@ -178,12 +146,7 @@ class MockLabJack:
         print("[MOCK] LabJack T7 disconnected (simulated)")
 
     def start_stream(self) -> int:
-        """
-        Simulate starting the 500 Hz data stream.
-
-        Returns:
-            The actual (simulated) stream rate in Hz.
-        """
+        """Start the simulated stream; returns the rate in Hz."""
         self._stream_start    = time.perf_counter()
         self._next_batch_time = self._stream_start + self._batch_duration
         self._streaming       = True
@@ -202,11 +165,7 @@ class MockLabJack:
 
     def stream_read(self) -> dict[str, list[float]]:
         """
-        Blocks to simulate 500 Hz clock, then generates mock scan values.
-
-        Returns:
-            Dict mapping channel id -> list of raw voltages, one per scan.
-            Also includes "scan_times" -> list of elapsed times in seconds.
+        Block until the next batch is due, then return it (same shape as the T7).
 
         Raises:
             RuntimeError: If called before start_stream().
@@ -236,28 +195,15 @@ class MockLabJack:
 
         return batch
 
-    def read_cjc(self) -> float:
-        """
-        Simulates LM34 cold junction ambient reference voltage.
-
-        Returns:
-            Voltage in volts. At 25 °C room temp this is ~0.770 V.
-        """
+    def read_cjc_celsius(self) -> float:
+        """Cold junction C, near 25 C."""
         t = time.perf_counter() - self._stream_start
-        drift = _CJC_DRIFT_V * math.sin(2 * math.pi * t / 120.0)
-        noise = self._noise() * 0.0002
-        return _CJC_BASE_V + drift + noise
+        drift = _CJC_DRIFT_C * math.sin(2 * math.pi * t / 120.0)
+        noise = self._noise() * 0.02
+        return _CJC_BASE_C + drift + noise
 
     def read_counters(self) -> dict[str, float]:
-        """
-        Simulates the photogate position-feedback counters.
-
-        A counter only advances while the stepper it belongs to is actually
-        moving, so the count tracks commanded motion. Reported telemetry only.
-
-        Returns:
-            Dict: channel id -> accumulated edge count.
-        """
+        """Photogate counts by channel id; each advances while its stepper moves."""
         now = time.perf_counter()
         with self._lock:
             dt = now - self._last_count_update if self._last_count_update else 0.0
@@ -277,14 +223,7 @@ class MockLabJack:
 
     def write_actuator(self, name: str, state: int) -> None:
         """
-        Set an actuator to open (1) or closed (0).
-
-        A pulse_stepper actuator additionally starts a simulated move that
-        keeps it reporting moving=True for the burst's duration.
-
-        Args:
-            name:  Actuator id from actuators.yaml.
-            state: 1 = energised/open, 0 = de-energised/closed.
+        Energise (1) or de-energise (0); a stepper also starts a timed move.
 
         Raises:
             KeyError: If name is not a recognised actuator.
@@ -303,27 +242,12 @@ class MockLabJack:
         print(f"[MOCK] {name} -> {'OPEN' if state else 'CLOSED'}")
 
     def read_actuator(self, name: str) -> int:
-        """
-        Return the current logical state of an actuator.
-
-        Args:
-            name: Actuator id.
-
-        Returns:
-            1 if energised/open, 0 if de-energised/closed.
-        """
+        """Commanded state: 1 = energised, 0 = de-energised."""
         with self._lock:
             return self._actuators[name]
 
     def all_safe(self) -> None:
-        """
-        De-energise all actuators (safe/closed position).
-
-        Mirrors LabJackT7.all_safe(): only binary_dio actuators report
-        closed. A pulse_stepper keeps its last commanded state, because
-        cancelling its burst leaves the valve wherever it sat rather than
-        shutting it.
-        """
+        """Mirrors LabJackT7.all_safe(): binary_dio to 0, steppers keep their state."""
         with self._lock:
             for name, spec in self._actuator_specs.items():
                 if spec.type == BINARY_DIO:
@@ -415,13 +339,7 @@ class MockLabJack:
         return base + drift + noise
 
     def _lc_sample(self, fire_elapsed: float | None) -> float:
-        """
-        Simulate load cell voltage.
-
-        At rest: near-zero with small noise.
-        During fire: ramp up over _LC_RAMP_S to ~500 lbf (1.134 V at
-        slope=440.92), then hold with thrust oscillation.
-        """
+        """Noise at rest; while firing, ramp over _LC_RAMP_S then oscillate."""
         if fire_elapsed is None:
             return self._noise() * _LC_NOISE_V
 
@@ -432,24 +350,14 @@ class MockLabJack:
         return thrust_v + oscillation + noise
 
     def _move_duration(self, spec: ActuatorSpec, state: int) -> float:
-        """
-        How long a commanded stepper move should stay in flight.
-
-        Uses the manifest's real step count and pulse rate when they're
-        filled in, and a fixed stand-in while they're still null.
-        """
+        """Move time from steps / pulse rate, or the stand-in while those are null."""
         steps = spec.steps_open if state == 1 else spec.steps_close
         if steps and spec.pulse_freq_hz:
             return steps / spec.pulse_freq_hz
         return _DEFAULT_MOVE_DURATION_S
 
     def _refresh_fire_state(self) -> None:
-        """
-        Track when firing starts, so the load cell ramp has a real origin.
-
-        Firing means every stepper main is commanded open - the mock's
-        stand-in for "the engine is running".
-        """
+        """Mark the fire start (every stepper main commanded open) for the LC ramp."""
         with self._lock:
             firing = bool(self._steppers) and all(
                 self._actuators.get(spec.id, 0) == 1 for spec in self._steppers
@@ -466,11 +374,7 @@ class MockLabJack:
         return None if start is None else time.perf_counter() - start
 
     def _noise(self) -> float:
-        """
-        Gaussian-ish noise in [-1, 1].
-        Uses a xorshift32 PRNG so output is reproducible given the same seed.
-        Sum of 4 uniform samples approximates gaussian by CLT.
-        """
+        """Roughly Gaussian noise in [-1, 1]: mean of 4 xorshift32 uniforms."""
         total = 0.0
         for _ in range(4):
             x = self._rng_state

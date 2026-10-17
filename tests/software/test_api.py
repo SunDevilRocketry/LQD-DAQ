@@ -1,12 +1,4 @@
-"""
-tests/software/test_api.py
-
-HTTP endpoint tests for daq/api.py via FastAPI's TestClient, running
-against an Engine wired to mock hardware.
-
-No real hardware or network required.
-Run with: python -m pytest tests/software/test_api.py -v
-"""
+"""tests/software/test_api.py: HTTP routes via TestClient on a mock Engine."""
 
 import tempfile
 import threading
@@ -25,14 +17,8 @@ from tests.software._helpers import make_engine, wait_for_first_batch
 
 def _wait_until_idle(api_client, timeout=20.0):
     """
-    Blocks until no sequence is active. abort.yaml's last action lands at
-    T+5s and its own post_record_seconds adds another 5s on top, so a full
-    abort cycle takes ~10s to clear sequence_active - mirrors
-    test_fire_then_abort's retry loop.
-
-    abort() can restart abort.yaml right as a previous run finishes. To 
-    avoid catching the gap between cycles, require two consecutive 
-    inactive checks b/f declaring idle.
+    Block until no sequence is active (an abort cycle takes ~10 s). Needs two
+    idle reads in a row, since abort.yaml can restart between cycles.
     """
     deadline = time.time() + timeout
     consecutive_idle = 0
@@ -47,26 +33,16 @@ def _wait_until_idle(api_client, timeout=20.0):
 
 
 def _ensure_idle(api_client, timeout=60.0):
-    """
-    Waits for a clean, settled idle state before a test that needs one.
-
-    Don't call POST /abort here. Earlier tests already triggered aborts, 
-    and calling it again just adds another ~10s cycle. Just wait for the
-    existing run to drain using _wait_until_idle.
-    """
+    """Wait for idle without POST /abort, which would add another ~10 s cycle."""
     _wait_until_idle(api_client, timeout=timeout)
 
 
 def _start_reliably(api_client, path, attempts=40, poll_interval=0.5):
     """
-    POST to a sequence-starting route (/fire or /sequence/start), retrying
-    if it silently no-oped, and returning the call's JSON body once the
-    engine confirms it actually took hold.
+    POST /fire or /sequence/start until the sequence is really active.
 
-    Both fire() and start_sequence() check if the previous thread is still alive.
-    Right after a thread finishes, that check can briefly read stale, causing the 
-    call to log and return 200 without actually running. Retry briefly to handle
-    the race.
+    Just after a thread ends it can still read as alive, and the call
+    returns 200 without starting. This retries around that bug.
     """
     for _ in range(attempts):
         body = api_client.post(path).json()
@@ -103,8 +79,7 @@ class TestAPI:
         assert "stream_hz" in data
 
     def test_status_reports_unwired_actuators(self, api_client):
-        """An operator's only pre-test view of actuators that cannot be
-        driven."""
+        """The fully wired fixture has none; the shipped cart lists two."""
         data = api_client.get("/status").json()
         assert data["unwired_actuators"] == []
 
@@ -117,14 +92,13 @@ class TestAPI:
         assert channels["pt0"]["unit"] == "Pa"
 
     def test_snapshot_reports_inactive_channels_as_null(self, api_client):
-        """An inactive channel stays in the reported set so a consumer's
-        key set matches the manifest - it just carries no value."""
+        """Inactive channels stay in the set, with no value."""
         channels = api_client.get("/snapshot").json()["channels"]
         assert "pt7" in channels
         assert channels["pt7"]["value"] is None
 
     def test_snapshot_has_no_derived_channels(self, api_client):
-        """Derived channels were deleted, not generalised (handoff sec 3/5)."""
+        """Old top-level keys stay gone; derived values live under `derived`."""
         data = api_client.get("/snapshot").json()
         for gone in ("lox_mdot", "fuel_mdot", "mixture_ratio", "impulse_ns"):
             assert gone not in data
@@ -154,7 +128,6 @@ class TestAPI:
         r = api_client.post("/actuator", json={"name": "fuel_vent", "state": 1})
         assert r.status_code == 200
         assert r.json()["ok"] is True
-        # Clean up
         api_client.post("/actuator", json={"name": "fuel_vent", "state": 0})
 
     def test_actuator_invalid_state(self, api_client):
@@ -203,7 +176,6 @@ class TestAPI:
         api_client.post("/log/stop")
 
     def test_fire_then_abort(self, api_client):
-        # Ensure any prior sequence has finished before firing
         for _ in range(20):
             snap = api_client.get("/snapshot").json()
             if not snap.get("sequence_active"):
@@ -220,7 +192,6 @@ class TestAPI:
     def test_fire_conflict(self, api_client):
         api_client.post("/abort")   # ensure clean state
         time.sleep(0.5)
-        # Start fire
         api_client.post("/fire")
         time.sleep(0.05)
         # Fire again while running should return 409
@@ -242,7 +213,7 @@ class TestAPI:
         _ensure_idle(api_client)
         _start_reliably(api_client, "/fire")
         try:
-            time.sleep(0.05)  # clearly past T=0, so seconds=0 below is unambiguously backward
+            time.sleep(0.05)  # past T=0, so seconds=0 is a backward seek
             r = api_client.post("/sequence/time", json={"seconds": 0})
             assert r.status_code == 409
         finally:
@@ -257,7 +228,7 @@ class TestAPI:
             assert r.json()["sequence_time_ms"] >= 5000
 
             # The jump fires main_valves_open (T+5.0s) immediately.
-            # Wait for the acquisition loop to publish the updated writes to /actuators.
+            # /actuators updates on the next batch.
             time.sleep(0.3)
             actuators = api_client.get("/actuators").json()
             assert actuators["lox_main"]["state"] == 1
@@ -283,9 +254,7 @@ class TestAPI:
         r_stop = api_client.post("/sequence/stop")
         assert r_stop.status_code == 200
 
-        # /status reflects the published snapshot, refreshed by the
-        # acquisition loop on its own cadence - give it a moment to catch
-        # up with stop_sequence()'s already-applied internal state.
+        # /status lags by up to one batch.
         time.sleep(0.3)
         status = api_client.get("/status").json()
         assert status["sequence_active"] is False
@@ -338,12 +307,8 @@ class TestDataFreshnessAPI:
         assert "data_age_s" in r.json()
 
     def test_snapshot_returns_500_when_stale(self):
-        """Uses its own engine/client (not the shared api_client fixture)
-        so breaking the device doesn't affect other API tests. api.py's
-        _engine/_logger are module-level singletons shared with whatever
-        else is using `app` (e.g. the api_client fixture), so we must
-        save and restore them - otherwise this test leaves a dead engine
-        wired into the global app for every test that runs after it."""
+        """Own engine, so breaking it can't affect other tests; api.py's
+        module-level engine is saved and restored."""
         prev_engine, prev_logger = api_module._engine, api_module._logger
 
         engine = make_engine()
@@ -380,11 +345,7 @@ class TestDataFreshnessAPI:
 # -- Foreground Write Mutex ------------------------
 
 class _BlockingStubEngine:
-    """
-    Test double that blocks on an Event to hold `_control_lock` open.
-
-    The default mock engine returns too quickly to test concurrent calls reliably.
-    """
+    """Engine double that holds _control_lock until released (the mock is too fast)."""
 
     def __init__(self):
         self.entered = threading.Event()
@@ -425,10 +386,7 @@ class _BlockingStubEngine:
 
 @pytest.fixture
 def stub_client():
-    """
-    Temporarily replaces the engine with _BlockingStubEngine, restoring 
-    OG state on teardown.
-    """
+    """Swap in _BlockingStubEngine, restoring the real engine afterwards."""
     prev_engine, prev_logger = api_module._engine, api_module._logger
     stub = _BlockingStubEngine()
     api_module.set_engine(stub)
@@ -439,12 +397,7 @@ def stub_client():
 
 
 class TestControlLockSynchronization:
-    """
-    /actuator, /fire, and /sequence/* share one foreground mutex and
-    discard (423) a request that arrives while another is being serviced.
-    /abort and /safe reserve the same mutex but always wait their turn -
-    never discarded.
-    """
+    """Busy lock: /actuator, /fire, /sequence/* get 423; /abort and /safe wait."""
 
     def test_actuator_busy_returns_423(self, stub_client):
         client, stub = stub_client

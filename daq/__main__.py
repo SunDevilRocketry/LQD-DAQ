@@ -1,21 +1,11 @@
 """
 daq/__main__.py
 
-Run with:
-    python -m daq
-    python -m daq --config path/to/custom_config.yaml
-    python -m daq --mock          (force mock hardware regardless of LJM)
-    python -m daq --no-server     (engine only, no HTTP API)
+    python -m daq [--config FILE] [--mock] [--no-server]
 
-Startup sequence:
-    1. Parse CLI args and load config.yaml
-    2. Load the channel/actuator manifests
-    3. Instantiate Engine (owns the manifests and the device)
-    4. Instantiate Logger against the engine's channel manifest
-    5. Register API engine reference
-    6. Start engine (connects to hardware, starts stream thread)
-    7. Start uvicorn (serves API; blocks until Ctrl-C)
-    8. On shutdown: stop engine, flush logger.
+Without LJM the service refuses to start unless --mock is given.
+Startup: config -> Engine (manifests, device) -> Logger -> API -> engine
+start -> uvicorn. Shutdown stops the engine, then the logger.
 """
 
 from __future__ import annotations
@@ -46,8 +36,8 @@ _DEFAULT_CONFIG = {
         "lox_table":    "daq/LOX_table_100_0-260_99R.csv",
     },
     "stream":  {"target_hz": 500},
-    "thresholds": {},  # Allows the parser to recognize and merge this section
-    "derived": {},     # Orifice geometry + the channels feeding mass flow
+    "thresholds": {},  # listed so config.yaml merges into them
+    "derived": {},
 }
 
 
@@ -69,7 +59,7 @@ def _load_config(path: str) -> dict:
 
 
 def _resolve(path: str) -> str:
-    """Make a path absolute relative to the working directory."""
+    """Absolute path from the working directory."""
     return os.path.abspath(path)
 
 
@@ -98,15 +88,21 @@ def main() -> None:
     server  = cfg["server"]
 
     # -- 2. Hardware Mock Configuration ----------------------
+    # daq.hardware falls back to the mock without LJM; refuse that unless asked.
+    import daq.hardware as _hw
+    if _hw.USING_MOCK and not args.mock:
+        print("[MAIN] ERROR: LabJack LJM native library not found, so only "
+              "mock hardware is available. Install LJM to use the T7, or "
+              "pass --mock to run on simulated data.")
+        sys.exit(1)
+
     if args.mock:
-        # Override the hardware classes before other modules import them
-        import daq.hardware as _hw
+        # Before daq.engine imports Device.
         from daq.hardware.mock import MockLabJack
         _hw.Device     = MockLabJack
         _hw.USING_MOCK = True
         print("[MAIN] Forced mock hardware")
 
-    # Now safe to import Engine and API after hardware references are resolved
     from daq.engine import Engine
     from daq import api as api_module
 
@@ -114,7 +110,7 @@ def main() -> None:
     cal_path     = _resolve(paths["cal_file"])
     sequence_dir = _resolve(paths["sequence_dir"])
 
-    # LOX density table for derived LOX mass flow (null without it)
+    # Without it, LOX mass flow is null.
     lox_table_path = _resolve(paths["lox_table"])
     if os.path.exists(lox_table_path):
         try:
@@ -128,7 +124,7 @@ def main() -> None:
     engine = Engine(
         cal_path=cal_path,
         sequence_dir=sequence_dir,
-        thresholds=cfg.get("thresholds"),  # Ingest thresholds from custom_config.yaml / config.yaml
+        thresholds=cfg.get("thresholds"),
         derived=cfg.get("derived"),
         channels_path=_resolve(paths["channels"]),
         actuators_path=_resolve(paths["actuators"]),
@@ -137,7 +133,6 @@ def main() -> None:
           f"{len(engine.actuator_specs)} actuators")
 
     # -- 4. Initialize CSV Logger ----------------------------
-    # CSV schema follows the engine's channel manifest.
     output_dir = _resolve(paths["output_dir"])
     logger = Logger(output_dir=output_dir, channels=engine.channel_specs)
     logger.open()
@@ -152,7 +147,7 @@ def main() -> None:
 
     def _shutdown(sig, frame):
         if _shutdown_requested[0]:
-            sys.exit(1)         # Force termination on consecutive signals
+            sys.exit(1)         # second signal: exit now
         _shutdown_requested[0] = True
         raise KeyboardInterrupt
 

@@ -1,49 +1,28 @@
-# config.yaml
-#
-# LQD-DAQ (legacy) system configuration.
-# Edit here for hardware-specific tuning and safety boundaries.
-
-# -- SERVER CONFIGURATION ------------------------------------
+# config.yaml: server, paths, derived-value inputs and display thresholds.
 
 server:
-  host: "0.0.0.0"       # Bind to all network interfaces for multi-console access
+  host: "0.0.0.0"       # all interfaces; closed network only
   port: 8000
-  log_level: "warning"  # Uvicorn logging verbosity: debug | info | warning | error
-
-# -- FILESYSTEM PATHS ----------------------------------------
+  log_level: "warning"  # uvicorn: debug | info | warning | error
 
 paths:
-  output_dir:    "data"                  # Target directory for CSV telemetry logs
-  sequence_dir:  "sequences"             # Directory containing fire.yaml and abort.yaml
-  cal_file:      "daq/calibration.json"  # Active calibration coefficients file
-  channels:      "channels.yaml"         # Sensor manifest for this cart
-  actuators:     "actuators.yaml"        # Actuator manifest for this cart
-  lox_table:     "daq/LOX_table_100_0-260_99R.csv"  # NIST LOX saturation density, for derived LOX mass flow
+  output_dir:    "data"                  # CSV recordings
+  sequence_dir:  "sequences"
+  cal_file:      "daq/calibration.json"
+  channels:      "channels.yaml"
+  actuators:     "actuators.yaml"
+  lox_table:     "daq/LOX_table_100_0-260_99R.csv"  # LOX density; source UNVERIFIED
 
-# -- DATA ACQUISITION STREAM ---------------------------------
 stream:
-  target_hz: 500       # Requested hardware sampling rate (negotiated at start)
+  target_hz: 500       # not read; the driver fixes 500 Hz
 
-# -- DERIVED CHANNELS ----------------------------------------
-#
-# Injector mass flow and mixture ratio, computed per batch from the
-# differential PTs and published under `derived` on /stream.
-#
-# Each side names the channel that feeds it, so nothing here depends on
-# the pt0..pt7 slot mapping being settled. A null or inactive channel, or
-# a null value below, makes that output null.
-#
-#   orifice_count         - 1 assumes a single orifice per side. If the
-#                           injector has N elements, this must be N or the
-#                           flow is wrong by a factor of N.
-#   discharge_coefficient - carried over from Goondaq's engine, NOT
-#                           measured on this injector.
-# The diameters are this cart's, supplied by Liquids.
-
+# Injector mass flow and O/F (calculated), published under `derived`.
+# A null or inactive input makes that output null. orifice_count must match
+# the injector's element count. Cd values are Goondaq's, not measured here.
 derived:
   lox:
     dp_channel:            dpt0
-    inlet_temp_channel:    tc0      # needed for LOX density; null -> no output
+    inlet_temp_channel:    tc0      # for LOX density
     orifice_diameter_in:   0.199
     orifice_count:         1
     discharge_coefficient: 0.6
@@ -52,32 +31,12 @@ derived:
     orifice_diameter_in:   0.280
     orifice_count:         1
     discharge_coefficient: 0.67
-    density_kg_m3:         800.0    # IPA at standard operating temperature
+    density_kg_m3:         800.0    # IPA, approximate
 
-# -- SAFETY THRESHOLDS (SR 3.2.2 / SR 3.2.3.1) ---------------
-#
-# These bands classify readings for the operator's display. They do NOT
-# arm an interlock: crossing into WARNING does not ACT
-# Nothing in the DAQ reads a status and acts on it. Do not add bounds here
-# expecting them to stop anything by themselves.
-#
-# Keyed by channel id from channels.yaml.
-# Bounds are authored in calibrated units: pressures (psig), temperatures
-# (°C), forces (lbf). Pressure bands are converted to Pa on load.
-#
-# GUI State Mapping (Dashboard readingStatus.ts):
-#   - Within [normal]:                        NOMINAL
-#   - Outside [normal] but within [warning]:  CAUTION
-#   - Outside [warning]:                      WARNING
-#
-# A channel with no entry here reports status: UNCONFIGURED - nobody has set
-# bounds for it yet.
-#
-# EMPTY ON PURPOSE. Real psi/°C bounds for this cart must come from the Liquids review.
-# Fill in per channel as:
-#
+# Display bands only (SR 3.2.2 / 3.2.3.1): nothing acts on them. Keyed by
+# channel id, in psig / C / lbf. No entry = UNCONFIGURED. Empty until
+# Liquids supplies bounds. Format:
 #   pt0:
-#     normal:  [<lo_psi>, <hi_psi>]
-#     warning: [<lo_psi>, <hi_psi>]
-#
+#     normal:  [<lo>, <hi>]
+#     warning: [<lo>, <hi>]
 thresholds: {}

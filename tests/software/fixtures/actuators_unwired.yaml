@@ -15,7 +15,7 @@ actuators:
   - id: fuel_purge
     type: binary_dio
     dio: null
-  - id: lox_vent
+  - id: tank_depress
     type: binary_dio
     dio: null
   - id: fuel_vent

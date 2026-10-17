@@ -1,11 +1,4 @@
-"""
-tests/software/test_logger.py
-
-Tests for the non-blocking CSV logger (daq/logger.py).
-
-No real hardware or network required.
-Run with: python -m pytest tests/software/test_logger.py -v
-"""
+"""tests/software/test_logger.py: the CSV logger (daq/logger.py)."""
 
 import csv
 import os
@@ -47,8 +40,7 @@ class TestLogger:
             reader = csv.reader(f)
             header = next(reader)
         assert "time_s" in header
-        # CSV schema follows channels.yaml, so column names are channel ids
-        # and their declared units.
+        # Columns come from the manifest: ids and declared units.
         assert "pt0_raw_V"  in header
         assert "pt0_eng_Pa" in header
         assert "tc0_eng_celsius" in header

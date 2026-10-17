@@ -1,15 +1,8 @@
 """
 tests/software/test_engine.py
 
-Integration tests for daq/engine.py against MockLabJack:
-  - Engine startup, snapshot population, and clean shutdown
-  - Actuator control and sequence blocking
-  - Reconnection-style stop / restart behaviour
-  - Threshold config unit conversion (psi -> Pa)
-  - Data freshness / staleness detection
-
-No real hardware or network required.
-Run with: python -m pytest tests/software/test_engine.py -v
+daq/engine.py against MockLabJack: snapshots, actuators, reconnect,
+thresholds, staleness, sequences and the CJC poll.
 """
 
 import threading
@@ -66,7 +59,7 @@ class TestEngine:
 
     def test_snapshot_pressures_in_engineering_range(self):
         channels = self.engine.snapshot.channels
-        # Default mock + default cal -> should be roughly 100-400 psi equivalent.
+        # Mock pt0 is ~200 psi at the default 400 psi/V.
         for tag in ("pt0", "pt1", "pt2"):
             v = channels[tag].value
             assert psi_to_pa(50) < v < psi_to_pa(500), f"{tag}={v}"
@@ -88,8 +81,7 @@ class TestEngine:
         assert snap.actuators["lox_main"].moving is False
 
     def test_stepper_reports_moving_during_commanded_move(self):
-        """A stepper main is in flight for the burst duration; a solenoid
-        never is, b/c for a solenoid the DIO write is the state."""
+        """A stepper is moving for the burst; a solenoid never is."""
         self.engine.write_actuator("lox_main", 1)
         time.sleep(0.15)
         actuators = self.engine.snapshot.actuators
@@ -122,12 +114,10 @@ class TestEngine:
         assert snap.actuators["fuel_vent"].state == 0
 
     def test_tare_sets_lc_near_zero(self):
-        # Before tare, LC values may be non-zero (noise)
         self.engine.tare()
         time.sleep(0.15)
         reading = self.engine.snapshot.channels["lc0"]
-        # After tare, tared force should be near zero
-        # (within noise of a few lbf)
+        # Weak check: the mock LC already sits near 0 at rest.
         if reading.value is not None:
             assert abs(reading.value) < 5.0, f"lc0 after tare: {reading.value}"
 
@@ -180,7 +170,7 @@ class TestEngine:
         self.engine.stop()
         time.sleep(0.1)
         assert self.engine.snapshot.streaming is False
-        # Recreate so teardown doesn't fail
+        # Recreate so teardown can stop it.
         self.engine = make_engine()
         self.engine.start()
 
@@ -188,13 +178,7 @@ class TestEngine:
 # -- Reconnection After Comms Loss -----------------------------
 
 class TestEngineReconnect:
-    """
-    Covers the reconnect-on-repeated-failure behavior added to
-    Engine._stream_loop (mitigates FC.NLFS.LJ.2 / FC.NLFS.LQDDAQ.1):
-    after _MAX_CONSECUTIVE_READ_ERRORS consecutive stream_read() failures,
-    the engine should cycle close()/open()/start_stream() and resume
-    streaming rather than silently dying.
-    """
+    """After repeated read failures the engine reconnects and streams again."""
 
     def test_reconnects_after_repeated_read_failures(self):
         engine = make_engine()
@@ -227,8 +211,7 @@ class TestEngineReconnect:
         device.open         = tracking_open
         device.start_stream = tracking_start_stream
 
-        # Give the engine time to notice the failures, reconnect (with its
-        # backoff sleep), and resume streaming.
+        # Time to fail, back off, reconnect and stream again.
         deadline = time.time() + 10.0
         while time.time() < deadline:
             if state["reopened"] and state["restarted"] and engine.snapshot.streaming:
@@ -244,8 +227,7 @@ class TestEngineReconnect:
         engine.stop()
 
     def test_stream_flag_goes_false_during_outage(self):
-        """streaming should flip False as soon as reads start failing, not
-        stay stale True while the connection is actually down."""
+        """streaming goes False as soon as reads fail."""
         engine = make_engine()
         engine.start()
         wait_for_first_batch(engine)
@@ -272,12 +254,7 @@ class TestEngineReconnect:
 # -- Threshold Config Conversion (psi input -> Pa internal) -----
 
 class TestThresholdConversion:
-    """
-    config.yaml is authored in psi for pressure channels (matches
-    calibration.json's convention); Engine.thresholds should expose Pa
-    so it's unit-consistent with /snapshot. Non-pressure entries pass
-    through untouched.
-    """
+    """psi bands for pressure channels become Pa; other channels pass through."""
 
     def test_pressure_channel_converted_to_pa(self):
         raw = {"pt0": {"normal": [100, 250], "warning": [50, 300]}}
@@ -322,11 +299,7 @@ class TestThresholdConversion:
 # -- Reading Status (Dashboard readingStatus.ts enum) ----------
 
 class TestChannelStatus:
-    """
-    Status is computed DAQ-side so Dashboard never re-derives bands from a
-    separately fetched config that could drift from what actually triggers
-    an abort.
-    """
+    """Status is computed here so Dashboard can't drift from config. Display only."""
 
     def _engine(self, bands):
         return make_engine(thresholds={"pt0": bands})
@@ -394,7 +367,7 @@ class TestDataFreshness:
 
     def test_never_streamed_engine_is_infinitely_stale(self):
         engine = make_engine()
-        # Before start(), no batch has ever landed - definitionally stale.
+        # No batch before start(), so stale.
         assert engine.data_age_seconds == float("inf")
         assert engine.is_data_stale is True
 
@@ -416,18 +389,10 @@ class TestDataFreshness:
         engine.stop()
 
 
-# -- First-batch wait (the fixed-sleep flake) ------------------
+# -- First-batch wait ----------------------------------------
 
 class TestFirstBatchWait:
-    """
-    Reproduces the flake the suite used to carry.
-
-    setup_method() slept a flat 0.3 s after start() and assumed a batch
-    had landed. The first batch normally takes ~0.1 s, but on a loaded
-    runner it can take longer, leaving snapshot.channels empty and every
-    test that subscripts a channel raising KeyError. wait_for_first_batch()
-    polls for a populated snapshot instead.
-    """
+    """Wait for a populated snapshot, not a fixed sleep (that flaked under load)."""
 
     @staticmethod
     def _delay_first_batch(engine, delay_s: float) -> None:
@@ -467,11 +432,7 @@ class TestFirstBatchWait:
 
 class TestUnwiredActuatorGate:
     """
-    Channels and actuators used to treat an unfilled manifest differently.
-    With no channel wired, start_stream() raises and the engine cannot
-    pretend to run. With no actuator wired, nothing was gated: every
-    device write raised, _run_sequence logged it and advanced, and the
-    sequence reported completion having moved nothing.
+    A sequence naming an unwired actuator is refused, not run to a fake completion.
     """
 
     @staticmethod
@@ -489,13 +450,7 @@ class TestUnwiredActuatorGate:
 
     @staticmethod
     def _wait_for_sequence_end(engine, timeout=5.0):
-        """
-        Join the sequence thread if one was spawned. The engine is never
-        start()ed here, so the snapshot is not a usable signal.
-
-        A refused sequence is now rejected before any thread starts, so
-        having no thread at all is a valid outcome.
-        """
+        """Join the sequence thread if any; a refused sequence starts none."""
         thread = engine._sequence_thread
         if thread is None:
             return
@@ -512,19 +467,19 @@ class TestUnwiredActuatorGate:
         assert make_engine().unwired_actuators == []
 
     def test_sequence_commanding_an_unwired_actuator_is_refused(self, tmp_path):
-        engine = self._seq_engine(tmp_path, [[0.0, "lox_vent", 0]])
+        engine = self._seq_engine(tmp_path, [[0.0, "tank_depress", 0]])
         engine.abort()
         self._wait_for_sequence_end(engine)
 
         log = engine.event_log
-        assert any("REFUSED" in e and "lox_vent" in e for e in log), log
+        assert any("REFUSED" in e and "tank_depress" in e for e in log), log
         assert not any("T+0.00s" in e for e in log), (
             "a step ran despite the actuator having no pin assignment"
         )
 
     def test_refused_abort_still_drives_the_hardware_safe(self, tmp_path):
         """An ordered closure is impossible, so fall back to de-energising."""
-        engine = self._seq_engine(tmp_path, [[0.0, "lox_vent", 0]])
+        engine = self._seq_engine(tmp_path, [[0.0, "tank_depress", 0]])
         calls = []
         engine._device.all_safe = lambda: calls.append("all_safe")
 
@@ -546,7 +501,7 @@ class TestUnwiredActuatorGate:
     def test_fully_wired_sequence_still_runs_every_step(self, tmp_path):
         engine = self._seq_engine(
             tmp_path,
-            [[0.0, "lox_vent", 1], [0.0, "fuel_vent", 1]],
+            [[0.0, "tank_depress", 1], [0.0, "fuel_vent", 1]],
             actuators_path=None,
         )
         engine.abort()
@@ -554,20 +509,16 @@ class TestUnwiredActuatorGate:
 
         log = engine.event_log
         assert not any("REFUSED" in e for e in log), log
-        assert engine._device.read_actuator("lox_vent") == 1
+        assert engine._device.read_actuator("tank_depress") == 1
         assert engine._device.read_actuator("fuel_vent") == 1
 
 
 class TestActuatorNormalState:
-    """
-    `normal` is the actuator's de-energised resting state, reported to
-    Dashboard alongside commanded state. It is a P&ID fact, so an
-    unconfirmed one stays null rather than being defaulted to a guess.
-    """
+    """`normal` stays null unless the manifest sets it."""
 
     @staticmethod
     def _manifest(tmp_path, **extra):
-        entry = {"id": "lox_vent", "type": "binary_dio", "dio": "EIO4", **extra}
+        entry = {"id": "tank_depress", "type": "binary_dio", "dio": "CIO1", **extra}
         path = tmp_path / "actuators.yaml"
         path.write_text(yaml.safe_dump({"actuators": [entry]}))
         return str(path)
@@ -595,10 +546,7 @@ class TestActuatorNormalState:
 
 
 class TestDerivedChannels:
-    """
-    Mass flow and mixture ratio are computed from the differential PTs and
-    the geometry in config.yaml's `derived` block.
-    """
+    """Mass flow and O/F from the dPTs and config.yaml's `derived` block."""
 
     CFG = {
         "lox": {
@@ -675,21 +623,13 @@ class TestDerivedChannels:
 
 
 class TestFireRefusalReachesTheCaller:
-    """
-    A refused sequence used to be discovered inside the sequence thread,
-    after fire() had already returned. POST /fire answered 200 and nothing
-    moved. Validation now runs on the caller's thread so the refusal is
-    something a caller can act on.
-    """
+    """A refused fire raises on the caller's thread, so /fire can return 409."""
 
     @staticmethod
     def _engine(tmp_path, steps, name="fire.yaml", actuators_path=UNWIRED_ACTUATORS):
         """
-        fire.yaml uses the named-phase schema (_load_fire_sequence); every
-        other name (abort.yaml) keeps the flat schema (_load_sequence).
-        Callers still pass flat [t, actuator, state] triples either way -
-        for fire.yaml each triple becomes its own auto-named single-action
-        step.
+        Engine with sequences/`name` built from flat triples (one step each in
+        fire.yaml).
         """
         seq_dir = tmp_path / "sequences"
         seq_dir.mkdir(exist_ok=True)
@@ -710,12 +650,12 @@ class TestFireRefusalReachesTheCaller:
         return make_engine(**kwargs)
 
     def test_fire_raises_when_an_actuator_is_unwired(self, tmp_path):
-        engine = self._engine(tmp_path, [[0.0, "lox_vent", 1]])
+        engine = self._engine(tmp_path, [[0.0, "tank_depress", 1]])
         with pytest.raises(SequenceRefused, match="not wired"):
             engine.fire()
 
     def test_refused_fire_starts_nothing(self, tmp_path):
-        engine = self._engine(tmp_path, [[0.0, "lox_vent", 1]])
+        engine = self._engine(tmp_path, [[0.0, "tank_depress", 1]])
         with pytest.raises(SequenceRefused):
             engine.fire()
         assert engine._sequence_thread is None
@@ -725,7 +665,7 @@ class TestFireRefusalReachesTheCaller:
         """The other silent-success path: a malformed fire.yaml."""
         seq_dir = tmp_path / "sequences"
         seq_dir.mkdir()
-        (seq_dir / "fire.yaml").write_text("steps: [[0.0, 'lox_vent']]")
+        (seq_dir / "fire.yaml").write_text("steps: [[0.0, 'tank_depress']]")
         engine = make_engine(sequence_dir=str(seq_dir))
         with pytest.raises(SequenceRefused, match="could not be loaded"):
             engine.fire()
@@ -739,24 +679,21 @@ class TestFireRefusalReachesTheCaller:
 
     def test_dump_lists_steps_even_when_an_actuator_is_unwired(self, tmp_path):
         """GET /sequence is read-only; only fire() refuses unwired steps."""
-        engine = self._engine(tmp_path, [[0.0, "lox_vent", 1]])
+        engine = self._engine(tmp_path, [[0.0, "tank_depress", 1]])
         assert [s["name"] for s in engine.dump_fire_sequence()] == ["step_0"]
         with pytest.raises(SequenceRefused, match="not wired"):
             engine.fire()
 
     def test_a_drivable_fire_still_starts(self, tmp_path):
-        engine = self._engine(tmp_path, [[0.0, "lox_vent", 1]],
+        engine = self._engine(tmp_path, [[0.0, "tank_depress", 1]],
                               actuators_path=None)
         engine.fire()
         assert engine._sequence_thread is not None
         engine._sequence_thread.join(timeout=5.0)
 
     def test_abort_never_raises_and_still_safes_the_hardware(self, tmp_path):
-        """
-        abort() absorbs the refusal fire() propagates: leaving the cart
-        de-energised matters more than reporting the failure upward.
-        """
-        engine = self._engine(tmp_path, [[0.0, "lox_vent", 0]],
+        """abort() swallows the refusal and still de-energises."""
+        engine = self._engine(tmp_path, [[0.0, "tank_depress", 0]],
                               name="abort.yaml")
         calls = []
         engine._device.all_safe = lambda: calls.append("all_safe")
@@ -766,28 +703,41 @@ class TestFireRefusalReachesTheCaller:
         assert calls == ["all_safe"]
         assert any("REFUSED" in e for e in engine.event_log)
 
+    @pytest.mark.parametrize("state", [2, -1, 0.5, True, "1"])
+    def test_fire_refuses_a_state_other_than_0_or_1(self, tmp_path, state):
+        engine = self._engine(tmp_path, [[0.0, "tank_depress", state]],
+                              actuators_path=None)
+        with pytest.raises(SequenceRefused, match="state must be 0 or 1"):
+            engine.fire()
+
+    def test_abort_with_a_bad_state_still_safes_the_hardware(self, tmp_path):
+        engine = self._engine(tmp_path, [[0.0, "tank_depress", 2]],
+                              name="abort.yaml", actuators_path=None)
+        calls = []
+        engine._device.all_safe = lambda: calls.append("all_safe")
+
+        engine.abort()
+
+        assert calls == ["all_safe"]
+        assert any("state must be 0 or 1" in e for e in engine.event_log)
+
 
 class TestFireSequencing:
     """
-    POST /sequence/* is a pausable/seekable runner for fire.yaml. While
-    stopped, seeking only moves the playhead (no hardware effect). While
-    running, a forward seek fires every action it skips over; a backward seek is refused.
-
-    Scheduled gamma 100s out so sequences stay active until explicitly stopped
-    or aborted during tests.
+    Pause, resume and seek for fire.yaml. gamma sits at T+100 s so a run stays active.
     """
 
     FIRE_STEPS = {
         "post_record_seconds": 0,
         "steps": [
-            {"name": "alpha", "actions": [[0.02, "lox_vent", 1]]},
+            {"name": "alpha", "actions": [[0.02, "tank_depress", 1]]},
             {"name": "beta",  "actions": [[0.06, "lox_purge", 1], [0.05, "fuel_vent", 1]]},
             {"name": "gamma", "actions": [[100.0, "fuel_purge", 1]]},
         ],
     }
     ABORT_STEPS = {
         "post_record_seconds": 0,
-        "steps": [[0.0, "lox_vent", 0]],
+        "steps": [[0.0, "tank_depress", 0]],
     }
 
     @classmethod
@@ -802,8 +752,7 @@ class TestFireSequencing:
         engine = self._engine(tmp_path)
         dump = engine.dump_fire_sequence()
         assert [s["name"] for s in dump] == ["alpha", "beta", "gamma"]
-        # beta's two actions are 0.06 then 0.05 in file order - start_s must
-        # be the smaller time, not "whichever action came first".
+        # beta lists 0.06 then 0.05; start_s is the earlier time.
         beta = next(s for s in dump if s["name"] == "beta")
         assert beta["start_s"] == 0.05
         assert beta["actions"] == [[0.06, "lox_purge", 1], [0.05, "fuel_vent", 1]]
@@ -819,15 +768,12 @@ class TestFireSequencing:
     def test_jump_to_step_seeks_to_earliest_action_in_group(self, tmp_path):
         engine = self._engine(tmp_path)
         status = engine.jump_to_step("beta")
-        # beta's actions are [0.06, 0.05] in file order - must seek to the
-        # smaller time (0.05s), not the first-listed one (0.06s).
+        # Seeks to beta's earlier action (0.05 s), not its first-listed one.
         assert status["step"] == "beta"
         assert status["sequence_time_ms"] == 50
 
     def test_backward_jump_refused_while_running(self, tmp_path):
-        # engine.snapshot only updates via the acquisition loop (start()),
-        # which isn't running here - check the live flag directly instead,
-        # matching TestUnwiredActuatorGate's convention.
+        # Engine not started, so check the live flag, not the snapshot.
         engine = self._engine(tmp_path)
         engine.start_sequence()
         time.sleep(0.1)  # well past alpha/beta, clearly ahead of T+0
@@ -852,15 +798,13 @@ class TestFireSequencing:
         engine.start_sequence()
         status = engine.set_sequence_time(50.0)  # immediately, before alpha/beta tick naturally
 
-        # alpha + beta's two actions fired as part of the jump; gamma (100s
-        # out) did not.
-        assert set(calls) == {("lox_vent", 1), ("lox_purge", 1), ("fuel_vent", 1)}
+        # The jump fired alpha and beta, not gamma (T+100 s).
+        assert set(calls) == {("tank_depress", 1), ("lox_purge", 1), ("fuel_vent", 1)}
         assert status["step"] == "beta"
-        # A few microseconds pass between the jump landing and this status
-        # read, so it's ~50000ms.
+        # A few microseconds pass before this read.
         assert 50000 <= status["sequence_time_ms"] < 50050
 
-        # Ticking resumed live from the new position, not left stopped.
+        # Still ticking from the new position.
         assert engine._sequence_active is True
         engine.stop_sequence()
 
@@ -899,7 +843,7 @@ class TestFireSequencing:
         time.sleep(0.15)
         engine.stop_sequence()
         first_round = list(calls)
-        assert set(first_round) == {("lox_vent", 1), ("lox_purge", 1), ("fuel_vent", 1)}
+        assert set(first_round) == {("tank_depress", 1), ("lox_purge", 1), ("fuel_vent", 1)}
 
         engine.start_sequence()
         time.sleep(0.15)
@@ -917,8 +861,7 @@ class TestFireSequencing:
             engine._sequence_thread.join(timeout=2.0)
 
         assert any("ABORT" in e or "[abort]" in e for e in engine.event_log)
-        # Frozen where it was (not reset to 0) and invalidated - resumable
-        # only via a fresh fire().
+        # Frozen, not reset; only a fresh fire() can resume.
         assert engine._fire_position_s == pytest.approx(0.06, abs=0.02)
         assert engine._fire_invalidated is True
         assert engine._sequence_active is False
@@ -944,12 +887,10 @@ class TestFireSequencing:
         engine.stop_sequence()
 
     def test_natural_completion_keeps_the_clock_running(self, tmp_path):
-        """After the last scripted action, elapsed keeps counting up (like
-        a real launch clock after liftoff) instead of freezing or
-        resetting."""
+        """After the last action the clock keeps counting."""
         engine = self._engine(tmp_path, fire_steps={
             "post_record_seconds": 0,
-            "steps": [{"name": "only", "actions": [[0.01, "lox_vent", 1]]}],
+            "steps": [{"name": "only", "actions": [[0.01, "tank_depress", 1]]}],
         })
         engine.fire()
         time.sleep(0.1)  # completes within this window
@@ -986,3 +927,49 @@ class _StubLogger:
 
     def write_row(self, row_vals):
         pass
+
+
+class TestColdJunctionPoll:
+    """A failed CJC/counter read is logged and blanks the value, never a guessed CJC."""
+
+    @staticmethod
+    def _tc_spec(engine):
+        return next(s for s in engine._channels if s.type == "tc_differential")
+
+    def test_no_tc_value_before_the_first_cjc_read(self):
+        engine = make_engine()
+        assert engine._scale_channel(self._tc_spec(engine), [0.0], engine._cjc_celsius) == [None]
+
+    def test_failed_cjc_read_is_logged_once_and_blanks_the_tc(self):
+        engine = make_engine()
+        engine._device.read_cjc_celsius = lambda: 21.0
+        engine._poll_out_of_band()
+        assert engine._cjc_celsius == 21.0
+
+        def boom():
+            raise RuntimeError("LJM timeout")
+        engine._device.read_cjc_celsius = boom
+        engine._poll_out_of_band()
+        engine._poll_out_of_band()
+
+        assert engine._cjc_celsius is None
+        failures = [e for e in engine.event_log if "CJC read FAILED" in e]
+        assert len(failures) == 1 and "LJM timeout" in failures[0]
+        assert engine._scale_channel(self._tc_spec(engine), [0.0], engine._cjc_celsius) == [None]
+
+        engine._device.read_cjc_celsius = lambda: 21.0
+        engine._poll_out_of_band()
+        assert engine._cjc_celsius == 21.0
+        assert any("CJC read recovered" in e for e in engine.event_log)
+
+    def test_failed_counter_read_is_logged_and_clears_counts(self):
+        engine = make_engine()
+        engine._counters = {"pos_lox_main": 12.0}
+
+        def boom():
+            raise RuntimeError("LJM timeout")
+        engine._device.read_counters = boom
+        engine._poll_out_of_band()
+
+        assert engine._counters == {}
+        assert any("counter read FAILED" in e for e in engine.event_log)

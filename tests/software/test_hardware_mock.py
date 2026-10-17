@@ -1,12 +1,4 @@
-"""
-tests/software/test_hardware_mock.py
-
-Tests for MockLabJack itself: stream timing, data shape, and actuator
-control of the simulator (daq/hardware/mock.py).
-
-No real hardware or network required.
-Run with: python -m pytest tests/software/test_hardware_mock.py -v
-"""
+"""tests/software/test_hardware_mock.py: MockLabJack timing, data and actuators."""
 
 import time
 
@@ -95,16 +87,15 @@ class TestMockLabJack:
         avg = sum(batch["lc0"]) / len(batch["lc0"])
         assert avg > 0.5, f"lc0 didn't ramp up during fire: avg={avg}"
 
-    def test_cjc_voltage_near_room_temp(self):
-        cjc_v = self.device.read_cjc()
-        # 0.770 V = 25°C; allow ±0.05 V (~3°C)
-        assert 0.720 < cjc_v < 0.820, f"CJC voltage {cjc_v} unexpected"
+    def test_cjc_near_room_temp(self):
+        cjc_c = self.device.read_cjc_celsius()
+        assert 22.0 < cjc_c < 28.0, f"CJC temperature {cjc_c} unexpected"
 
     def test_actuator_write_and_read(self):
-        self.device.write_actuator("lox_vent", 1)
-        assert self.device.read_actuator("lox_vent") == 1
-        self.device.write_actuator("lox_vent", 0)
-        assert self.device.read_actuator("lox_vent") == 0
+        self.device.write_actuator("tank_depress", 1)
+        assert self.device.read_actuator("tank_depress") == 1
+        self.device.write_actuator("tank_depress", 0)
+        assert self.device.read_actuator("tank_depress") == 0
 
     def test_all_safe_closes_solenoids_and_stops_all_motion(self):
         for name in ("lox_main", "fuel_main", "ignition_arm"):
@@ -117,13 +108,7 @@ class TestMockLabJack:
             assert reading.moving is False, f"{name} still moving after all_safe()"
 
     def test_all_safe_does_not_claim_the_stepper_mains_are_closed(self):
-        """
-        all_safe() cancels an in-flight burst and drops ENA, which leaves an
-        open-loop stepper wherever it currently sits | ordered closure of the
-        mains is abort.yaml's job. Reporting state 0 here would tell the
-        operator the main is shut at the exact moment we did not
-        shut it, so a stepper keeps its last commanded state instead.
-        """
+        """A cancelled burst leaves the main where it is, so it keeps state 1."""
         self.device.write_actuator("lox_main", 1)
         self.device.all_safe()
 
@@ -165,11 +150,7 @@ class TestMockLabJack:
 # -- Stepper Actuators ----------------------------------------
 
 class TestMockStepper:
-    """
-    Stepper mains are commanded, not instant. The mock has to reproduce the
-    gap between "commanded open" and "physically open" that solenoids don't
-    have, because that's what the `moving` flag exists to express.
-    """
+    """A stepper move takes time; the mock must report moving=True meanwhile."""
 
     def setup_method(self):
         self.device = MockLabJack(full_channels(), full_actuators())
@@ -214,9 +195,8 @@ class TestMockStepper:
 
 class TestDifferentialPtSimulation:
     """
-    A differential PT reads the drop across an injector orifice, which is
-    tens of psi. Simulating it with the absolute-PT signal put it in the
-    hundreds and produced a physically impossible mass flow downstream.
+    The mock dP signal must stay small next to the PT signal (it once reused
+    the PT signal). The real dPT range is UNVERIFIED.
     """
 
     def test_orifice_dp_stays_in_a_plausible_band(self):
@@ -230,14 +210,14 @@ class TestDifferentialPtSimulation:
             device.close()
 
         for tag in ("dpt0", "dpt1"):
-            psi = [v * 500.0 for v in batch[tag]]     # nominal 500 psi/V
+            psi = [v * 500.0 for v in batch[tag]]   # old slope; real one UNVERIFIED
             assert all(0.0 < p < 100.0 for p in psi), (
                 f"{tag} simulated outside a plausible orifice dP band: "
                 f"min={min(psi):.1f} max={max(psi):.1f} psi"
             )
 
     def test_orifice_dp_is_well_below_tank_pressure(self):
-        """The drop across an orifice is a fraction of tank pressure."""
+        """Orifice dP is a fraction of tank pressure."""
         device = MockLabJack(full_channels(), full_actuators())
         device.open()
         device.start_stream()

@@ -1,18 +1,10 @@
 # tests/software/fixtures/actuators_full.yaml
 #
-# A fully-populated variant of the repo's actuators.yaml: every pin, step
-# count and pulse rate filled in, so the pulse_stepper path (and the
-# watchdog-mask scoping that depends on actuator type) is exercised.
-#
-# DIO assignments, step counts and rates here are arbitrary but
-# structurally valid.
+# The repo's actuators.yaml with step counts, rates and `normal` filled in
+# (values arbitrary), so the stepper path is tested.
 
 actuators:
-  - id: lox_press
-    type: binary_dio
-    normal: closed
-    dio: EIO0
-  - id: fuel_press
+  - id: fuel_purge
     type: binary_dio
     normal: closed
     dio: EIO1
@@ -20,31 +12,34 @@ actuators:
     type: binary_dio
     normal: closed
     dio: EIO2
-  - id: fuel_purge
+  - id: fuel_press
     type: binary_dio
     normal: closed
     dio: EIO3
-  - id: lox_vent
+  - id: lox_press
     type: binary_dio
-    normal: open
+    normal: closed
     dio: EIO4
   - id: fuel_vent
     type: binary_dio
     normal: open
-    dio: EIO5
+    dio: EIO7
+  - id: tank_depress
+    type: binary_dio
+    normal: open
+    dio: CIO1
   - id: ignition_arm
     type: binary_dio
-    dio: CIO0
+    dio: MIO0
   - id: ignition_fire
     type: binary_dio
-    dio: CIO1
+    dio: MIO1
 
   - id: lox_main
     type: pulse_stepper
     normal: closed
-    step_dio: FIO0
+    step_dio: FIO3
     dir_dio: FIO2
-    ena_dio: FIO3
     steps_open: 400
     steps_close: 400
     pulse_freq_hz: 2000
@@ -55,9 +50,8 @@ actuators:
   - id: fuel_main
     type: pulse_stepper
     normal: closed
-    step_dio: FIO1
-    dir_dio: FIO4
-    ena_dio: FIO5
+    step_dio: FIO0
+    dir_dio: FIO1
     steps_open: 400
     steps_close: 400
     pulse_freq_hz: 2000

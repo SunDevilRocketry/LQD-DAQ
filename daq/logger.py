@@ -1,11 +1,8 @@
 """
 daq/logger.py
 
-Non-blocking background CSV logging engine for real-time telemetry.
-
-Design Constraints:
-  - Disk I/O runs entirely on a dedicated writer thread to prevent stream stalling.
-  - Thread-safe queue (deque) drops the oldest rows if disk latency spikes.
+CSV recorder. Disk writes run on their own thread so the stream never
+waits; if the disk stalls, the buffer drops the oldest rows.
 """
 
 
@@ -22,30 +19,15 @@ from typing import Optional, Sequence
 from daq.manifest import ChannelSpec
 
 
-# Buffer polling and disk flushing intervals
-_FLUSH_INTERVAL_S  = 0.05     # Thread sleep duration (20 Hz drain rate)
-_FSYNC_EVERY_N     = 20       # Frequency of file system syncs (~1 second interval)
-_MAX_BUFFER        = 250_000  # Thread-safe ring buffer maximum capacity
+_FLUSH_INTERVAL_S  = 0.05     # drain every 50 ms
+_FSYNC_EVERY_N     = 20       # flush() (not fsync) every N drains, ~1 s
+_MAX_BUFFER        = 250_000  # rows (~500 s at 500 Hz)
 
 
 class Logger:
     """
-    Non-blocking CSV logger.
-
-    Usage:
-        logger = Logger(output_dir="data", channels=engine.channel_specs)
-        logger.open()                          # starts writer thread
-
-        logger.start_recording("hotfire")      # opens CSV file
-        for row in rows:
-            logger.write_row(row)              # non-blocking
-        logger.stop_recording()                # flush + close file
-
-        logger.close()                         # stops writer thread
-
-    Lifecycle contract:
-        open() and close() are managed by the application owner (__main__.py).
-        start_recording() and stop_recording() are driven dynamically by the engine.
+    Non-blocking CSV logger. __main__.py owns open()/close(); the engine and
+    API start and stop recordings.
     """
 
     def __init__(
@@ -56,9 +38,7 @@ class Logger:
         self._output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        # CSV column set follows channels.yaml. Only active, streamed
-        # channels get columns. Photogate counter isn't sampled per scan,
-        # and an inactive channel would be a column of empty strings.
+        # Columns: active streamed channels only (counters aren't per scan).
         self._channels: list[ChannelSpec] = [
             spec for spec in (channels or [])
             if spec.active and spec.is_streamed
@@ -76,7 +56,6 @@ class Logger:
         self._current_path: str = ""
         self._flush_count  = 0
 
-        # Operational metrics
         self._rows_written  = 0
         self._rows_dropped  = 0
 
@@ -85,7 +64,7 @@ class Logger:
     # --------------------------------------------------------
 
     def open(self) -> None:
-        """Start the background writer thread. Call once at startup."""
+        """Start the writer thread."""
         if self._running:
             return
         self._running = True
@@ -97,7 +76,7 @@ class Logger:
         self._writer_thread.start()
 
     def close(self) -> None:
-        """Flushes the remaining queue and stops the background writer thread."""
+        """Stop any recording and the writer thread."""
         if self._recording:
             self.stop_recording()
         self._running = False
@@ -110,15 +89,9 @@ class Logger:
 
     def start_recording(self, prefix: str = "data") -> str:
         """
-        Initializes a new CSV file and starts logging telemetry.
+        Open <prefix>_<timestamp>.csv and start recording; returns its path.
 
-        If a recording is active, it is stopped and flushed first.
-
-        Args:
-            prefix: Filename prefix (e.g. "hotfire", "manual_log").
-
-        Returns:
-            Full path to the opened CSV file.
+        Stops an active recording first. Prefix isn't sanitised.
         """
         if self._recording:
             self.stop_recording()
@@ -126,7 +99,7 @@ class Logger:
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self._output_dir, f"{prefix}_{ts}.csv")
 
-        # Open with large write buffer; newline="" required for csv module
+        # 128 KiB buffer; csv needs newline="".
         fh = open(path, "w", newline="", buffering=1 << 17)
         writer = csv.writer(fh)
         writer.writerow(self._header())
@@ -145,7 +118,7 @@ class Logger:
         return path
 
     def stop_recording(self) -> None:
-        """Flushes all remaining buffered rows, fsyncs, and closes the file."""
+        """Drain, flush, fsync and close the file."""
         with self._lock:
             self._recording = False
 
@@ -172,13 +145,8 @@ class Logger:
 
     def write_row(self, row: list) -> None:
         """
-        Enqueues a data row for non-blocking background writing.
-
-        If the buffer is full (disk stall), the oldest row is silently
-        dropped (deque maxlen handles this automatically).
-
-        Args:
-            row: List of values matching the CSV column order.
+        Queue a row (no-op when not recording). A full buffer drops the
+        oldest row; rows_dropped counts it but nothing reports it.
         """
         if not self._recording:
             return
@@ -217,21 +185,20 @@ class Logger:
     # --------------------------------------------------------
 
     def _writer_loop(self) -> None:
-        """
-        Background thread: drains the buffer to disk at _FLUSH_INTERVAL_S.
-        Runs independently of the stream thread.
-        """
+        """Drain the buffer every _FLUSH_INTERVAL_S until close()."""
         while self._running:
             time.sleep(_FLUSH_INTERVAL_S)
             with self._lock:
                 self._drain_locked()
 
-        # Final drain after stop()
         with self._lock:
             self._drain_locked()
 
     def _drain_locked(self) -> None:
-        """Drains the queue and writes buffered rows to the active file handle."""
+        """
+        Write buffered rows. On a disk error, stop recording with a print
+        only; the API and GUI aren't told.
+        """
         if not self._csv_writer or not self._buffer:
             return
 
@@ -268,13 +235,8 @@ class Logger:
     # --------------------------------------------------------
 
     def _header(self) -> list[str]:
-        """
-        Column headers for the telemetry row schema.
-
-        Derived from channels.yaml. Column order here must match the
-        order engine._process_batch() assembles rows in - both iterate the
-        same filtered manifest list.
-        """
+        """time_s, then <id>_raw_V and <id>_eng_<unit> per channel, in the same
+        order as Engine._process_batch() builds rows."""
         cols = ["time_s"]
         for spec in self._channels:
             cols.append(f"{spec.id}_raw_V")

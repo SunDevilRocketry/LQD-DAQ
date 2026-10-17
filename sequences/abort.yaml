@@ -1,21 +1,9 @@
-# sequences/abort.yaml
-#
-# Abort / emergency shutdown sequence.
-# Executes immediately when ABORT is commanded, interrupting any
-# running fire sequence. Reaches safe state ASAP w/ considering
-# water hammer.
-#
-# Format is as follows: [elapsed_seconds, actuator_name, state]
-#
-# !! TIMINGS BELOW ARE PLACEHOLDERS PENDING LIQUIDS REVIEW !!
-# This is the main LQD-DAQ abort ordering with the actuator names remapped to
-# this cart's ids. The ordering is safety-critical and belongs to the Liquids
-# review.
-#   - lox_main/fuel_main are stepper-driven on this cart. Commanding them
-#     closed starts a timed move.
-#   - Engine.all_safe() de-energises solenoids and cancels any in-flight
-#     stepper burst, which leaves a main valve wherever it currently sits.
-#     Closing the mains is this file's responsibility.
+# sequences/abort.yaml: abort timeline, [t_s, actuator_id, state] from
+# /abort; 1 = energise.
+# PLACEHOLDER ordering from the old Goondaq DAQ; Liquids confirms it.
+# Refused while lox_main/fuel_main are unwired, so today an abort is
+# all-off (no purge). Once runnable, closing the mains is this file's job:
+# all-off leaves a stepper where it is.
 
 post_record_seconds: 5.0
 
@@ -28,7 +16,7 @@ steps:
   - [0.00, "fuel_press", 0]
   - [0.05, "lox_purge",  1]
   - [0.05, "fuel_purge", 1]
-  - [0.10, "lox_vent",   0]
+  - [0.10, "tank_depress", 0]
   - [0.10, "fuel_vent",  0]
   - [5.00, "lox_purge",  0]
   - [5.00, "fuel_purge", 0]

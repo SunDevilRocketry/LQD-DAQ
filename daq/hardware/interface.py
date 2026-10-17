@@ -1,50 +1,12 @@
 """
 daq/hardware/interface.py
 
-Production LabJack T7 driver wrapping the LJM library.
+LabJack T7 driver (LJM). Same public interface as hardware/mock.py; keep
+the two in sync. Channels and actuators with a null pin are skipped.
 
-Implements the exact same public interface as hardware/mock.py so that
-engine.py is hardware-agnostic. Mock.py must stay in sync vise versa.
-
-Channel and actuator layout is built at construction time from the 
-ChannelSpec/ActuatorSpec manifests loaded from
-channels.yaml / actuators.yaml:
-    pt_direct         - single-ended, AIN_NEGATIVE_CH=199, ±5 V range
-    pt_differential   - orifice dP transducer; same single-ended wiring
-                        and range as pt_direct, the value is a delta
-    tc_differential   - differential pair, ±0.1 V range
-    lc_direct         - single-ended, AIN_NEGATIVE_CH=199, ±5 V range
-    photogate_counter - DIO_EF Counter, polled outside the stream
-    CJC               - LM34 on AIN58, single-ended, ±1 V range (read outside stream)
-
-A channel or actuator whose physical pin is still null in the manifest is
-skipped: it is not added to the scan list and cannot be driven.
-
-Actuators:
-    binary_dio    - active-low on the EIO/CIO bank
-                    hardware logical 0 = energised, logical 1 = de-energised
-                    We invert at this layer so the rest of the system uses:
-                        1 = open/energised, 0 = closed/safe
-    pulse_stepper - DM860T via DIO_EF Pulse Out (mode 2) on the STEP line,
-                    with DIR/ENA as static DIO writes. Hardware generates a
-                    fixed-count pulse burst from one register write; no CPU
-                    polling once started. Open-loop: the burst is commanded,
-                    not verified.
-
-Watchdog:
-    Armed during open(). If the host loses comms for > 5 s the T7 drives the
-    covered DIO lines to their safe (de-energised) defaults.
-
-    Coverage is scoped to binary_dio (solenoid) lines only. 
-    !!!pulse_stepper lines are excluded until the watchdog-vs-DIO_EF-Pulse-Out
-    interaction has been bench-tested. !!! watchdog reset firing mid-burst on
-    a line the pulse engine owns is untested behaviour.
-
-Reference:
-    LabJack T7 User Guide - https://labjack.com/pages/support?doc=/datasheets/t7-datasheet/
-    LJM Library - https://labjack.com/pages/support?doc=/software-driver/ljm-users-guide/
-    DIO_EF Pulse Out - https://support.labjack.com/docs/13-2-4-pulse-out-t-series-datasheet
-    Stepper control app note - https://support.labjack.com/docs/stepper-motor-controller
+binary_dio lines are active-low; this layer inverts so 1 = energised.
+The watchdog covers binary_dio lines only: stepper lines stay out until
+watchdog vs DIO_EF Pulse Out is bench-tested.
 """
 
 from __future__ import annotations
@@ -66,24 +28,26 @@ from daq.manifest import (
     TC_DIFFERENTIAL,
     LC_DIRECT,
     PHOTOGATE_COUNTER,
+    check_ain,
 )
 
 
-_CJC_CHANNEL = "AIN58"   # LM34 cold junction sensor
+# CJC: internal sensor minus 3 C for the AIN0-3 screw terminals (LabJack 18.0).
+_CJC_REGISTER          = "TEMPERATURE_DEVICE_K"
+_CJC_SCREW_TERMINAL_C  = -3.0
+_KELVIN_OFFSET         = 273.15
 
 # -- Stream & Safety Parameters -------------------------------
 _STREAM_HZ       = 500
-_SCANS_PER_READ  = 50     # yields ~10 batches/s, 0.1 s per read call
-_SETTLING_US     = 100    # AIN settling time in microseconds
-_RESOLUTION      = 3      # resolution index (1=fastest, 12=slowest/quietest)
+_SCANS_PER_READ  = 50     # replaced in start_stream() by rate // 20
+_SETTLING_US     = 100
+_RESOLUTION      = 3      # STREAM_RESOLUTION_INDEX, applies to every channel
 
-# Hardware watchdog safety settings (T7 executes autonomously on host crash)
+# Only command-response traffic resets it; stream data doesn't.
 _WATCHDOG_TIMEOUT_S = 5
 
 # -- DIO_EF Parameters ----------------------------------------
-# T7 core clock is 80 MHz. Divisor 8 gives a 10 MHz tick, which keeps the
-# roll value inside 32 bits across the whole stepper rate range we care
-# about (10 Hz -> 1 M ticks, 20 kHz -> 500 ticks).
+# 80 MHz / 8 = 10 MHz tick; the roll value fits from 10 Hz to 20 kHz.
 _DIO_EF_CORE_HZ      = 80_000_000
 _DIO_EF_CLOCK_DIV    = 8
 _DIO_EF_TICK_HZ      = _DIO_EF_CORE_HZ // _DIO_EF_CLOCK_DIV
@@ -91,18 +55,13 @@ _DIO_EF_TICK_HZ      = _DIO_EF_CORE_HZ // _DIO_EF_CLOCK_DIV
 _DIO_EF_INDEX_PULSE_OUT = 2
 _DIO_EF_INDEX_COUNTER   = 8
 
-# DIO bit offsets for the T7's named banks (T7 datasheet, DIO numbering).
+# Bank -> flat DIO number (MIO0 = DIO20).
 _DIO_BANK_OFFSETS = {"FIO": 0, "EIO": 8, "CIO": 16, "MIO": 20}
 
 
 def _dio_number(name: str) -> int:
     """
-    Resolve a T7 DIO register name to its DIO number.
-
-    Accepts either the bank form ('EIO0', 'CIO1') or the flat form
-    ('DIO8'). Needed b/c the watchdog mask registers are bitmasks over
-    flat DIO numbers, while the manifest names lines the way the wiring
-    diagram does.
+    DIO number for 'EIO0' / 'MIO1' / 'DIO8', for the watchdog bitmasks.
 
     Raises:
         ValueError: If the name isn't a recognised DIO register.
@@ -117,25 +76,7 @@ def _dio_number(name: str) -> int:
 
 
 class LabJackT7:
-    """
-    Production LabJack T7 driver.
-
-    Public interface is identical to MockLabJack. Only hardware-specific
-    implementation details are documented here.
-
-    Usage:
-        device = LabJackT7(channels, actuators)
-        device.open()
-        device.start_stream()
-
-        while running:
-            batch = device.stream_read()
-            cjc_v = device.read_cjc()
-            device.write_actuator("lox_main", state=1)
-
-        device.stop_stream()
-        device.close()
-    """
+    """LabJack T7 driver; same public interface as MockLabJack."""
 
     def __init__(
         self,
@@ -149,8 +90,7 @@ class LabJackT7:
         self._handle: Optional[int] = None
         self._lock = threading.Lock()
 
-        # Only channels the manifest marks active AND names a pin for can be
-        # touched. Everything else stays in the manifest but is not wired.
+        # Active channels with a pin; the rest are never touched.
         self._channels = [
             spec for spec in channels if spec.active and spec.is_wired
         ]
@@ -161,14 +101,17 @@ class LabJackT7:
             spec for spec in self._channels if spec.type == PHOTOGATE_COUNTER
         ]
 
+        for spec in self._channels:
+            for name in (spec.ain, spec.ain_pos, spec.ain_neg):
+                check_ain(name)
+
         self._actuator_specs: dict[str, ActuatorSpec] = {
             spec.id: spec for spec in actuators
         }
         self._actuators: dict[str, int] = {
             spec.id: 0 for spec in actuators
         }
-        # Monotonic deadline per stepper; a commanded burst is still in
-        # flight until perf_counter() passes it.
+        # Per stepper: the burst is in flight until perf_counter() passes this.
         self._move_deadline: dict[str, float] = {}
 
         self._warn_unwired(channels, actuators)
@@ -178,17 +121,15 @@ class LabJackT7:
         self._stream_start: float = 0.0
         self._actual_hz: int = 0
 
-        # Pre-compile the scan list addresses for stream efficiency
+        # Filled by _build_scan_list().
         self._scan_tags:    list[str] = []
         self._scan_addrs:   list[int] = []
-        self._scan_types:   list[int] = []
         self._n_channels:   int = 0
 
-        # Shared DIO_EF CLOCK0 roll value, resolved once in
-        # _configure_steppers() from the single stepper pulse rate.
+        # Shared CLOCK0 roll value, set in _configure_steppers().
         self._pulse_roll: int = 0
 
-        # Watchdog covers solenoid lines only (see module docstring).
+        # Watchdog mask: binary_dio lines only (valves, igniter).
         self._actuator_mask = 0
         for spec in actuators:
             if spec.type == BINARY_DIO and spec.dio is not None:
@@ -363,26 +304,13 @@ class LabJackT7:
 
         return batch
 
-    def read_cjc(self) -> float:
-        """
-        Reads the raw cold junction temperature reference (AIN58).
-
-        Returns:
-            Voltage in volts (~0.770 V at 25 °C room temperature).
-        """
-        return ljm.eReadName(self._handle, _CJC_CHANNEL)
+    def read_cjc_celsius(self) -> float:
+        """Cold junction C. Command-response, so it also resets the watchdog."""
+        kelvin = ljm.eReadName(self._handle, _CJC_REGISTER)
+        return kelvin - _KELVIN_OFFSET + _CJC_SCREW_TERMINAL_C
 
     def read_counters(self) -> dict[str, float]:
-        """
-        Reads the photogate position-feedback counters.
-
-        Polled out-of-band on the same tick as read_cjc(), not
-        part of the AIN scan list. Informational telemetry only.
-
-        Returns:
-            Dict: channel id -> accumulated edge count. Channels whose read
-            fails are omitted rather than reported as a bogus zero.
-        """
+        """Photogate edge counts by channel id; a failed read is omitted, not zeroed."""
         counts: dict[str, float] = {}
         for spec in self._counter_channels:
             try:
@@ -399,17 +327,10 @@ class LabJackT7:
 
     def write_actuator(self, name: str, state: int) -> None:
         """
-        Commands an actuator to its open (1) or closed/safe (0) position.
+        Energise (1) or de-energise (0) an actuator.
 
-        binary_dio actuators are a single DIO write with the active-low
-        hardware inversion applied here. pulse_stepper actuators start a
-        fixed-count DIO_EF pulse burst; the call returns as soon as the
-        burst is armed, and the actuator reports moving=True until the
-        commanded burst duration has elapsed.
-
-        Args:
-            name:  Actuator id from actuators.yaml.
-            state: 1 = energise/open, 0 = de-energise/safe.
+        A stepper starts a fixed-count burst and returns at once; it reports
+        moving=True until the burst should have finished.
 
         Raises:
             KeyError:      If name is not a recognised actuator.
@@ -426,7 +347,7 @@ class LabJackT7:
             )
 
         if spec.type == BINARY_DIO:
-            hw_state = 0 if state == 1 else 1   # Active-low hardware inversion :>
+            hw_state = 0 if state == 1 else 1   # active-low
             ljm.eWriteName(self._handle, spec.dio, hw_state)
         else:
             self._start_pulse_burst(spec, state)
@@ -441,19 +362,10 @@ class LabJackT7:
 
     def all_safe(self) -> None:
         """
-        De-energise all hardware outputs immediately.
+        De-energise every binary_dio line and cancel any stepper burst.
 
-        Solenoids drop to their safe state. Steppers have any in-flight
-        pulse burst cancelled and their driver disabled, which leaves the
-        valve wherever it currently sits.
-        An open-loop stepper can't be shut immediately, ordered closure of the
-        mains is abort.yaml's job, which Engine.abort() runs before reaching here.
-
-        B/c of that, only binary_dio actuators are reported closed here.
-        A stepper keeps its last commanded state: forcing it to 0 would tell
-        the operator the main is shut at the exact moment we have deliberately
-        left it wherever it sat. `moving` does drop to false for every
-        actuator, since any in-flight burst really has been cancelled.
+        Steppers keep their last commanded state: a cancelled burst leaves
+        the valve where it is, so reporting 0 would claim a closed main.
         """
         self._safe_all_hardware()
         with self._lock:
@@ -506,33 +418,18 @@ class LabJackT7:
 
     def _configure_channels(self) -> None:
         """
-        Set AIN range, resolution, and negative channel for every sensor.
+        Set negative channel and range per sensor.
 
-        pt_direct / lc_direct:
-            Single-ended (NEGATIVE_CH = 199 = GND reference)
-            ±5 V range, resolution index 1 (fastest)
-
-        tc_differential:
-            Differential (NEGATIVE_CH = partner channel number)
-            ±0.1 V range, resolution index 3 (quieter for small signal)
-
-        CJC (LM34 on AIN58):
-            Single-ended, ±1 V range, resolution 4
+        Resolution is stream-wide (STREAM_RESOLUTION_INDEX in start_stream()).
         """
         for spec in self._stream_channels:
             if spec.type in (PT_DIRECT, PT_DIFFERENTIAL, LC_DIRECT):
-                ljm.eWriteName(self._handle, f"{spec.ain}_NEGATIVE_CH",    199)
-                ljm.eWriteName(self._handle, f"{spec.ain}_RANGE",          5.0)
-                ljm.eWriteName(self._handle, f"{spec.ain}_RESOLUTION_INDEX", 1)
+                ljm.eWriteName(self._handle, f"{spec.ain}_NEGATIVE_CH", 199)
+                ljm.eWriteName(self._handle, f"{spec.ain}_RANGE",       10.0)
             elif spec.type == TC_DIFFERENTIAL:
                 neg_num = int(spec.ain_neg.replace("AIN", ""))
-                ljm.eWriteName(self._handle, f"{spec.ain_pos}_NEGATIVE_CH",    neg_num)
-                ljm.eWriteName(self._handle, f"{spec.ain_pos}_RANGE",          0.1)
-                ljm.eWriteName(self._handle, f"{spec.ain_pos}_RESOLUTION_INDEX", 3)
-
-        ljm.eWriteName(self._handle, f"{_CJC_CHANNEL}_NEGATIVE_CH",    199)
-        ljm.eWriteName(self._handle, f"{_CJC_CHANNEL}_RANGE",          1.0)
-        ljm.eWriteName(self._handle, f"{_CJC_CHANNEL}_RESOLUTION_INDEX", 4)
+                ljm.eWriteName(self._handle, f"{spec.ain_pos}_NEGATIVE_CH", neg_num)
+                ljm.eWriteName(self._handle, f"{spec.ain_pos}_RANGE",       0.1)
 
     def _configure_counters(self) -> None:
         """Puts each photogate DIO into DIO_EF Counter mode."""
@@ -544,19 +441,10 @@ class LabJackT7:
 
     def _configure_steppers(self) -> None:
         """
-        Configures the shared DIO_EF clock used by every STEP line.
+        Configure DIO_EF CLOCK0 once for every STEP line.
 
-        The clock is set up once; each burst then only has to write that
-        actuator's own pulse-count/width registers. DIR and ENA are plain
-        DIO lines and need no EF configuration.
-
-        CLOCK0 is a single shared resource. It is configured and enabled
-        exactly once here and never touched again, because disabling it
-        while any STEP line is mid-burst truncates that burst.
-
-        The consequence is that every stepper must share one
-        pulse_freq_hz. A mismatch is rejected here rather than silently
-        running whichever stepper was armed second at the wrong rate.
+        It's never touched again (disabling it truncates a running burst), so
+        all steppers must share one pulse_freq_hz; a mismatch raises.
         """
         steppers = [
             spec for spec in self._actuator_specs.values()
@@ -586,25 +474,22 @@ class LabJackT7:
 
         for spec in steppers:
             ljm.eWriteName(self._handle, f"{spec.step_dio}_EF_ENABLE", 0)
-            ljm.eWriteName(self._handle, spec.ena_dio, 1)   # start disabled
+            if spec.ena_dio is not None:
+                ljm.eWriteName(self._handle, spec.ena_dio, 1)   # start disabled
 
     def _start_pulse_burst(self, spec: ActuatorSpec, state: int) -> None:
         """
-        Arms a fixed-count DIO_EF Pulse Out burst on a stepper's STEP line.
+        Arm a fixed-count Pulse Out burst (open-loop) on one STEP line.
 
-        Open-loop and fire-and-forget (T7's pulse engine emits the whole
-        burst in hardware).
-
-        Touches only this actuator's own EF registers. The shared CLOCK0 is
-        owned by _configure_steppers() and must not be disturbed here, or a
-        burst already running on the other STEP line would be cut short.
+        Leaves CLOCK0 alone so the other stepper's burst isn't cut short.
         """
         steps = spec.steps_open if state == 1 else spec.steps_close
         roll  = self._pulse_roll
 
-        # DIR first so the line is settled b/f the first STEP edge.
+        # DIR first, so it's settled before the first STEP edge.
         ljm.eWriteName(self._handle, spec.dir_dio, 1 if state == 1 else 0)
-        ljm.eWriteName(self._handle, spec.ena_dio, 0)   # active-low enable
+        if spec.ena_dio is not None:
+            ljm.eWriteName(self._handle, spec.ena_dio, 0)   # active-low enable
 
         step_dio = spec.step_dio
         ljm.eWriteName(self._handle, f"{step_dio}_EF_ENABLE",   0)
@@ -621,14 +506,10 @@ class LabJackT7:
 
     def _build_scan_list(self) -> None:
         """
-        Build the ordered address list passed to eStreamStart.
+        Build the eStreamStart address list.
 
-        Only the positive channel of each TC pair goes into the stream.
-        The negative channel is configured via NEGATIVE_CH register,
-        not as a separate scan slot.
-
-        CJC (AIN58) and the photogate counters are intentionally excluded;
-        both are polled out-of-band.
+        A TC streams its positive AIN only (NEGATIVE_CH sets the pair). The
+        CJC and counters are polled instead; TEMPERATURE_DEVICE_K can't stream.
         """
         names: list[str] = []
         tags:  list[str] = []
@@ -637,23 +518,12 @@ class LabJackT7:
             tags.append(spec.id)
             names.append(spec.ain_pos if spec.type == TC_DIFFERENTIAL else spec.ain)
 
-        addrs = [0] * len(names)
-        types = [0] * len(names)
-        for i, name in enumerate(names):
-            info      = ljm.nameToAddress(name)
-            addrs[i]  = info[0]
-            types[i]  = info[1]
-
         self._scan_tags   = tags
-        self._scan_addrs  = addrs
-        self._scan_types  = types
+        self._scan_addrs  = [ljm.nameToAddress(name)[0] for name in names]
         self._n_channels  = len(names)
 
     def _safe_all_hardware(self) -> None:
-        """
-        Forces every solenoid DIO line high (safe/de-energized state) and
-        cancels any in-flight stepper burst.
-        """
+        """Drive every binary_dio line high (de-energised) and stop stepper bursts."""
         if self._handle is None:
             return
         for spec in self._actuator_specs.values():
@@ -662,16 +532,13 @@ class LabJackT7:
                     ljm.eWriteName(self._handle, spec.dio, 1)   # active-low: 1 = safe
                 elif spec.type == PULSE_STEPPER and spec.is_wired:
                     ljm.eWriteName(self._handle, f"{spec.step_dio}_EF_ENABLE", 0)
-                    ljm.eWriteName(self._handle, spec.ena_dio, 1)   # de-assert enable
+                    if spec.ena_dio is not None:
+                        ljm.eWriteName(self._handle, spec.ena_dio, 1)   # de-assert enable
             except ljm.LJMError:
                 pass
 
     def _arm_watchdog(self) -> None:
-        """
-        Arms the T7 hardware watchdog to safe outputs on host crash.
-
-        The covered mask holds binary_dio lines only.
-        """
+        """Arm the watchdog to drive the binary_dio lines high on comms loss."""
         h = self._handle
         if self._actuator_mask == 0:
             print("[T7] WARNING: no binary_dio actuator pins assigned - "
@@ -682,12 +549,12 @@ class LabJackT7:
         ljm.eWriteName(h, "WATCHDOG_TIMEOUT_S_DEFAULT",     _WATCHDOG_TIMEOUT_S)
         ljm.eWriteName(h, "WATCHDOG_DIO_ENABLE_DEFAULT",    1)
 
-        # Bits not in actuator mask are inhibited (ignored by watchdog)
+        # Inhibit every line outside the mask.
         inhibit = (~self._actuator_mask) & 0xFFFFFFFF
         ljm.eWriteName(h, "WATCHDOG_DIO_INHIBIT_DEFAULT",   inhibit)
         ljm.eWriteName(h, "WATCHDOG_DIO_DIRECTION_DEFAULT", self._actuator_mask)
         ljm.eWriteName(h, "WATCHDOG_DIO_STATE_DEFAULT",     self._actuator_mask)
         ljm.eWriteName(h, "WATCHDOG_ENABLE_DEFAULT",        1)
         print(f"[T7] Watchdog armed: {_WATCHDOG_TIMEOUT_S} s timeout, "
-              f"solenoids -> safe on comms loss "
-              f"(stepper lines excluded by design)")
+              f"valves and igniter -> safe on comms loss "
+              f"(stepper lines excluded)")

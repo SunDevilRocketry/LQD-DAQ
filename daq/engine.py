@@ -1,26 +1,9 @@
 """
 daq/engine.py
 
-500 Hz background acquisition engine for the Liquids DAQ system.
-
-Responsibilities:
-  - Drives the hardware stream loop in a daemon thread.
-  - Applies real-time calibration and calculations per scan.
-  - Publishes atomic snapshots (no partial reads) of latest values.
-  - Executes fire and abort autosequences on a dedicated thread.
-  - Controls CSV logging lifecycle.
-  - Exposes thread-safe data to the API and GUI.
-
-Design constraints (from SR 3.4.1):
-  - File I/O is decoupled from the stream thread to prevent buffer overflows.
-  - Every 500 Hz scan is logged; consumer threads poll snapshots at lower rates.
-  - Sequence timing uses perf_counter absolute baselines to prevent timing drift.
-
-Threading model:
-  - _stream_thread (Producer):     Acquires data and publishes EngineState snapshots.
-  - _sequence_thread:              Executes autosequence steps and hardware outputs.
-  - Main / API Thread (Consumer):  Reads the latest snapshot with minimal lock contention.
-  - self._lock:                    Protects all shared mutable state.
+Acquisition and sequencing engine. The stream thread calibrates each batch
+and swaps in a new snapshot; a sequence thread runs fire/abort; API threads
+read the snapshot. self._lock guards shared state.
 """
 
 from __future__ import annotations
@@ -52,8 +35,7 @@ from daq.manifest import (
     PULSE_STEPPER,
 )
 from daq.calculations import (
-    lm34_voltage_to_celsius,
-    software_seebeck_type_k,
+    thermocouple_type_t,
     psi_to_pa,
     pt_voltage_to_pa,
     load_cell_voltage_to_force,
@@ -64,55 +46,40 @@ from daq.calculations import (
 )
 
 
-# Manifests live at the repo root next to config.yaml. Resolved off this
-# file so the defaults hold regardless of the process working directory.
+# Repo-root manifests, resolved off this file so the cwd doesn't matter.
 _PKG_DIR  = os.path.dirname(os.path.abspath(__file__))
 _REPO_DIR = os.path.dirname(_PKG_DIR)
 
 DEFAULT_CHANNELS_PATH  = os.path.join(_REPO_DIR, "channels.yaml")
 DEFAULT_ACTUATORS_PATH = os.path.join(_REPO_DIR, "actuators.yaml")
 
-# Fallback calibrations by channel type, applied to every channel of that
-# type that calibration.json doesn't override. Slope/intercept stay in the
-# psi calibration domain for PTs (psi/V, psi), lbf for load cells.
-#
-#   pt_direct - Omega PX309-2KG5V nominal transfer function: 0-2000 psig
-#               over a 0-5 V output => 400 psi/V, 0 psi offset. Nominal
-#               datasheet values.
-#   lc_direct - placeholder. The PUSHTON S1 bridge is conditioned by an
-#               external amplifier whose gain isn't recorded yet, so this
-#               slope is a stand-in until the module is identified.
+# Nominal fallbacks where calibration.json has no entry (psi/V, lbf/V).
+# The dPT slope is UNVERIFIED.
 _DEFAULT_CAL_BY_TYPE: dict[str, dict[str, float]] = {
     PT_DIRECT: {"slope": 400.0, "intercept": 0.0},
     PT_DIFFERENTIAL: {"slope": 5.80151, "intercept": 0.0},
     LC_DIRECT: {"slope": 440.92, "intercept": 0.0},
 }
 
-# Cold Junction Compensation (CJC) sensor polling interval in seconds.
-# Photogate counters are polled on the same out-of-band tick.
+# CJC + counter poll. Also the watchdog keep-alive (stream data doesn't
+# reset it): stop it and the T7 safes every output after 5 s.
 _CJC_INTERVAL_S = 0.5
 
-# LJM's missing-sample sentinel inside a stream batch.
+# LJM's missing-sample sentinel.
 _MISSING_SAMPLE = -9999.0
 
-# During a comms outage no batch is processed, so state pushes come from
-# the error path instead. The first failure fires immediately; subsequent
-# ones are rate-limited to this interval.
+# State pushes during an outage: first failure at once, then this often.
 _ERROR_NOTIFY_INTERVAL_S = 0.5
 
-# FC.NLFS.LQDDAQ.1: data older than this is considered stale and should
-# not be presented to an operator/dashboard as current.
+# FC.NLFS.LQDDAQ.1: older data is stale, not live.
 _DATA_STALE_THRESHOLD_S = 1.0
 
-# Reconnection tuning (FC.NLFS.LJ.2 / FC.NLFS.LQDDAQ.1 mitigation): after this
-# many consecutive stream_read() failures, assume the connection itself is
-# gone and attempt a full close/open/restart cycle.
+# FC.NLFS.LJ.2: this many failed reads in a row -> full reconnect.
 _MAX_CONSECUTIVE_READ_ERRORS = 3
-_RECONNECT_BACKOFF_S         = 1.0    # multiplied by attempt number, capped below
+_RECONNECT_BACKOFF_S         = 1.0    # x attempt number, capped
 _RECONNECT_BACKOFF_CAP_S     = 10.0
 
-# Fire-sequence lifecycle, reported alongside sequence_active/name/step so a
-# dashboard can tell *why* active is false.
+# Fire lifecycle, so a dashboard can tell why sequence_active is false.
 FIRE_IDLE      = "idle"
 FIRE_RUNNING   = "running"
 FIRE_PAUSED    = "paused"
@@ -122,25 +89,14 @@ FIRE_ABORTED   = "aborted"
 
 class EngineState:
     """
-    Read-only snapshot of calculated sensor data and system states.
-
-    Split into two halves:
-
-      Structural fields  - fixed for every cart, kept as named __slots__.
-      Channel-set fields - whatever channels.yaml declares, carried in the
-                           `channels` dict as ChannelReading objects.
-
-    The channel set is manifest-driven precisely so this class does *not*
-    have to be edited when the cart's sensor inventory changes.
-
-    Instance fields are restricted using __slots__ to prevent dynamic
-    attribute assignment.
+    One published snapshot. Fixed fields are slots; per-channel readings
+    live in `channels`, so a manifest change needs no edit here.
     """
     __slots__ = (
         "timestamp",
         # Manifest-driven readings
         "channels",     # dict[str, ChannelReading]
-        "derived",      # dict[str, float | None] - computed, not measured
+        "derived",      # dict[str, float | None], calculated
         "actuators",    # dict[str, ActuatorReading]
         # Hardware & loop state
         "streaming", "sequence_active", "sequence_name", "sequence_step",
@@ -161,24 +117,28 @@ class EngineState:
         object.__setattr__(self, "using_mock", USING_MOCK)
 
 
-class SequenceRefused(RuntimeError):
+def _parse_action(raw) -> tuple[float, str, int]:
     """
-    A sequence cannot run, determined before it starts.
+    One sequence action, [elapsed_s, actuator_id, state].
 
-    Raised on the caller's thread - by _validate_sequence(), so a caller
-    (e.g. POST /fire) can report the failure when sequence moves nothing.
+    Raises:
+        ValueError: If it isn't a 3-item list or state isn't 0 or 1.
     """
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        raise ValueError(f"action {raw!r} is not [elapsed_s, actuator, state]")
+    elapsed, name, state = raw
+    if isinstance(state, bool) or state not in (0, 1):
+        raise ValueError(f"action {raw!r}: state must be 0 or 1")
+    return float(elapsed), str(name), int(state)
+
+
+class SequenceRefused(RuntimeError):
+    """A sequence can't run; raised on the caller's thread before it starts."""
 
 
 @dataclass(frozen=True)
 class FireStep:
-    """
-    One named phase of sequences/fire.yaml.
-
-    start_t is the phase's earliest action time - what /sequence/step jumps
-    to. actions keeps every original (elapsed_s, actuator, state) triple
-    from the phase, unmerged, for GET /sequence's dump.
-    """
+    """One named phase of fire.yaml; start_t (earliest action) is the jump target."""
     name:    str
     start_t: float
     actions: tuple[tuple[float, str, int], ...]
@@ -186,27 +146,17 @@ class FireStep:
 
 class Engine:
     """
-    Central acquisition and control engine.
-
-    Instantiate once, call start(), then read .snapshot from any thread.
+    Acquisition and control engine. Create once, start(), read .snapshot.
 
     Args:
-        channels_path:  Path to channels.yaml (the cart's sensor manifest).
-        actuators_path: Path to actuators.yaml (the cart's actuator manifest).
-        cal_path:      Path to calibration.json (optional).
-                       Also used by save_calibration() to persist runtime changes.
-        sequence_dir:  Directory containing fire.yaml / abort.yaml.
-        logger:        A daq.logger.Logger instance (optional).
-                       If None, no CSV logging occurs.
-                       The caller is responsible for logger.open() / logger.close();
-                       the engine only calls start_recording() / stop_recording().
-        thresholds:    Warning and abort thresholds dictionary (optional).
-        derived:       config.yaml's `derived` block - orifice geometry and
-                       the channel ids feeding mass flow (optional).
+        cal_path:     calibration.json; save_calibration() writes it back.
+        sequence_dir: holds fire.yaml / abort.yaml.
+        logger:       optional; the caller opens/closes it, the engine only
+                      starts/stops recordings.
+        thresholds:   config.yaml display bands (nothing acts on them).
+        derived:      config.yaml `derived` block (mass-flow inputs).
     """
 
-    # Public alias so callers can reference the threshold
-    # w/o reaching into the private module-level constant.
     DATA_STALE_THRESHOLD_S = _DATA_STALE_THRESHOLD_S
 
     def __init__(
@@ -220,11 +170,9 @@ class Engine:
         actuators_path: str = DEFAULT_ACTUATORS_PATH,
     ) -> None:
         self._lock = threading.RLock()
-        self._event_log: deque[str] = deque(maxlen=500)  # Rolling debug log console (SR 3.5)
+        self._event_log: deque[str] = deque(maxlen=500)  # SR 3.5
         self._snapshot = EngineState()
 
-        # Cart inventory - everything downstream iterates these instead of
-        # a literal tag tuple.
         self._channels:  list[ChannelSpec]  = load_channels(channels_path)
         self._actuators: list[ActuatorSpec] = load_actuators(actuators_path)
 
@@ -234,55 +182,45 @@ class Engine:
         self._thresholds    = self._convert_thresholds_to_pa(thresholds or {})
         self._derived_cfg   = derived or {}
 
-        # Calibration state (re-loaded from disk if path exists)
         self._cal_path = cal_path
         self._cal = self._default_calibration()
         if cal_path and os.path.exists(cal_path):
             self._load_calibration(cal_path)
 
-        # Tare offsets, keyed by load cell channel id (set by caller via tare())
+        # lbf, by load cell id.
         self._lc_tare: dict[str, float] = {
             spec.id: 0.0 for spec in self._channels if spec.type == LC_DIRECT
         }
 
-        # CJC polling state (thermocouple cold junction reference)
-        self._cjc_celsius: float = 25.0
+        # None until a good read and after a failed one, so TCs report nothing.
+        self._cjc_celsius: Optional[float] = None
         self._last_cjc_read: float = 0.0
+        self._cjc_failing: bool = False
+        self._counters_failing: bool = False
 
-        # Latest out-of-band photogate counter values, keyed by channel id.
         self._counters: dict[str, float] = {}
 
-        # Monotonic timestamp of the last successfully processed batch.
         self._last_batch_perf_time: float = 0.0
 
-        # Autosequence thread handles & event flags
         self._sequence_thread:   Optional[threading.Thread] = None
         self._abort_flag         = threading.Event()
         self._sequence_active    = False
         self._sequence_name      = ""
         self._sequence_t0:       Optional[float] = None
 
-        # Fire-only pause/seek state. abort.yaml doesn't touch.
+        # Fire-only pause/seek state.
         self._pause_flag         = threading.Event()
         self._fire_position_s:   float = 0.0
         self._fire_next_idx:     int = 0
         self._fire_steps:        Optional[list[FireStep]] = None
-        # Live fire UI clock anchor (distinct from internal _sequence_t0).
-        # Kept after completion so the clock keeps running; cleared on pause/abort to freeze.
+        # Fire clock anchor: kept after completion (clock runs), cleared to freeze.
         self._fire_t0:           Optional[float] = None
-        # True after an abort preempts a fire; cleared only by fire(). While
-        # set, start_sequence() refuses to resume.
+        # Set by abort(), cleared by fire(); blocks start_sequence() resumes.
         self._fire_invalidated:  bool = False
-        # Reported lifecycle state for the fire sequence specifically.
-        # Transitions: _start_sequence() -> RUNNING,
-        # _run_sequence()'s pause/abort branches -> PAUSED/ABORTED,
-        # _sequence_completed() -> COMPLETED.
         self._fire_state:        str = FIRE_IDLE
 
-        # Optional callback fired whenever there is new state worth pushing.
         self._state_listener = None
 
-        # Hardware streaming thread state
         self._stream_thread: Optional[threading.Thread] = None
         self._running = False
 
@@ -291,7 +229,7 @@ class Engine:
     # --------------------------------------------------------
 
     def start(self) -> None:
-        """Connects to hardware and starts the acquisition loop on a daemon thread."""
+        """Open the device and start the stream thread."""
         self._log(f"Engine starting (mock={USING_MOCK})")
         self._device.open()
         self._running = True
@@ -303,7 +241,7 @@ class Engine:
         self._stream_thread.start()
 
     def stop(self) -> None:
-        """Stops background acquisition and disconnects hardware safely."""
+        """Abort, stop the stream thread, and close the device (which safes it)."""
         self._log("Engine stopping")
         self._running = False
         self.abort()
@@ -321,38 +259,31 @@ class Engine:
 
     @property
     def snapshot(self) -> EngineState:
-        """Returns the latest thread-safe sensor snapshot."""
+        """Latest snapshot (replaced whole, never mutated after publish)."""
         with self._lock:
             return self._snapshot
 
     @property
     def event_log(self) -> list[str]:
-        """Returns a copy of the rolling debug event log."""
+        """Copy of the event log."""
         with self._lock:
             return list(self._event_log)
 
     @property
     def thresholds(self) -> dict:
-        """Returns configured safety thresholds."""
+        """Threshold bands in Pa / C / lbf (display only)."""
         with self._lock:
             return dict(self._thresholds)
 
     def set_state_listener(self, listener) -> None:
         """
-        Registers a callback fired whenever there is new state worth pushing.
-
-        Called w/ no arguments from the stream thread, both after a batch
-        is processed and on an error tick where no batch arrived. The
-        listener is responsible for reading the snapshot itself and for
-        being quick and non-blocking - it runs on the acquisition thread.
-        Pass None to detach.
+        Set a no-arg callback run on the stream thread after each batch and
+        error tick. It must be quick; None detaches.
         """
         self._state_listener = listener
 
     def _notify_state(self) -> None:
-        """
-        Fires the state listener, swallowing anything it raises.
-        """
+        """Run the listener; log and swallow its errors."""
         listener = self._state_listener
         if listener is None:
             return
@@ -369,37 +300,26 @@ class Engine:
         return None if t0 is None else time.perf_counter() - t0
 
     def set_logger(self, logger) -> None:
-        """
-        Attaches a CSV logger after construction.
-
-        The logger's column set is built from this engine's channel
-        manifest, so it can't be constructed until the engine has parsed
-        channels.yaml - hence the post-construction hand-off.
-        """
+        """Attach the logger (it needs channel_specs, so it's built after us)."""
         self._logger = logger
 
     @property
     def channel_specs(self) -> list[ChannelSpec]:
-        """The cart's channel manifest, as loaded from channels.yaml."""
+        """Channel manifest (channels.yaml)."""
         return list(self._channels)
 
     @property
     def actuator_specs(self) -> list[ActuatorSpec]:
-        """The cart's actuator manifest, as loaded from actuators.yaml."""
+        """Actuator manifest (actuators.yaml)."""
         return list(self._actuators)
 
     @property
     def unwired_actuators(self) -> list[str]:
-        """
-        Ids of actuators the manifest declares but names no pins for.
-
-        These exist in the inventory and are reported in every snapshot,
-        but cannot be driven: LabJackT7.write_actuator() raises on them.
-        """
+        """Ids of actuators with missing pins or step settings; they can't be driven."""
         return [spec.id for spec in self._actuators if not spec.is_wired]
 
     def _default_calibration(self) -> dict[str, dict[str, float]]:
-        """Builds the per-channel fallback calibration table from the manifest."""
+        """Per-channel calibration from the type defaults."""
         return {
             spec.cal_ref or spec.id: dict(_DEFAULT_CAL_BY_TYPE[spec.type])
             for spec in self._channels
@@ -407,12 +327,7 @@ class Engine:
         }
 
     def _convert_thresholds_to_pa(self, raw: dict) -> dict:
-        """
-        Converts psi-authored pressure threshold bounds to Pa.
-
-        Which tags count as pressures comes from the manifest (every
-        pt_direct channel).
-        """
+        """Convert psi bands to Pa for pressure channels (PRESSURE_TYPES)."""
         pressure_ids = {
             spec.id for spec in self._channels
             if spec.type in PRESSURE_TYPES
@@ -430,14 +345,9 @@ class Engine:
 
     def _compute_derived(self, latest: dict) -> dict:
         """
-        Injector mass flows (kg/s) and mixture ratio, from this batch.
+        Injector mass flows (kg/s) and O/F from this batch's values.
 
-        Every input is named in config.yaml's `derived` block.
-
-        Any missing channel, inactive channel, absent geometry, or
-        non-positive dP yields None for that output.
-
-        Units are SI on the wire, matching the Pa used for pressures.
+        Any missing input or non-positive dP gives None for that output.
         """
         def _mdot(side: str):
             cfg = self._derived_cfg.get(side) or {}
@@ -467,25 +377,9 @@ class Engine:
 
     def _channel_status(self, tag: str, value: Optional[float]) -> Optional[str]:
         """
-        Classify a reading against its config.yaml threshold bands.
-
-        Returns:
-            NOMINAL    - inside the normal band
-            CAUTION    - outside normal but inside warning
-            WARNING    - outside warning
-            UNCONFIGURED - the channel has no threshold bands configured
-            None       - bands exist but there is no reading to classify
-
-        Status is reported. WARNING does not trigger an action.
-
-        All four are Dashboard's enum (readingStatus.ts) verbatim.
-
-        UNCONFIGURED is checked first b/c it describes
-        the *config* rather than the reading: A channel w/o set bounds is 
-        an open gap to be flagged.
-
-        None survives only for the narrow case of a monitored channel with
-        no data this batch.
+        NOMINAL (in normal), CAUTION (in warning), WARNING (outside),
+        UNCONFIGURED (no bands), or None (bands, no value). Display only;
+        the strings match Dashboard's readingStatus.ts.
         """
         bands = self._thresholds.get(tag)
         if not isinstance(bands, dict):
@@ -504,12 +398,7 @@ class Engine:
 
     @property
     def data_age_seconds(self) -> float:
-        """
-        Seconds since the last successfully processed stream batch.
-
-        Returns float("inf") if no batch has ever been processed. Snaps back 
-	near-zero when fresh batch is processed.
-        """
+        """Seconds since the last processed batch; inf if none yet."""
         with self._lock:
             last = self._last_batch_perf_time
         if last == 0.0:
@@ -518,16 +407,12 @@ class Engine:
 
     @property
     def is_data_stale(self) -> bool:
-        """True if the most recent snapshot is older than the FC.NLFS.LQDDAQ.1 threshold."""
+        """True if the snapshot is older than _DATA_STALE_THRESHOLD_S."""
         return self.data_age_seconds > _DATA_STALE_THRESHOLD_S
 
     def write_actuator(self, name: str, state: int) -> None:
         """
-        Commands an individual actuator if no autosequence is active.
-        
-        Args:
-            name:  Actuator name.
-            state: 1 = open, 0 = safe/closed.
+        Manual command: 1 = energise, 0 = de-energise. Refused mid-sequence.
 
         Raises:
             RuntimeError: If a sequence is currently active, or if the
@@ -560,20 +445,24 @@ class Engine:
             self._log(f"Manual: {name} -> {'OPEN' if state else 'CLOSED'}")
 
     def _is_stepper(self, name: str) -> bool:
-        """True if `name` is a pulse_stepper in this cart's manifest."""
+        """True if `name` is a pulse_stepper."""
         return any(
             spec.id == name and spec.type == PULSE_STEPPER
             for spec in self._actuators
         )
 
     def all_safe(self) -> None:
-        """De-energizes all hardware outputs immediately."""
+        """
+        abort(), then de-energise everything.
+
+        Once abort.yaml is runnable, its purges re-energise after this.
+        """
         self.abort()
         self._device.all_safe()
         self._log("ALL SAFE commanded")
 
     def tare(self) -> None:
-        """Tares the load cells using the latest baseline sensor readings."""
+        """Tare the load cells on the latest snapshot value (one sample)."""
         with self._lock:
             channels = self._snapshot.channels or {}
             for tag in self._lc_tare:
@@ -584,20 +473,12 @@ class Engine:
 
     def fire(self) -> None:
         """
-        Spawns the fire autosequence thread if the system is idle.
-
-        Always starts from the top (T=0), unlike start_sequence() which
-        resumes wherever a prior /sequence/stop left the position. This is
-        the "real" hotfire trigger - callers use start_sequence() only for
-        the rehearsal/resume flow behind POST /sequence/start.
+        Start fire.yaml from T=0 (start_sequence() resumes instead).
 
         Raises:
-            SequenceRefused: If fire.yaml cannot be loaded, or commands an
-                             actuator this cart cannot drive. Raised before
-                             anything starts.
+            SequenceRefused: fire.yaml can't be loaded or driven.
         """
-        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        steps, post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        steps, post_s, fire_steps = self._validate_fire()
         with self._lock:
             self._fire_steps      = fire_steps
             self._fire_position_s = 0.0
@@ -608,21 +489,15 @@ class Engine:
 
     def dump_fire_sequence(self) -> list[dict]:
         """
-        Named-phase dump of sequences/fire.yaml, for GET /sequence.
-
-        Read-only, so unwired actuators don't block it (fire() still
-        refuses them; /status lists them under unwired_actuators).
+        fire.yaml's phases for GET /sequence; unwired actuators don't block it.
 
         Raises:
-            SequenceRefused: If the file cannot be parsed.
+            SequenceRefused: If the file can't be parsed.
         """
         seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        try:
-            _steps, _post_s, fire_steps = self._load_fire_sequence(seq_path)
-        except Exception as exc:
-            raise SequenceRefused(
-                f"Sequence 'fire' could not be loaded: {exc}"
-            ) from exc
+        _steps, _post_s, fire_steps = self._load_or_refuse(
+            "fire", seq_path, self._load_fire_sequence
+        )
         return [
             {
                 "name":     step.name,
@@ -634,16 +509,9 @@ class Engine:
 
     def sequence_status(self) -> dict:
         """
-        Current fire-sequence position: step name, backend UTC time (ms),
-        and sequence-relative time (ms). Shared return shape for every
-        /sequence/* control endpoint s.t. dashboard can compute latency
-        and offset its own countdown display.
-
-        Keeps counting past the last action after natural completion
-        (_fire_t0 stays set); freezes on pause or abort (_fire_t0 nulled).
-
-        `state` is the fire lifecycle (FIRE_* - idle/running/paused/
-        completed/aborted).
+        Fire position for every /sequence/* response: step, state, server
+        epoch ms and sequence ms. The clock runs on after completion and
+        freezes on pause or abort.
         """
         with self._lock:
             if self._fire_t0 is not None:
@@ -662,13 +530,7 @@ class Engine:
 
     def start_sequence(self) -> dict:
         """
-        Resumes forward execution of the fire sequence from wherever the
-        position pointer currently sits (0.0 if untouched since the last
-        completion/abort, or wherever /sequence/stop or a prior
-        /sequence/time / /sequence/step made while stopped left it).
-
-        From that position onward this behaves exactly like fire() except
-        not resetting to position 0 first.
+        Resume fire.yaml from the current position (like fire(), no reset).
 
         Raises:
             SequenceRefused: fire.yaml can't be loaded or driven.
@@ -680,8 +542,7 @@ class Engine:
                 raise RuntimeError(
                     "Sequence was aborted - use /fire to restart from the top"
                 )
-        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        steps, post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        steps, post_s, fire_steps = self._validate_fire()
         with self._lock:
             self._fire_steps = fire_steps
             start_idx        = self._fire_next_idx
@@ -696,10 +557,7 @@ class Engine:
 
     def stop_sequence(self) -> dict:
         """
-        Pauses the fire sequence in place: no abort.yaml, no all_safe(),
-        no interruption to an in-progress CSV recording. Position freezes
-        exactly where the last applied action left it, ready to resume
-        from start_sequence().
+        Pause fire in place: outputs and recording untouched.
 
         Raises:
             RuntimeError: no fire sequence is currently active.
@@ -716,16 +574,8 @@ class Engine:
 
     def set_sequence_time(self, seconds: float) -> dict:
         """
-        Repositions the fire-sequence clock.
-
-        While stopped: display/rehearsal only - repositions the pointer
-        w/o writing to any actuator. Only the forward tick after
-        start_sequence() drives real hardware, from this new position on.
-
-        While running: forward-only. Instantly fires every actuator action
-        between the current position and the target (no waiting for the
-        real-time tick), then keeps ticking forward live from there. 
-        Backward is refused given "unfiring" is unsafe.
+        Move the fire clock. Stopped: pointer only, no hardware writes.
+        Running: forward only; skipped actions fire at once, then it ticks on.
 
         Raises:
             SequenceRefused: fire.yaml can't be loaded or driven.
@@ -738,8 +588,7 @@ class Engine:
         if active:
             return self._jump_while_active(seconds)
 
-        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        steps, _post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        steps, _post_s, fire_steps = self._validate_fire()
         with self._lock:
             self._fire_steps      = fire_steps
             self._fire_position_s = seconds
@@ -748,13 +597,8 @@ class Engine:
 
     def _jump_while_active(self, target_seconds: float) -> dict:
         """
-        Forward-jump a running fire sequence: pauses the live thread,
-        fires every skipped actuator action immediately, then resumes
-        ticking live from the new position.
-
-        Once the thread has actually exited,
-        _fire_next_idx/_fire_position_s are a consistent snapshot of
-        what's been applied, safe to read and advance from this thread.
+        Pause, fire the skipped actions, resume. The position fields are only
+        safe to advance here once the old thread has exited.
 
         Raises:
             RuntimeError: target_seconds is behind the current live
@@ -776,8 +620,7 @@ class Engine:
             thread.join(timeout=2.0)
         self._pause_flag.clear()
 
-        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        steps, post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        steps, post_s, fire_steps = self._validate_fire()
         with self._lock:
             self._fire_steps = fire_steps
             idx = self._fire_next_idx
@@ -807,8 +650,7 @@ class Engine:
 
     def jump_to_step(self, step_name: str) -> dict:
         """
-        Jump to a named step's start time (display/rehearsal only - see
-        set_sequence_time()).
+        set_sequence_time() to a named step's start.
 
         Raises:
             SequenceRefused: fire.yaml can't be loaded or driven.
@@ -816,8 +658,7 @@ class Engine:
                           first.
             KeyError: step_name doesn't match any step in fire.yaml.
         """
-        seq_path = os.path.join(self._sequence_dir, "fire.yaml")
-        _steps, _post_s, fire_steps = self._validate_fire_sequence("fire", seq_path)
+        _steps, _post_s, fire_steps = self._validate_fire()
         match = next((s for s in fire_steps if s.name == step_name), None)
         if match is None:
             raise KeyError(step_name)
@@ -827,8 +668,7 @@ class Engine:
     def _step_name_for_position(
         fire_steps: list[FireStep], elapsed: float
     ) -> Optional[str]:
-        """Name of the last phase whose start_t <= elapsed; None before the
-        first phase's start time (never-started / position 0)."""
+        """Last phase with start_t <= elapsed, or None before the first."""
         name = None
         for step in fire_steps:
             if step.start_t <= elapsed:
@@ -838,7 +678,7 @@ class Engine:
         return name
 
     def _current_fire_step_name(self) -> Optional[str]:
-        """sequence_step for the live snapshot - see EngineState."""
+        """Current fire step name; caller holds self._lock."""
         if self._fire_steps is None:
             return None
         if self._fire_t0 is not None:
@@ -849,26 +689,18 @@ class Engine:
 
     def abort(self) -> None:
         """
-        Terminates any active sequence and runs the abort sequence.
-
-        Guarantees that the abort thread is spawned safely w/o
-        double-activation conflicts.
-
-        Always invalidates the fire position - start_sequence() refuses to
-        resume from it afterward, whether or not a fire was actually
-        running when this was called. Only fire() clears the invalidation.
+        Stop any sequence, then run abort.yaml, or de-energise everything if
+        it's missing or refused. Never raises. Blocks fire resumes until
+        the next fire(). A second abort starts a second thread.
         """
         with self._lock:
             self._fire_invalidated = True
         self._abort_flag.set()
 
-        # Wait for the running sequence thread to notice the flag and exit.
         old_thread = self._sequence_thread
         if old_thread and old_thread.is_alive():
             old_thread.join(timeout=0.5)
             if old_thread.is_alive():
-                # It didn't exit in time (don't clear flag yet)
-		# Give it a bit longer.
                 self._log(
                     f"WARNING: '{old_thread.name}' did not exit within 0.5s "
                     f"of abort - waiting longer before starting abort.yaml"
@@ -888,14 +720,11 @@ class Engine:
             try:
                 steps, post_s = self._validate_sequence("abort", seq_path)
             except SequenceRefused as exc:
-                # An ordered closure is off the table, but abort must still
-                # leave the hardware safe - never propagate out of abort().
                 self._log(str(exc))
                 self._device.all_safe()
                 self._log("ABORT: refused sequence, hardware -> all safe")
                 return
-            # force=True: abort must always be able to preempt, even if the
-            # previous sequence thread is (unexpectedly) still marked alive.
+            # force: abort preempts even a thread that's still alive.
             self._start_sequence(
                 "abort", steps, post_s, is_fire=False, force=True
             )
@@ -904,21 +733,14 @@ class Engine:
             self._log("ABORT: no abort.yaml found, hardware -> all safe")
 
     def update_calibration(self, tag: str, slope: float, intercept: float) -> None:
-        """
-        Update a sensor calibration coefficient at runtime.
-
-        Args:
-            tag:       Calibration reference tag (e.g. "pt0", "lc0").
-            slope:     New slope in engineering-units per volt.
-            intercept: New intercept in engineering units.
-        """
+        """Set a channel's slope/intercept in memory (psi or lbf domain)."""
         with self._lock:
             self._cal[tag] = {"slope": slope, "intercept": intercept}
         self._log(f"Cal updated: {tag} slope={slope} intercept={intercept}")
 
     def save_calibration(self) -> None:
         """
-        Saves current in-memory calibrations to calibration.json.
+        Write calibrations to calibration.json, dropping keys it doesn't know.
 
         Raises:
             AttributeError: If no cal_path was provided at construction time.
@@ -959,15 +781,7 @@ class Engine:
     # --------------------------------------------------------
 
     def _stream_loop(self) -> None:
-        """
-        Main acquisition loop.
-
-        1. Starts the hardware stream.
-        2. Reads streaming data in batches.
-        3. Calibrates and processes each batch.
-        4. Atomically updates the state snapshot.
-        5. Writes raw and calibrated data rows to the logger.
-        """
+        """Read, poll, process; reconnect after repeated read failures."""
         try:
             actual_hz = self._device.start_stream()
             self._log(f"Stream running at {actual_hz} Hz")
@@ -993,8 +807,7 @@ class Engine:
                     with self._lock:
                         object.__setattr__(self._snapshot, "streaming", False)
 
-                    # The moment comms drop is the one moment no batch gets
-                    # processed. Push the first failure immediately then throttle.
+                    # No batch to push now, so push the failure.
                     now_err = time.perf_counter()
                     if (consecutive_errors == 1
                             or now_err - last_error_notify >= _ERROR_NOTIFY_INTERVAL_S):
@@ -1009,19 +822,9 @@ class Engine:
                         time.sleep(0.1)
                     continue
 
-                # Periodically poll the out-of-band channels (CJC reference
-                # and photogate counters) outside the hardware stream.
                 now = time.perf_counter()
                 if now - self._last_cjc_read >= _CJC_INTERVAL_S:
-                    try:
-                        cjc_v = self._device.read_cjc()
-                        self._cjc_celsius = lm34_voltage_to_celsius(cjc_v)
-                    except Exception:
-                        pass
-                    try:
-                        self._counters = dict(self._device.read_counters())
-                    except Exception:
-                        pass
+                    self._poll_out_of_band()
                     self._last_cjc_read = now
 
                 try:
@@ -1044,23 +847,16 @@ class Engine:
                 object.__setattr__(self._snapshot, "streaming", False)
 
     def _sleep_interruptible(self, duration: float) -> None:
-        """
-        Sleep in small increments, rechecking self._running throughout,
-        so a stop() request is noticed promptly instead of being blocked 
-        behind a single long time.sleep() call.
-        """
+        """Sleep in 0.1 s steps so stop() is noticed."""
         deadline = time.perf_counter() + duration
         while self._running and time.perf_counter() < deadline:
             time.sleep(min(0.1, deadline - time.perf_counter()))
 
     def _reconnect_device(self) -> None:
         """
-        Attempts to fully re-establish the hardware connection after repeated
-        stream_read() failures.
+        close/open/restart with backoff until it works or stop() is called.
 
-        Loops with linear backoff (capped) until self._running goes False or
-        a reconnect attempt succeeds. The job is only to get software back 
-        in sync once comms return.
+        close() safes the hardware but cached actuator states stay.
         """
         self._log("Device connection lost - attempting to reconnect...")
         attempt = 0
@@ -1079,7 +875,7 @@ class Engine:
                 backoff = min(_RECONNECT_BACKOFF_S * attempt, _RECONNECT_BACKOFF_CAP_S)
                 self._sleep_interruptible(backoff)
                 if not self._running:
-                    break   # stop() was called mid-backoff - don't touch the device again
+                    break   # stop() during backoff
 
                 self._device.open()
                 actual_hz = self._device.start_stream()
@@ -1100,21 +896,43 @@ class Engine:
         self._log("Reconnect loop exiting - engine is stopping")
 
     def _channel_calibration(self, spec: ChannelSpec) -> dict[str, float]:
-        """Calibration coefficients for one channel, falling back to its type default."""
+        """A channel's calibration, or its type default."""
         return self._cal.get(
             spec.cal_ref or spec.id,
             _DEFAULT_CAL_BY_TYPE.get(spec.type, {"slope": 1.0, "intercept": 0.0}),
         )
 
-    def _scale_channel(
-        self, spec: ChannelSpec, raw: list[float], cjc_c: float
-    ) -> list[Optional[float]]:
+    def _poll_out_of_band(self) -> None:
         """
-        Convert one channel's raw scan voltages to engineering units.
+        Read CJC and counters (the watchdog keep-alive). A failure clears the
+        value and logs once per outage.
+        """
+        try:
+            self._cjc_celsius = self._device.read_cjc_celsius()
+            if self._cjc_failing:
+                self._log("CJC read recovered")
+            self._cjc_failing = False
+        except Exception as exc:
+            self._cjc_celsius = None
+            if not self._cjc_failing:
+                self._log(f"CJC read FAILED, thermocouples report no value: {exc}")
+            self._cjc_failing = True
 
-        Dispatches on the manifest's channel type to the matching
-        calculations.py function.
-        """
+        try:
+            self._counters = dict(self._device.read_counters())
+            if self._counters_failing:
+                self._log("Photogate counter read recovered")
+            self._counters_failing = False
+        except Exception as exc:
+            self._counters = {}
+            if not self._counters_failing:
+                self._log(f"Photogate counter read FAILED: {exc}")
+            self._counters_failing = True
+
+    def _scale_channel(
+        self, spec: ChannelSpec, raw: list[float], cjc_c: Optional[float]
+    ) -> list[Optional[float]]:
+        """Raw volts to engineering units, by channel type."""
         c = self._channel_calibration(spec)
 
         if spec.type in PRESSURE_TYPES:
@@ -1134,8 +952,8 @@ class Engine:
 
         if spec.type == TC_DIFFERENTIAL:
             return [
-                None if v == _MISSING_SAMPLE
-                else software_seebeck_type_k(v, cjc_c)
+                None if v == _MISSING_SAMPLE or cjc_c is None
+                else thermocouple_type_t(v, cjc_c)
                 for v in raw
             ]
 
@@ -1143,12 +961,10 @@ class Engine:
 
     def _process_batch(self, batch: dict[str, list[float]]) -> None:
         """
-        Calibrates a raw data batch and atomically swaps in a new snapshot.
+        Calibrate a batch, publish a new snapshot, then queue CSV rows.
 
-        Iterates the channels.yaml manifest so the cart's sensor inventory 
-        is config. Channels the manifest marks inactive & channels the hardware
-        layer had no wired pin for simply carry no value. They stay in the 
-        reported channel set so a consumer's key set matches the manifest.
+        Every manifest channel is reported; inactive or unwired ones carry no
+        value, so the key set matches the manifest.
         """
         scan_times = batch.get("scan_times", [])
         n_scans    = len(scan_times)
@@ -1158,9 +974,9 @@ class Engine:
         cjc_c = self._cjc_celsius
         now_epoch = time.time()
 
-        # Per-scan engineering values, keyed by channel id (feeds the CSV).
+        # Per-scan values for the CSV.
         eng_rows: dict[str, list[Optional[float]]] = {}
-        # Snapshot value per channel - the batch's final scan, except TCs.
+        # Snapshot values: the last scan (TCs: batch average).
         latest: dict[str, Optional[float]] = {}
 
         for spec in self._channels:
@@ -1173,18 +989,15 @@ class Engine:
             eng_rows[spec.id] = self._scale_channel(spec, raw, cjc_c)
 
             if spec.type == TC_DIFFERENTIAL:
-                # Batch-average the raw voltages before conversion; the TC
-                # signal is small enough that per-scan noise dominates.
+                # Average first: per-scan noise dominates a mV signal.
                 valid = [v for v in raw if v != _MISSING_SAMPLE]
                 latest[spec.id] = (
-                    software_seebeck_type_k(sum(valid) / len(valid), cjc_c)
-                    if valid else None
+                    thermocouple_type_t(sum(valid) / len(valid), cjc_c)
+                    if valid and cjc_c is not None else None
                 )
             else:
                 latest[spec.id] = eng_rows[spec.id][-1]
 
-        # Photogate counters arrive from the out-of-band poll. Informational 
-        # telemetry only.
         for spec in self._channels:
             if spec.active and spec.type == PHOTOGATE_COUNTER:
                 latest[spec.id] = self._counters.get(spec.id)
@@ -1199,7 +1012,13 @@ class Engine:
             for spec in self._channels
         }
 
-        # Build and swap the new snapshot
+        # One locked read, so a frame can't mix before/after a transition.
+        with self._lock:
+            seq_active = self._sequence_active
+            seq_name   = self._sequence_name
+            seq_step   = self._current_fire_step_name()
+            seq_state  = self._fire_state
+
         new_snap = EngineState()
         object.__setattr__(new_snap, "timestamp",       scan_times[-1])
         object.__setattr__(new_snap, "streaming",       True)
@@ -1209,21 +1028,19 @@ class Engine:
         object.__setattr__(new_snap, "channels",        channels)
         object.__setattr__(new_snap, "derived",         self._compute_derived(latest))
         object.__setattr__(new_snap, "actuators",       dict(self._device.actuator_states()))
-        object.__setattr__(new_snap, "sequence_active", self._sequence_active)
-        object.__setattr__(new_snap, "sequence_name",   self._sequence_name)
-        object.__setattr__(new_snap, "sequence_step",   self._current_fire_step_name())
-        object.__setattr__(new_snap, "sequence_state",  self._fire_state)
+        object.__setattr__(new_snap, "sequence_active", seq_active)
+        object.__setattr__(new_snap, "sequence_name",   seq_name)
+        object.__setattr__(new_snap, "sequence_step",   seq_step)
+        object.__setattr__(new_snap, "sequence_state",  seq_state)
 
         with self._lock:
             self._snapshot = new_snap
             self._last_batch_perf_time = time.perf_counter()
 
-        # Push before the CSV work so consumers see the new state at the
-        # earliest possible moment; logging is the slower, non-urgent half.
+        # Push before the slower CSV work.
         self._notify_state()
 
-        # Export raw hardware and calibrated values to CSV, one row per scan.
-        # Column order follows logger.py's manifest-driven header.
+        # One row per scan; order matches Logger._header().
         if self._logger:
             csv_specs = [
                 spec for spec in self._channels
@@ -1244,28 +1061,40 @@ class Engine:
     # Sequence control
     # --------------------------------------------------------
 
-    def _validate_sequence(
-        self, name: str, path: str
-    ) -> tuple[list[tuple[float, str, int]], float]:
-        """
-        Load a sequence and confirm this cart can actually drive it.
+    def _validate_fire(
+        self,
+    ) -> tuple[list[tuple[float, str, int]], float, list[FireStep]]:
+        """Load and validate fire.yaml; re-read each call so edits apply live."""
+        return self._validate_sequence(
+            "fire",
+            os.path.join(self._sequence_dir, "fire.yaml"),
+            self._load_fire_sequence,
+        )
 
-        Runs b/f any thread is spawned, so both failure modes - an
-        unreadable file and a step naming an actuator with no pin - reach
-        the caller.
-
-        Raises:
-            SequenceRefused: If the file cannot be parsed, or any step
-                             commands an actuator this cart cannot drive.
-        """
+    def _load_or_refuse(self, name: str, path: str, loader) -> tuple:
+        """Run a loader, turning any parse failure into SequenceRefused."""
         try:
-            steps, post_s = self._load_sequence(path)
+            return loader(path)
         except Exception as exc:
             raise SequenceRefused(
                 f"Sequence '{name}' could not be loaded: {exc}"
             ) from exc
 
-        undrivable = self._undrivable_steps(steps)
+    def _validate_sequence(self, name: str, path: str, loader=None) -> tuple:
+        """
+        Load a sequence and check every actuator in it can be driven.
+
+        Args:
+            loader: _load_sequence (flat, default) or _load_fire_sequence.
+                    Its tuple is returned; element 0 is the flat step list.
+
+        Raises:
+            SequenceRefused: If the file cannot be parsed, or any step
+                             commands an actuator this cart cannot drive.
+        """
+        loaded = self._load_or_refuse(name, path, loader or self._load_sequence)
+
+        undrivable = self._undrivable_steps(loaded[0])
         if undrivable:
             raise SequenceRefused(
                 f"Sequence '{name}' REFUSED: cannot drive "
@@ -1273,7 +1102,7 @@ class Engine:
                 f"Every step for these would have failed and the sequence "
                 f"would have reported completion having moved nothing."
             )
-        return steps, post_s
+        return loaded
 
     def _start_sequence(
         self,
@@ -1286,21 +1115,8 @@ class Engine:
         start_elapsed: float = 0.0,
     ) -> bool:
         """
-        Spawns a new background thread to execute an autosequence.
-
-        Args:
-            force: If True, starts even if a sequence thread object is still
-                   marked alive (used by abort(), which must always be able
-                   to preempt). If False (default), refuses to start a second
-                   sequence on top of a live one - callers should check the
-                   return value rather than assuming success.
-            start_idx/start_elapsed: Resume a fire sequence mid-timeline
-                   (see start_sequence()). Always 0/0.0 for fire()'s own
-                   from-the-top launch and for abort.yaml.
-
-        Returns:
-            True if the sequence thread was started, False if refused
-            because another sequence is already active.
+        Start a sequence thread. Returns False if one is alive, unless force
+        (abort). start_idx/start_elapsed resume a fire mid-timeline.
         """
         with self._lock:
             thread_alive = (
@@ -1316,7 +1132,7 @@ class Engine:
                 )
             self._sequence_active = True
             self._sequence_name   = name
-            # Set synchronously so sequence_status() doesn't race thread startup.
+            # Set here, not in the thread, so sequence_status() can't race it.
             t0 = time.perf_counter() - start_elapsed
             self._sequence_t0 = t0
             if is_fire:
@@ -1343,16 +1159,7 @@ class Engine:
         start_idx: int,
         t0: float,
     ) -> None:
-        """
-        Execute an already-validated autosequence step by step.
-
-        Loading check happen in _validate_sequence() on the caller's thread.
-
-        start_idx/t0 resume a fire sequence from wherever stop_sequence()
-        (or a set_sequence_time()/jump_to_step() made while stopped) last
-        left it - see start_sequence(). abort.yaml always runs with the
-        defaults (0, perf_counter()).
-        """
+        """Run validated steps against t0; fire checks abort/pause each tick."""
         self._log(f"Sequence '{name}' starting")
 
         if is_fire and self._logger and not self._logger.is_recording:
@@ -1361,23 +1168,16 @@ class Engine:
         idx = start_idx
 
         while idx < len(steps):
-            # Exit thread immediately on abort flag (applicable to fire sequences only)
             if self._abort_flag.is_set() and is_fire:
                 self._log(
                     "Sequence aborted - exiting. "
                     "abort() will handle the abort sequence launch."
                 )
-                # Freeze in place, same as a pause - abort() has already
-                # set _fire_invalidated so start_sequence() won't resume
-                # from this frozen position.
                 with self._lock:
                     self._fire_state = FIRE_ABORTED
                 self._sequence_paused()
                 return
 
-            # stop_sequence(): pause in place, resumable from here via
-            # start_sequence(). Distinct from abort - no abort.yaml, no
-            # all_safe(), recording keeps running.
             if self._pause_flag.is_set() and is_fire:
                 self._log(f"Sequence '{name}' paused at T+{steps[idx][0]:.2f}s")
                 with self._lock:
@@ -1403,10 +1203,9 @@ class Engine:
                         self._fire_next_idx   = idx
                         self._fire_position_s = target_t
             else:
-                # Sleep briefly to prevent high CPU utilization while awaiting timing targets
                 time.sleep(0.0005)
 
-        # Keep recording post-sequence telemetry until timeout or abort
+        # An abort here still ends as "completed".
         if self._logger and post_s > 0:
             self._log(f"Sequence '{name}' complete, recording {post_s:.1f} s post-data")
             deadline = time.perf_counter() + post_s
@@ -1426,12 +1225,7 @@ class Engine:
             self._sequence_paused()
 
     def _sequence_completed(self) -> None:
-        """
-        Normal completion: all actions executed; thread exiting cleanly.
-
-        Leaves _fire_t0 intact so the clock keeps counting up until the next
-        fire() or abort(). Position fields are left as-is.
-        """
+        """Mark fire completed; _fire_t0 stays so the clock keeps running."""
         with self._lock:
             self._sequence_active = False
             self._sequence_name   = ""
@@ -1439,13 +1233,7 @@ class Engine:
             self._fire_state      = FIRE_COMPLETED
 
     def _sequence_paused(self) -> None:
-        """
-        Freezes the fire clock (pause, abort preemption, or abort.yaml completion).
-
-        Nulls _fire_t0 so status queries fall back to _fire_position_s. Position
-        fields are left as-is (tracked by _run_sequence); abort() separately
-        flags resumability via _fire_invalidated.
-        """
+        """End the sequence and freeze the fire clock at _fire_position_s."""
         with self._lock:
             self._sequence_active = False
             self._sequence_name   = ""
@@ -1456,12 +1244,8 @@ class Engine:
         self, steps: list[tuple[float, str, int]]
     ) -> list[str]:
         """
-        Actuator ids a sequence commands that this cart cannot drive.
-
-        Covers both an id absent from actuators.yaml and one present but
-        with null pin fields. Either way the device write raises, and
-        _run_sequence's per-step handler logs it and moves on - so without
-        this check a sequence runs to "completion" having moved nothing.
+        Ids a sequence commands that are unknown or unwired. Without this
+        check the writes fail one by one and the sequence still "completes".
         """
         drivable = {spec.id for spec in self._actuators if spec.is_wired}
         return sorted({name for _, name, _ in steps if name not in drivable})
@@ -1469,67 +1253,24 @@ class Engine:
     def _load_sequence(
         self, path: str
     ) -> tuple[list[tuple[float, str, int]], float]:
-        """
-        Parse a YAML sequence file.
-
-        Returns:
-            (steps, post_record_seconds)
-            steps: sorted list of (elapsed_s, actuator_name, state)
-        """
+        """Flat sequence file -> (time-sorted steps, post_record_seconds)."""
         with open(path) as f:
             data = yaml.safe_load(f)
 
         post_s = float(data.get("post_record_seconds", 5.0))
         raw    = data.get("steps", [])
-        steps  = [(float(s[0]), str(s[1]), int(s[2])) for s in raw]
+        steps  = [_parse_action(s) for s in raw]
         steps.sort(key=lambda s: s[0])
         return steps, post_s
-
-    def _validate_fire_sequence(
-        self, name: str, path: str
-    ) -> tuple[list[tuple[float, str, int]], float, list[FireStep]]:
-        """
-        Load fire.yaml's named-phase schema and confirm this cart can
-        actually drive it.
-
-        Raises:
-            SequenceRefused: If the file cannot be parsed, or any step
-                             commands an actuator this cart cannot drive.
-        """
-        try:
-            steps, post_s, fire_steps = self._load_fire_sequence(path)
-        except Exception as exc:
-            raise SequenceRefused(
-                f"Sequence '{name}' could not be loaded: {exc}"
-            ) from exc
-
-        undrivable = self._undrivable_steps(steps)
-        if undrivable:
-            raise SequenceRefused(
-                f"Sequence '{name}' REFUSED: cannot drive "
-                f"{', '.join(undrivable)} - not wired in actuators.yaml. "
-                f"Every step for these would have failed and the sequence "
-                f"would have reported completion having moved nothing."
-            )
-        return steps, post_s, fire_steps
 
     def _load_fire_sequence(
         self, path: str
     ) -> tuple[list[tuple[float, str, int]], float, list[FireStep]]:
         """
-        Parse fire.yaml's named-phase schema.
+        fire.yaml -> (flat time-sorted steps, post_record_seconds, phases).
 
-        Each phase's actions keep their own original times - grouping into
-        a named phase never merges or renumbers them. A phase's start_t
-        (its jump target) is its earliest action time, and start_t must be
-        non-decreasing across phases in file order, or a step name would
-        not resolve to a unknown position.
-
-        Returns:
-            (steps, post_record_seconds, fire_steps)
-            steps:      flattened, time-sorted (elapsed_s, actuator, state)
-                        triples.
-            fire_steps: named phases in start_t order.
+        Phase start times must not decrease in file order, so each step name
+        maps to one position.
         """
         with open(path) as f:
             data = yaml.safe_load(f)
@@ -1546,9 +1287,7 @@ class Engine:
             if not raw_actions:
                 raise ValueError(f"step '{name}' has no actions")
 
-            actions = tuple(
-                (float(a[0]), str(a[1]), int(a[2])) for a in raw_actions
-            )
+            actions = tuple(_parse_action(a) for a in raw_actions)
             flat.extend(actions)
 
             start_t = min(t for t, _, _ in actions)
@@ -1568,7 +1307,7 @@ class Engine:
     # --------------------------------------------------------
 
     def _load_calibration(self, path: str) -> None:
-        """Loads and merges coefficients from calibration.json."""
+        """Merge calibration.json over the defaults; unknown tags are ignored."""
         try:
             with open(path) as f:
                 saved = json.load(f)
@@ -1587,7 +1326,7 @@ class Engine:
     # --------------------------------------------------------
 
     def _log(self, message: str) -> None:
-        """Appends a timestamped string to the rolling debug event log."""
+        """Timestamp, append to the event log, and print."""
         entry = f"{time.strftime('%H:%M:%S')} {message}"
         with self._lock:
             self._event_log.append(entry)

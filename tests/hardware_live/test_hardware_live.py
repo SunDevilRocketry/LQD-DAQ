@@ -1,25 +1,10 @@
 """
 tests/hardware_live/test_hardware_live.py
 
-Hardware-in-the-loop (HIL) sanity checks against a real, physically
-connected LabJack T7. Requires:
-  - The labjack-ljm native driver installed on this machine.
-  - A LabJack T7 plugged in over USB (or reachable over Ethernet/WiFi).
-
-These are are not run by `run.sh --test` / `run.bat --test` by default.
-
-Run this file directly, on the bench, with the hardware attached:
-
-    python -m pytest tests/hardware_live/ -v
-
-If no physical device is present, every test here will fail fast with a
-device/connection error.
-
-The driver is manifest-driven, so these tests run against the repo's real
-channels.yaml / actuators.yaml. Any test that needs a wired pin skips with
-a clear reason while that pin is still null - the point of running this on
-the bench is to confirm the wiring you just did, so it should tell you
-what isn't wired rather than fail opaquely.
+Bench checks against a real T7 with LJM, using the repo's manifests. Not in
+CI; run with `Start_Linux.sh --test-live` or
+`python -m pytest tests/hardware_live/ -v`. Tests that need an unwired pin
+skip and say which.
 """
 
 import os
@@ -84,24 +69,16 @@ class TestPhysicalConnection:
 
     def test_physical_actuator_round_trip(self, device, actuators):
         """
-        Write then read back a single solenoid on real hardware, then
-        immediately return it to the safe (closed) state.
-
-        Deliberately picks a binary_dio actuator: a stepper round-trip
-        would physically move a main valve, which is not something a
-        connectivity smoke test should do on its own.
+        Energise then de-energise the binary_dio actuator named in
+        LQD_LIVE_ACTUATOR; skipped if unset. Never name one with gas connected.
         """
-        wired = [
-            spec for spec in actuators
-            if spec.type == BINARY_DIO and spec.is_wired
-        ]
-        if not wired:
-            pytest.skip(
-                "No binary_dio actuator in actuators.yaml has a DIO "
-                "assigned yet"
-            )
+        name = os.environ.get("LQD_LIVE_ACTUATOR")
+        if not name:
+            pytest.skip("Set LQD_LIVE_ACTUATOR=<id> to energise that actuator")
+        spec = next((s for s in actuators if s.id == name), None)
+        if spec is None or spec.type != BINARY_DIO or not spec.is_wired:
+            pytest.fail(f"'{name}' is not a wired binary_dio actuator")
 
-        name = wired[0].id
         try:
             device.write_actuator(name, 1)
             assert device.read_actuator(name) == 1

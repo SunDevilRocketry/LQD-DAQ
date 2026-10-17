@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# CSV recordings from the DAQ (logger output_dir)
+data/

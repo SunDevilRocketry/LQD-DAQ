@@ -17,15 +17,12 @@ _HERE     = os.path.dirname(os.path.abspath(__file__))
 _REPO     = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _FIXTURES = os.path.join(_HERE, "fixtures")
 
-# The fully-wired fixture manifests, not the repo's own channels.yaml.
-# The real manifests leave the stepper pins and step counts null and the TC,
-# load cell and photogate channels inactive, which would leave those paths
-# untested.
+# Fully wired fixtures: the repo's manifests leave the step counts null
+# and the photogates inactive, so those paths would go untested.
 FULL_CHANNELS     = os.path.join(_FIXTURES, "channels_full.yaml")
 FULL_ACTUATORS    = os.path.join(_FIXTURES, "actuators_full.yaml")
 UNWIRED_ACTUATORS = os.path.join(_FIXTURES, "actuators_unwired.yaml")
 
-# The manifests actually shipped in the repo.
 REPO_CHANNELS  = os.path.join(_REPO, "channels.yaml")
 REPO_ACTUATORS = os.path.join(_REPO, "actuators.yaml")
 
@@ -47,13 +44,7 @@ def make_engine(
     sequence_dir=None,
     actuators_path=FULL_ACTUATORS,
 ) -> Engine:
-    """
-    Create an Engine wired to mock hardware and the fixture manifests.
-
-    actuators_path defaults to the fully-wired fixture; pass
-    UNWIRED_ACTUATORS for a cart with no pins assigned, or REPO_ACTUATORS
-    for the manifest as shipped.
-    """
+    """Mock Engine on the fixture channels; actuators default to FULL_ACTUATORS."""
     return Engine(
         cal_path=None,
         sequence_dir=sequence_dir or os.path.join(_REPO, "sequences"),
@@ -66,12 +57,7 @@ def make_engine(
 
 
 def wait_for_first_batch(engine, timeout: float = 5.0) -> None:
-    """
-    Block until the engine has published its first populated snapshot.
-
-    Raises:
-        AssertionError: If no batch has landed within `timeout` seconds.
-    """
+    """Block until the first populated snapshot; AssertionError after timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if engine.snapshot.channels:

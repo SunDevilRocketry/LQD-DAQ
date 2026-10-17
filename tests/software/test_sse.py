@@ -1,20 +1,8 @@
 """
 tests/software/test_sse.py
 
-Tests for the /stream SSE endpoint and the Broadcaster behind it.
-
-The rest of the API suite uses FastAPI's TestClient. That does not work
-here: TestClient runs the ASGI app to completion and buffers the whole
-body before returning (starlette/testclient.py's `portal.call(self.app,
-...)`). This is an expected casualty of the persistent-connection
-model.
-
-These tests therefore run the app under a real uvicorn server on an
-ephemeral port and connect over real HTTP - which also means the
-disconnect path gets exercised.
-
-No real hardware required (mock LabJack); binds to 127.0.0.1 only.
-Run with: python -m pytest tests/software/test_sse.py -v
+/stream and the Broadcaster. TestClient buffers a whole response, so these
+run a real uvicorn on a free 127.0.0.1 port, which also covers disconnects.
 """
 
 import asyncio
@@ -44,15 +32,10 @@ _SERVER_BOOT_S    = 10.0
 
 def iter_messages(response):
     """
-    Yield decoded SSE messages off a streaming response.
-
-    A response body can only be iterated once, so a test opens exactly one
-    of these per connection and pulls from it.
+    Decoded SSE messages; use one per connection (a body iterates once).
 
     Raises:
-        httpx.ReadTimeout: If the stream stalls (the client timeout, so a
-                           broken endpoint fails the test rather than
-                           hanging it).
+        httpx.ReadTimeout: If the stream stalls, so the test fails, not hangs.
     """
     for line in response.iter_lines():
         if line.startswith("data: "):
@@ -60,12 +43,7 @@ def iter_messages(response):
 
 
 def read_frames(response, count: int) -> list[dict]:
-    """
-    Pull the first `count` decoded messages off a streaming response.
-
-    Raises:
-        AssertionError: If the stream ends before `count` frames arrive.
-    """
+    """First `count` messages; AssertionError if the stream ends first."""
     frames = []
     for message in iter_messages(response):
         frames.append(message)
@@ -77,11 +55,8 @@ def read_frames(response, count: int) -> list[dict]:
 @pytest.fixture
 def sse_server():
     """
-    A running engine served by a real uvicorn instance on a free port.
-
-    Yields (base_url, engine). api.py's engine reference is a module-level
-    singleton shared with the rest of the API suite, so it is saved and
-    restored around the test.
+    Yields (base_url, engine) on a real uvicorn. Saves and restores api.py's
+    module-level engine, which the other API tests share.
     """
     prev_engine, prev_logger = api_module._engine, api_module._logger
 
@@ -120,10 +95,7 @@ def sse_client(sse_server):
 # -- Envelope & payload shape ---------------------------------
 
 class TestEnvelope:
-    """
-    The outer envelope matches the convention Dashboard already consumes
-    for flight (sseCommon.ts).
-    """
+    """The envelope matches Dashboard's sseCommon.ts."""
 
     def test_manifest_envelope_fields(self):
         engine = make_engine()
@@ -166,7 +138,7 @@ class TestEnvelope:
         assert payload["sequence"]["state"] == "idle"  # fresh engine, fire never run
 
     def test_derived_is_present_but_empty(self):
-        """Kept for shape consistency; this cart has no orifice geometry."""
+        """Empty only because this engine never processed a batch."""
         engine = make_engine()
         assert system_state_message(engine)["payload"]["derived"] == {}
 
@@ -224,7 +196,7 @@ class TestStreamEndpoint:
         with client.stream("GET", "/stream") as response:
             frames = read_frames(response, 3)
         valves = frames[-1]["payload"]["valves"]
-        assert valves["lox_vent"]["normal"] == "open"
+        assert valves["tank_depress"]["normal"] == "open"
         assert valves["lox_main"]["normal"] == "closed"
         # Omitted in the manifest - reaches Dashboard as null, not defaulted.
         assert valves["ignition_arm"]["normal"] is None
@@ -240,15 +212,10 @@ class TestStreamEndpoint:
         assert api_module._broadcaster.client_count == 0
 
 
-# -- Error-path push (handoff sec 4's known gap) ---------------
+# -- Error-path push ------------------------------------------
 
 class TestErrorPathBroadcast:
-    """
-    A comms failure skips _process_batch entirely, so w/o an explicit
-    push on the error path the exact moment the cart goes quiet is the one
-    moment nothing is sent - Dashboard would have to infer the outage from
-    silence.
-    """
+    """A comms failure skips _process_batch, so the error path must push a frame."""
 
     def test_outage_pushes_a_not_streaming_frame(self, sse_client):
         client, engine = sse_client
@@ -274,11 +241,7 @@ class TestErrorPathBroadcast:
         assert saw_outage, "no frame was pushed when the stream started failing"
 
     def test_outage_frame_keeps_last_known_readings(self, sse_client):
-        """
-        Values are kept, not blanked: an operator should still see the
-        state the cart was in when it went quiet. `streaming`/`is_stale`
-        are what say it is no longer live.
-        """
+        """Values stay (last known state); streaming/is_stale mark them not live."""
         client, engine = sse_client
 
         with client.stream("GET", "/stream") as response:
@@ -311,10 +274,7 @@ class TestBroadcaster:
         Broadcaster().publish({"messageType": "system-state"})
 
     def test_latest_value_wins_on_a_full_queue(self):
-        """
-        Telemetry is not an event log. A client that falls behind should
-        get current state on its next read, not a backlog.
-        """
+        """A client that falls behind gets the current frame, not a backlog."""
         broadcaster = Broadcaster()
         results = {}
 
@@ -348,10 +308,7 @@ class TestBroadcaster:
         assert results["b"] == {"n": 1}
 
     def test_a_stalled_client_does_not_block_the_others(self):
-        """
-        Per-client queues exist precisely so one hung dashboard can't hold
-        up delivery to any other.
-        """
+        """One hung client can't hold up the others."""
         broadcaster = Broadcaster()
         results = {}
 
@@ -386,10 +343,7 @@ class TestBroadcaster:
 # -- Keep-alive on an idle stream ------------------------------
 
 class TestKeepAlive:
-    """
-    A client that connects while the engine is stopped gets the two
-    initial frames and then nothing.
-    """
+    """With the engine stopped, only keep-alive comments follow the first two frames."""
 
     def test_idle_stream_sends_comment_frames(self, sse_client, monkeypatch):
         client, engine = sse_client
@@ -425,11 +379,7 @@ class TestKeepAlive:
 # -- Listener cost with nobody connected -----------------------
 
 class TestListenerCost:
-    """
-    The listener runs on the acquisition thread ~10 Hz. publish() already
-    no-ops with no clients, but only after the whole state dict has been
-    built - walking every channel and actuator for nobody.
-    """
+    """With no clients, the stream thread must not build a state frame at all."""
 
     def test_no_state_message_is_built_with_nobody_connected(self, monkeypatch):
         assert api_module._broadcaster.client_count == 0, (

@@ -1,16 +1,8 @@
 # tests/software/fixtures/channels_full.yaml
 #
-# A fully-populated variant of the repo's channels.yaml: every channel
-# active and every physical pin filled in.
-#
-# The real channels.yaml leaves pins null and marks the TC,
-# load cells and photogates inactive, because none of that is confirmed on
-# the cart yet. That is correct for the cart and useless for testing - it
-# would leave the tc_differential / lc_direct / photogate_counter code
-# paths unexercised. This fixture exists so those paths are covered.
-#
-# AIN/DIO assignments here are arbitrary but structurally valid. They are
-# NOT a proposed wiring plan for the cart.
+# Every channel active with a pin, so the photogate path is tested too.
+# Pins are arbitrary and not a wiring plan; the mock doesn't check them
+# (the counters on CIO2/CIO3 wouldn't work on a T7).
 
 channels:
   - id: pt0

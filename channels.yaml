@@ -1,48 +1,10 @@
-# channels.yaml
-#
-# LQD-DAQ (legacy) channel manifest.
-#
-# Principle: this is data. Each entry names a sensor and the T7 pin it is
-# read from. A null physical field (ain, dio, etc.) marks an unwired channel,
-# which the engine skips.
-#
-# Channel ids (pt0-pt3, dpt0/1, lc0/1, tc0, pos_*) follow the wiring sheet.
-# They are this cart's own tags, separate from the POT/PFT/POI/... scheme and
-# threshold shape of the main LQD-DAQ branch.
-#
-# type: pt_direct         - absolute/gauge PT, single-ended AIN.
-# type: pt_differential   - differential PT across an injector orifice.
-#                           Same 0-5 V wiring and same calibration form as
-#                           pt_direct; the value is a pressure drop.
-# type: lc_direct         - load cell conditioned by an external amplifier,
-#                           read single-ended like a PT.
-# type: tc_differential   - thermocouple on a differential AIN pair.
-# type: photogate_counter - valve-position photogate on a DIO line, read as a
-#                           DIO_EF counter outside the AIN stream.
-#
-# `unit` is the unit the channel is *reported* in (snapshot, SSE, CSV).
-# Pressures report Pa (SI-internal convention) the pipeline uses.
-# Calibration coefficients (calibration.json) and threshold bands
-# (config.yaml) stay authored in psi and are converted on load.
-#
-# -- T7 AIN pin map (DB37/CB37 side, from the wiring sheet) -------------
-#   AIN0   PT0           AIN8   PT3
-#   AIN1   LC0 signal+   AIN9   unused
-#   AIN2   TC0 +         AIN10  dPT0 (LOX injector dP)
-#   AIN3   TC0 -         AIN11  unused
-#   AIN4   PT1           AIN12  dPT1 (fuel injector dP)
-#   AIN5   LC1 signal+   AIN13  igniter continuity/arm sense (provisional,
-#   AIN6   PT2                   pending a voltage channel type)
-#   AIN7   unused
-# LC signal- returns to T7 GND, so LCs are read single-ended like the PTs.
-# TC0 is on the main screw terminals (AIN2/AIN3), a differential pair.
-# Photogate counters are on FIO6 (LOX) / FIO7 (fuel); see actuators.yaml for
-# the full DIO map.
+# channels.yaml: sensors and the T7 pin each is read on.
+# Pins follow docs/schematics/legacy_cart_2026-10-16.pdf; a null pin means
+# unwired.
+# Pressures report in Pa; calibration and thresholds stay authored in psi.
 
 channels:
-  # -- Pressure transducers (Omega PX309-2KG5V: 0-2000 psig, 0-5V, direct to T7 AIN) --
-  # Only PT0-PT3 exist on the wiring sheet; PT4-PT7 are marked inactive.
-  # All wired directly to the T7.
+  # -- PTs: Omega PX309-2KG5V, gauge. pt4-pt7 are spare slots. --
   - id: pt0
     type: pt_direct
     unit: Pa
@@ -92,27 +54,21 @@ channels:
     active: false
     notes: "spare slot"
 
-  # -- Differential PTs (across the injector orifices, QDW90A) --
-  # Feed lox/fuel mass flow. Orifice geometry lives in config.yaml.
-  # slope/intercept in calibration.json are the pt_direct nominal values
-  # as a placeholder.
+  # -- dPTs: QDW90A across the injector orifices; feed mass flow. --
   - id: dpt0
     type: pt_differential
     unit: Pa
     ain: AIN10
     cal_ref: dpt0
-    notes: "LOx injector orifice dP - confirm part and full-scale range"
+    notes: "LOX injector orifice dP; QDW90A range/output UNVERIFIED"
   - id: dpt1
     type: pt_differential
     unit: Pa
     ain: AIN12
     cal_ref: dpt1
-    notes: "fuel injector orifice dP - confirm part and full-scale range"
+    notes: "fuel injector orifice dP; QDW90A range/output UNVERIFIED"
 
-  # -- Thermocouple (differential pair, LM34 CJC ref) --
-  # Connector on the T7 screw terminals (AIN2/AIN3). Rough LOX-cold
-  # indicator; also feeds LOX density (config.yaml derived.lox), so LOX
-  # mass flow and mixture ratio are estimates only.
+  # -- TC: Type T on the T7 screw terminals. Feeds LOX density (estimate). --
   - id: tc0
     type: tc_differential
     unit: celsius
@@ -121,9 +77,7 @@ channels:
     cal_ref: tc0
     active: true
 
-  # -- Load cells (PUSHTON S1 2000kg, via weight transmitter) --
-  # Transmitter excites the bridge and outputs 0-10 V full scale on V,
-  # read single-ended against T7 GND like a PT.
+  # -- Load cells: Pushton S1 2000 kg via a 0-10 V weight transmitter. --
   - id: lc0
     type: lc_direct
     unit: lbf
@@ -137,10 +91,7 @@ channels:
     cal_ref: lc1
     active: true
 
-  # -- Stepper position feedback (L0004 photogate boards) --
-  # Informational telemetry only, same as any other channel. Reported
-  # in EngineState like a PT/TC. The boards are bench-tested and working;
-  # the channels stay inactive until stepper analysis consumes them.
+  # -- Photogates (L0004): stepper travel counts, telemetry only. --
   - id: pos_lox_main
     type: photogate_counter
     unit: counts

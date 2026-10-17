@@ -1,48 +1,59 @@
 """
 daq/manifest.py
 
-Shared data model for the cart's channel and actuator inventory.
-
-Holds both the *specs* loaded from channels.yaml / actuators.yaml and the
-*readings* produced from them, so engine.py, logger.py and the hardware
-layer.
-
-The manifests are data. Physical fields (ain, dio, ...) may be
-null until confirmed on the cart by wire count. A null physical field is a
-placeholder. The channel/actuator still exists in the manifest and is 
-still reported.
+Channel and actuator specs (channels.yaml / actuators.yaml) and their
+readings. A null pin is a placeholder: still reported, can't be read or
+driven.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import yaml
 
 
-# Channel types understood by the processing pipeline.
+# Channel types
 PT_DIRECT         = "pt_direct"
-# A physical differential transducer reading pressure drop across an
-# orifice. Electrically identical to pt_direct - one single-ended AIN,
-# same voltage->pressure calibration - but the value is a delta.
+# Orifice pressure drop; wired and calibrated like pt_direct.
 PT_DIFFERENTIAL   = "pt_differential"
 TC_DIFFERENTIAL   = "tc_differential"
 LC_DIRECT         = "lc_direct"
 PHOTOGATE_COUNTER = "photogate_counter"
 
-# Actuator types understood by the hardware layer.
+# Actuator types
 BINARY_DIO    = "binary_dio"
 PULSE_STEPPER = "pulse_stepper"
 
-# Channel types carried by the AIN stream. photogate_counter is read
-# out-of-band (DIO_EF counter) on the same pattern as CJC.
+# Read via the AIN stream; photogate counters are polled out-of-band.
 _STREAMED_TYPES = frozenset(
     {PT_DIRECT, PT_DIFFERENTIAL, TC_DIFFERENTIAL, LC_DIRECT}
 )
 
-# Types whose calibration lives under calibration.json's "PT" section and
-# whose threshold bands are authored in psi.
+# AIN16+ refused: extended (Mux80) channels drive MIO0-2, the igniter lines.
+MAX_AIN = 15
+
+
+def check_ain(name: Optional[str]) -> Optional[str]:
+    """
+    Return an AIN register name unchanged, refusing extended channels.
+
+    Raises:
+        ValueError: If the name is AIN16 or higher.
+    """
+    if name is not None:
+        match = re.fullmatch(r"AIN(\d+)", name.strip().upper())
+        if match and int(match.group(1)) > MAX_AIN:
+            raise ValueError(
+                f"{name} is an extended channel (AIN16+), which drives MIO0-2 "
+                f"(igniter lines). Use AIN0-AIN{MAX_AIN}."
+            )
+    return name
+
+
+# Calibrated under calibration.json "PT"; thresholds authored in psi.
 PRESSURE_TYPES = frozenset({PT_DIRECT, PT_DIFFERENTIAL})
 
 
@@ -81,18 +92,16 @@ class ActuatorSpec:
     """One actuator as declared in actuators.yaml."""
     id:            str
     type:          str
-    # De-energised resting state ("open"/"closed"), or None where the cart's
-    # Reported to Dashboard, never used to decide anything.
+    # De-energised state: "open" / "closed" / None. Reported only.
     normal:        Optional[str]   = None
     dio:           Optional[str]   = None   # binary_dio
     step_dio:      Optional[str]   = None   # pulse_stepper
     dir_dio:       Optional[str]   = None
-    ena_dio:       Optional[str]   = None
+    ena_dio:       Optional[str]   = None   # optional; None = ENA unconnected
     steps_open:    Optional[int]   = None
     steps_close:   Optional[int]   = None
     pulse_freq_hz: Optional[float] = None
-    # Channel id of this actuator's photogate counter, when position
-    # feedback is enabled. Reported telemetry only.
+    # Photogate channel id; only the mock reads it.
     position_feedback: Optional[str] = None
 
     @property
@@ -102,7 +111,7 @@ class ActuatorSpec:
             return self.dio is not None
         if self.type == PULSE_STEPPER:
             return None not in (
-                self.step_dio, self.dir_dio, self.ena_dio,
+                self.step_dio, self.dir_dio,
                 self.steps_open, self.steps_close, self.pulse_freq_hz,
             )
         return False
@@ -111,10 +120,10 @@ class ActuatorSpec:
 @dataclass(frozen=True)
 class ChannelReading:
     """
-    One channel's latest processed value.
+    One channel's latest value.
 
-    `status` is NOMINAL | CAUTION | WARNING for a channel with threshold
-    bands configured, UNCONFIGURED for one with none.
+    `status`: NOMINAL | CAUTION | WARNING, UNCONFIGURED (no bands), or None
+    (bands but no value).
     """
     value:        Optional[float]
     unit:         str
@@ -127,33 +136,25 @@ class ActuatorReading:
     """
     One actuator's latest state.
 
-    `state` is the commanded logical state (1 = open/energised, 0 = safe).
-    `moving` is True while a commanded move is still physically in flight -
-    only ever True for pulse_stepper actuators, where "commanded open" and
-    "physically open" are different moments in time. For a solenoid the DIO
-    write is the state, so `moving` stays False.
+    `state`: commanded, 1 = energised, 0 = de-energised.
+    `moving`: True while a stepper move is in flight; always False for
+    binary_dio.
     """
     state:  int
     moving: bool = False
 
 
 def _ain_name(value: Any) -> Optional[str]:
-    """Normalise an AIN field to a LJM register name ('AIN122') or None."""
+    """Normalise an AIN field (2 or 'AIN2') to an LJM name, refusing AIN16+."""
     if value is None:
         return None
     if isinstance(value, int):
-        return f"AIN{value}"
-    return str(value)
+        return check_ain(f"AIN{value}")
+    return check_ain(str(value))
 
 
 def _active(value: Any) -> bool:
-    """
-    Resolve the `active` field.
-
-    Absent or null means "not yet confirmed" - treated as active so an
-    unconfirmed channel shows up as data rather than silently vanishing.
-    Only an explicit `false` disables a channel.
-    """
+    """Absent or null = active (still reports); only `false` disables."""
     return True if value is None else bool(value)
 
 
@@ -162,7 +163,8 @@ def load_channels(path: str) -> list[ChannelSpec]:
     Parse channels.yaml into ChannelSpec objects.
 
     Raises:
-        ValueError: On a duplicate id or an unrecognised channel type.
+        ValueError: On a duplicate id, an unrecognised channel type, or an
+                    extended channel (AIN16+).
     """
     with open(path) as f:
         data = yaml.safe_load(f) or {}

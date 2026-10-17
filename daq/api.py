@@ -1,42 +1,31 @@
 """
 daq/api.py
 
-FastAPI microservice for the Liquids DAQ system.
+HTTP API over the Engine (FastAPI).
 
-Exposes the Engine state and control interfaces over HTTP to decouple the 
-GUI process (SR 3.4.1) and support concurrent client connections (SR 3.3.1).
+  GET  /status            health, sequence state, unwired actuators
+  GET  /stream            SSE: manifest on connect, then system-state per batch
+  GET  /snapshot          latest values (500 if stale)
+  GET  /actuators         actuator states
+  GET  /events            event log
+  GET  /logger            recording status
+  GET  /sequence          fire.yaml phases
+  POST /actuator          manual command (409 mid-sequence)
+  POST /safe              abort, then de-energise everything
+  POST /fire              fire.yaml from T=0
+  POST /abort             abort.yaml, or all-off if it can't run
+  POST /sequence/start    resume fire
+  POST /sequence/stop     pause fire in place
+  POST /sequence/time     seek the fire clock (forward-only while running)
+  POST /sequence/step     seek to a named step
+  POST /tare              tare load cells
+  POST /calibration       set a slope/intercept in memory
+  POST /calibration/save  write calibration.json
+  POST /log/start         start a CSV recording
+  POST /log/stop          stop it
 
-Client Polling Guideline (SR 3.3.2):
-  To minimize network overhead, clients should poll on a closed-loop schedule 
-  (send request, wait for response, sleep before the next request).
-
-Endpoints:
-  GET  /status          - connection and system health
-  GET  /stream          - server-sent events: manifest on connect, then
-                          live system-state pushed per acquisition batch
-  GET  /snapshot        - latest engineering values (all sensors)
-  GET  /actuators       - current actuator states
-  GET  /events          - recent event log (SR 3.5 debug console)
-  GET  /logger          - logger status and current file path
-  GET  /sequence        - named-phase dump of the fire sequence
-  POST /actuator        - send a single manual actuator command
-  POST /safe            - all safe (de-energise everything)
-  POST /fire            - start the fire autosequence (always from T=0)
-  POST /abort           - abort any running sequence
-  POST /sequence/start  - resume the fire sequence from its current position
-  POST /sequence/stop   - pause the fire sequence in place (not an abort)
-  POST /sequence/time   - seek the fire sequence clock (forward-only while running)
-  POST /sequence/step   - seek to a named fire-sequence step (forward-only while running)
-  POST /tare            - tare load cells
-  POST /calibration     - update a sensor calibration coefficient
-  POST /log/start       - start manual CSV recording
-  POST /log/stop        - stop manual CSV recording
-
-All endpoints return JSON. Errors return {"error": "description"}.
-
-/actuator, /fire, and /sequence/* share a single mutex and return 423
-Locked if busy instead of queuing. /safe and /abort use the same
-mutex but block until acquired so safety commands are never dropped.
+Errors are FastAPI's {"detail": ...}. /actuator, /fire and /sequence/*
+return 423 if the control lock is busy; /safe and /abort wait for it.
 """
 
 from __future__ import annotations
@@ -61,34 +50,27 @@ from daq.broadcast import (
     system_state_message,
 )
 
-# Seconds of silence on /stream before a comment frame is sent instead.
+# Seconds of /stream silence before a keep-alive comment.
 _KEEPALIVE_INTERVAL_S = 5.0
 
-# Engine and Logger instances injected at application startup.
+# Set by set_engine() at startup.
 _engine = None
 _logger = None
 
 _broadcaster = Broadcaster()
 
 
-# Serializes API write handlers; always acquired before Engine._lock to avoid deadlocks.
+# Serialises control routes. Always taken before Engine._lock (lock order).
 _control_lock = threading.Lock()
 
 
 class _ControlLockBusy(Exception):
-    """Internal signal only: non-blocking acquire of _control_lock failed."""
+    """Non-blocking acquire of _control_lock failed (-> 423)."""
 
 
 @contextmanager
 def _control_guard(*, blocking: bool):
-    """Context manager for _control_lock.
-
-    blocking=False:
-        Raises _ControlLockBusy if contended (used by droppable routes:
-        /actuator, /fire, /sequence/*; callers return 423).
-    blocking=True:
-        Blocks until acquired (used by critical routes: /abort, /safe).
-    """
+    """Hold _control_lock; blocking=False raises _ControlLockBusy if taken."""
     if not _control_lock.acquire(blocking=blocking):
         raise _ControlLockBusy()
     try:
@@ -98,12 +80,7 @@ def _control_guard(*, blocking: bool):
 
 
 def set_engine(engine, logger=None) -> None:
-    """
-    Injects runtime engine and logger instances at startup.
-
-    Also subscribes the SSE broadcaster to the engine's state updates, so
-    /stream clients are fed straight off the acquisition thread.
-    """
+    """Inject the engine and logger, and feed /stream from engine updates."""
     global _engine, _logger
     _engine = engine
     _logger = logger
@@ -113,12 +90,7 @@ def set_engine(engine, logger=None) -> None:
 
 
 def _publish_state(engine) -> None:
-    """
-    Build and publish one state frame, unless nobody is listening.
-
-    Runs on the acquisition thread ~10 Hz. Broadcaster.publish() already
-    no-ops with no clients, so the client check comes first.
-    """
+    """Publish one state frame; skipped with no clients (runs on the stream thread)."""
     if _broadcaster.client_count == 0:
         return
     _broadcaster.publish(system_state_message(engine))
@@ -134,8 +106,7 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS middleware for local network communication
-# Restrict this if the system is ever exposed beyond the test-stand LAN.
+# Open CORS: test-stand LAN only.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -150,13 +121,11 @@ app.add_middleware(
 
 class ActuatorCommand(BaseModel):
     name:  str
-    state: int   # 1 = Open, 0 = Closed
+    state: int   # 1 = energise, 0 = de-energise
 
 
 class CalibrationUpdate(BaseModel):
-    """
-    slope/intercept remain in the psi calibration domain (psi/V, psi)
-    """
+    """slope/intercept in the psi or lbf domain (psi/V, lbf/V). The tag isn't checked."""
     tag:       str
     slope:     float
     intercept: float
@@ -185,7 +154,7 @@ def _require_engine():
 
 
 def _snap_to_dict(snap) -> dict[str, Any]:
-    """Convert an EngineState snapshot to a JSON-serializable dictionary."""
+    """EngineState -> dict for JSON."""
     result: dict[str, Any] = {}
     for slot in snap.__slots__:
         result[slot] = getattr(snap, slot, None)
@@ -193,11 +162,7 @@ def _snap_to_dict(snap) -> dict[str, Any]:
 
 
 def _data_age_s(eng) -> Optional[float]:
-    """
-    Rounded seconds since the last processed batch, or None if infinite
-    (no data has ever been received). JSON has no infinity literal, so
-    None is the wire representation of "never received data".
-    """
+    """Data age in s, or None if no batch yet (JSON has no infinity)."""
     age = eng.data_age_seconds
     return None if age == float("inf") else round(age, 3)
 
@@ -207,7 +172,7 @@ def _data_age_s(eng) -> Optional[float]:
 
 @app.get("/status")
 def get_status():
-    """Returns system connectivity, active sequence status, and server time."""
+    """Health and sequence state. Lags a transition by up to one batch."""
     eng = _require_engine()
     snap = eng.snapshot
     return {
@@ -228,21 +193,8 @@ def get_status():
 @app.get("/stream")
 async def get_stream():
     """
-    Live telemetry as server-sent events.
-
-    On connect the client receives a `manifest` message (the cart's full
-    channel/actuator inventory) followed immediately by one `system-state`
-    frame, so a dashboard can render w/o waiting for the next batch.
-    After that, one `system-state` per processed acquisition batch, plus
-    an SSE comment frame every few seconds whenever no state has been
-    pushed in that window.
-
-    Cadence is the natural batch rate, ~10 Hz (500 Hz / 50 scans per read),
-    which already sits under Dashboard's render ceiling - no down-sampling
-    is applied here.
-
-    /snapshot is kept alongside this for a client that doesn't want a persistent
-    connection.
+    SSE: manifest + one state frame on connect, then a frame per batch
+    (~20 Hz on the T7, 10 Hz mock), keep-alive comments when idle.
     """
     eng = _require_engine()
 
@@ -273,23 +225,11 @@ async def get_stream():
 @app.get("/snapshot")
 def get_snapshot():
     """
-    Latest processed sensor snapshot.
-
-    `channels` is keyed by channel id from channels.yaml; each entry
-    carries value / unit / status / last_updated. Units are whatever the
-    manifest declares (pressures in Pa). Always represents the last
-    completed 500 Hz batch.
-
-    Recommended polling pattern (SR 3.3.2):
-        t0 = now(); GET /snapshot; sleep(max(0, 1/display_hz - (now()-t0)))
+    Latest snapshot, channels keyed by manifest id in manifest units.
 
     Raises:
-        500: If the underlying data is older than the staleness threshold
-             e.g. hardware disconnected and a reconnect is in progress.
-
-	     Prevents a dashboard from displaying frozen readings as if 
-	     they were live. Poll /status first if you want to distinguish
-             "stale" from "engine not initialised" ahead of time.
+        500: Data is stale (e.g. reconnecting), so frozen values never
+             look live.
     """
     eng = _require_engine()
     if eng.is_data_stale:
@@ -308,25 +248,14 @@ def get_snapshot():
 
 @app.get("/actuators")
 def get_actuators():
-    """
-    Current state of every system actuator.
-
-    Each entry is {"state": 1|0, "moving": bool}. `moving` is only ever
-    true for stepper-driven valves, where a commanded move takes real time
-    to complete; for a solenoid the DIO write is the state.
-    """
+    """{id: {"state": 1|0, "moving": bool}}; moving is stepper-only."""
     eng = _require_engine()
     return eng.snapshot.actuators or {}
 
 
 @app.get("/events")
 def get_events(last_n: int = 100):
-    """
-    Recent event log entries for the debug console (SR 3.5).
-
-    Args:
-        last_n: Maximum number of entries to return (default 100, max 500).
-    """
+    """Last `last_n` event log entries (1-500, SR 3.5)."""
     eng = _require_engine()
     events = eng.event_log
     clamped_n = max(1, min(last_n, 500))
@@ -335,7 +264,7 @@ def get_events(last_n: int = 100):
 
 @app.get("/logger")
 def get_logger_status():
-    """Returns current logger activity, active filepath, and write metrics."""
+    """Recording flag, file path, rows written, buffer depth."""
     if _logger is None:
         return {"recording": False, "path": None, "rows_written": 0, "buffer_depth": 0}
     return {
@@ -348,7 +277,7 @@ def get_logger_status():
 
 @app.get("/sequence")
 def get_sequence():
-    """Named-phase dump of sequences/fire.yaml, for rehearsal and step lookups."""
+    """fire.yaml phases (409 if it can't be parsed)."""
     eng = _require_engine()
     try:
         return {"steps": eng.dump_fire_sequence()}
@@ -363,15 +292,8 @@ def get_sequence():
 @app.post("/actuator")
 def post_actuator(cmd: ActuatorCommand):
     """
-    Commands a single actuator state if no autosequence is active.
-
-    Blocked while a sequence is active (returns 409 Conflict).
-    The GUI should reflect the blocked state immediately per SR 3.2.4.
-
-    Body: {"name": "lox_main", "state": 1}
-
-    Returns 423 Locked instead of running at all if another guarded
-    command is being serviced.
+    Body {"name": id, "state": 0|1}. 409 mid-sequence, unwired or stepper
+    moving; 422 unknown id; 423 if the control lock is busy.
     """
     eng = _require_engine()
     if cmd.state not in (0, 1):
@@ -390,7 +312,7 @@ def post_actuator(cmd: ActuatorCommand):
 
 @app.post("/safe")
 def post_safe():
-    """Immediately aborts active sequences and de-energizes all hardware outputs."""
+    """abort(), then de-energise everything. Waits for the control lock."""
     eng = _require_engine()
     with _control_guard(blocking=True):
         eng.all_safe()
@@ -400,17 +322,8 @@ def post_safe():
 @app.post("/fire")
 def post_fire():
     """
-    Triggers the fire autosequence if the system is idle.
-
-    Returns 409 if a sequence is already running, or if fire.yaml cannot be
-    run at all - unreadable, or commanding an actuator with no pin assigned.
-    [200 = sequence was launched].
-
-    Raises:
-        409: A sequence is already active, or this one was refused.
-
-    Returns 423 Locked instead of running at all if another guarded
-    command is being serviced.
+    Start fire.yaml. 409 if a sequence is active or fire.yaml is refused,
+    423 if the control lock is busy. Can return 200 without a launch.
     """
     eng = _require_engine()
     snap = eng.snapshot
@@ -432,14 +345,8 @@ def post_fire():
 @app.post("/abort")
 def post_abort():
     """
-    Aborts active sequences and triggers the safe shutdown sequence.
-
-    Always succeeds. If abort.yaml is unrunnable the hardware is still
-    de-energised, so there is no failure to report to the caller - check
-    /events for whether the ordered closure or the fallback ran.
-
-    Always waits its turn on the guard shared with /actuator, /fire, and
-    /sequence/* and is never discarded b/c of aborts.
+    abort.yaml, or all-off if it can't run; /events says which. Always 200.
+    Waits for the control lock, up to ~2 s behind another route.
     """
     eng = _require_engine()
     with _control_guard(blocking=True):
@@ -449,17 +356,7 @@ def post_abort():
 
 @app.post("/sequence/start")
 def post_sequence_start():
-    """
-    Resumes the fire sequence from wherever it's currently positioned
-    (T=0 if untouched, or wherever /sequence/stop last left it).
-
-    Unlike POST /fire, this does not reset position to 0 first. Refused
-    (409) if a sequence was aborted since - only POST /fire can restart
-    from there.
-
-    Returns 423 Locked instead of running at all if another guarded
-    command is being serviced.
-    """
+    """Resume fire from its position. 409 after an abort (use /fire), 423 if busy."""
     eng = _require_engine()
     try:
         with _control_guard(blocking=False):
@@ -472,13 +369,7 @@ def post_sequence_start():
 
 @app.post("/sequence/stop")
 def post_sequence_stop():
-    """
-    Pauses the fire sequence in place. No abort.yaml runs,
-    hardware is left exactly where it sits, and CSV recording continues.
-
-    Returns 423 Locked instead of running at all if another guarded
-    command is being serviced.
-    """
+    """Pause fire; outputs and recording untouched. 423 if busy."""
     eng = _require_engine()
     try:
         with _control_guard(blocking=False):
@@ -492,13 +383,8 @@ def post_sequence_stop():
 @app.post("/sequence/time")
 def post_sequence_time(req: SequenceTimeRequest):
     """
-    Seeks the fire sequence's clock. While stopped: display/rehearsal
-    only, no hardware effect. While running: forward-only fires every
-    action between the current position and the target, then keeps
-    ticking from there. Refused (409) for a backward seek while running.
-
-    Returns 423 Locked instead of running at all if another guarded
-    command is being serviced.
+    Seek the fire clock. Stopped: no hardware effect. Running: forward only
+    (skipped actions fire; 409 backward). 423 if busy.
     """
     eng = _require_engine()
     try:
@@ -512,13 +398,7 @@ def post_sequence_time(req: SequenceTimeRequest):
 
 @app.post("/sequence/step")
 def post_sequence_step(req: SequenceStepRequest):
-    """
-    Seeks the fire sequence's clock to a named step's start time. Same
-    stopped/running behavior as /sequence/time.
-
-    Returns 423 Locked instead of running at all if another guarded
-    command is being serviced.
-    """
+    """/sequence/time to a named step's start. 422 unknown step, 423 if busy."""
     eng = _require_engine()
     try:
         with _control_guard(blocking=False):
@@ -533,7 +413,7 @@ def post_sequence_step(req: SequenceStepRequest):
 
 @app.post("/tare")
 def post_tare():
-    """Captures load cell baseline readings as tare offsets."""
+    """Tare load cells on one sample; not locked out mid-fire."""
     eng = _require_engine()
     eng.tare()
     return {"ok": True}
@@ -541,14 +421,7 @@ def post_tare():
 
 @app.post("/calibration")
 def post_calibration(update: CalibrationUpdate):
-    """
-    Update a sensor calibration coefficient at runtime.
-
-    Changes take effect on the next processed scan batch.
-    Does not persist to calibration.json - call /calibration/save for that.
-
-    Body: {"tag": "pt0", "slope": 128.0, "intercept": -62.8}
-    """
+    """Set a slope/intercept from the next batch on; /calibration/save persists it."""
     eng = _require_engine()
     eng.update_calibration(update.tag, update.slope, update.intercept)
     return {"ok": True, "tag": update.tag}
@@ -556,7 +429,7 @@ def post_calibration(update: CalibrationUpdate):
 
 @app.post("/calibration/save")
 def post_calibration_save():
-    """Saves current active calibrations to calibration.json."""
+    """Write calibration.json (drops keys it doesn't know). 501 without a path."""
     eng = _require_engine()
     try:
         eng.save_calibration()
@@ -570,10 +443,7 @@ def post_calibration_save():
 
 @app.post("/log/start")
 def post_log_start(req: LogStartRequest):
-    """
-    Starts a manual CSV logging session if the logger is idle.
-    Returns 409 if a recording is already active.
-    """
+    """Start a CSV recording; 409 if one is running. Prefix isn't sanitised."""
     if _logger is None:
         raise HTTPException(status_code=503, detail="Logger not configured")
     if _logger.is_recording:
@@ -587,7 +457,7 @@ def post_log_start(req: LogStartRequest):
 
 @app.post("/log/stop")
 def post_log_stop():
-    """Stops the active manual CSV logging session and flushes the buffer."""
+    """Stop and flush the recording."""
     if _logger is None:
         raise HTTPException(status_code=503, detail="Logger not configured")
     if not _logger.is_recording:

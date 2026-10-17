@@ -1,28 +1,8 @@
-# sequences/fire.yaml
-#
-# Hot-fire autosequence timeline.
-#   state 1 = energise / open
-#   state 0 = de-energise / closed / safe
-#
-# Actuator names must exactly match an `id` in actuators.yaml:
-#   lox_press, fuel_press, lox_purge, fuel_purge,
-#   lox_main, fuel_main, lox_vent, fuel_vent, ignition_arm, ignition_fire
-#
-# The igniter fires only when BOTH ignition_arm and ignition_fire are
-# energised, and arm has an RC on-delay, so arm leads fire by about a second
-# and fire is released before arm.
-#
-# Format: each step has a `name` (unique, used by POST /sequence/step) and
-# an `actions` list of [elapsed_seconds, actuator_name, state] triples, all
-# relative to T=0 (moment FIRE is confirmed). A step's "start time" - what
-# /sequence/step jumps to - is the earliest action time within it. Actions
-# within a step keep their own individual times; grouping into a step does
-# not merge or renumber them.
-#
-# !! TIMINGS BELOW ARE PLACEHOLDERS PENDING LIQUIDS REVIEW !!
-# Carried over from the main LQD-DAQ timeline with the actuator names
-# remapped to this cart's ids. lox_main and fuel_main are stepper moves, so
-# closing takes time.
+# sequences/fire.yaml: hot-fire timeline, [t_s, actuator_id, state] from
+# T=0 at /fire; 1 = energise. Step names are /sequence/step targets; a step
+# starts at its earliest action.
+# PLACEHOLDER timings from the old Goondaq DAQ; Liquids confirms the real
+# sequence. Arm leads fire (RC on-delay) and fire releases first.
 
 post_record_seconds: 5.0
 
@@ -61,7 +41,7 @@ steps:
     actions:
       - [16.00, "lox_press",  0]
       - [16.00, "fuel_press", 0]
-      - [16.00, "lox_vent",   0]
+      - [16.00, "tank_depress", 0]
       - [16.00, "fuel_vent",  0]
   - name: purge_final_close
     actions:

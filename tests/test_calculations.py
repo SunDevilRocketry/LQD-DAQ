@@ -1,26 +1,18 @@
-"""
-tests/test_calculations.py
-
-Unit tests for daq/calculations.py.
-
-Run with:
-    python -m pytest tests/test_calculations.py -v
-
-"""
+"""tests/test_calculations.py: unit tests for daq/calculations.py."""
 
 import math
 import sys
 import os
 import tempfile
 
-# Make the package importable when running from the repo root
+# Importable from the repo root.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 from daq.calculations import (
-    type_k_uv_to_celsius,
-    lm34_voltage_to_celsius,
-    software_seebeck_type_k,
+    type_t_celsius_to_mv,
+    type_t_mv_to_celsius,
+    thermocouple_type_t,
     psi_to_pa,
     pa_to_psi,
     PSI_TO_PA,
@@ -42,7 +34,7 @@ from daq.calculations import (
 # -- Helper Utilities ----------------------------------------
 
 def _write_lox_table(rows: list[tuple[float, float]]) -> str:
-    """Writes a temporary minimal LOX density table to disk and returns the path."""
+    """Write a minimal LOX density CSV and return its path."""
     content = "temperature_R,density_lbm_ft3\n"
     for t, d in rows:
         content += f"{t},{d}\n"
@@ -54,113 +46,57 @@ def _write_lox_table(rows: list[tuple[float, float]]) -> str:
     return f.name
 
 
-# -- Type-K Thermocouple Polynomial (NIST ITS-90) ------------
+# -- Type T Thermocouple (NIST ITS-90) -----------------------
+# NIST ITS-90 type T table, mV at a 0 C reference:
+# https://its90.nist.gov/downloadFiles/type_t.tab.txt
 
-class TestTypeKInversePolynomial:
-    """NIST Monograph 175, Table 10.5 polynomial conversions."""
-
-    def test_zero_emf_gives_zero_celsius(self):
-        result = type_k_uv_to_celsius(0.0)
-        assert abs(result) < 1e-6, f"Expected 0 °C, got {result}"
-
-    def test_positive_emf_positive_temp(self):
-        # NIST: 1000 µV ≈ 24.91 °C for Type K
-        result = type_k_uv_to_celsius(1000.0)
-        assert abs(result - 24.91) < 0.1, f"Expected ~24.91 °C, got {result}"
-
-    def test_negative_emf_negative_temp(self):
-        # NIST: -1000 µV ≈ -25.00 °C for Type K (negative branch)
-        result = type_k_uv_to_celsius(-1000.0)
-        assert result < 0.0, "Negative EMF should give negative temperature"
-
-    def test_large_positive_emf(self):
-        # NIST: ~20 000 µV ≈ 475 °C
-        result = type_k_uv_to_celsius(20_000.0)
-        assert 460.0 < result < 490.0, f"Expected ~475 °C, got {result}"
-
-    def test_selects_positive_branch_at_zero(self):
-        # Positive branch used for emf >= 0
-        pos = type_k_uv_to_celsius(0.0)
-        neg = type_k_uv_to_celsius(-1e-9)  # just below 0
-        # Both should be very close to 0 °C (no discontinuity at origin)
-        assert abs(pos - neg) < 0.01
+_NIST_TYPE_T_TABLE = [
+    (-200.0, -5.603),
+    (-183.0, -5.316),   # about LOX normal boiling point
+    (0.0,     0.000),
+    (25.0,    0.992),
+    (100.0,   4.279),
+    (200.0,   9.288),
+    (400.0,  20.872),
+]
 
 
-# -- LM34 CJC Temperature Sensor ------------------------------
+class TestTypeT:
+    """NIST ITS-90 Type T reference and inverse functions."""
 
-class TestLM34VoltageToCelsius:
-    """LM34 sensor output conversions (10 mV/°F, 0 V = 0 °F)."""
+    @pytest.mark.parametrize("temp_c, emf_mv", _NIST_TYPE_T_TABLE)
+    def test_reference_function_matches_nist_table(self, temp_c, emf_mv):
+        # The table is rounded to 1 µV.
+        assert type_t_celsius_to_mv(temp_c) == pytest.approx(emf_mv, abs=0.0006)
 
-    def test_room_temperature(self):
-        # 77 °F = 25 °C; LM34 outputs 10 mV/°F -> 770 mV = 0.770 V
-        result = lm34_voltage_to_celsius(0.770)
-        assert abs(result - 25.0) < 0.1, f"Expected ~25 °C, got {result}"
+    @pytest.mark.parametrize("temp_c, emf_mv", _NIST_TYPE_T_TABLE)
+    def test_inverse_function_matches_nist_table(self, temp_c, emf_mv):
+        # NIST inverse error <= 0.04 C, plus up to ~0.03 C from table rounding.
+        assert type_t_mv_to_celsius(emf_mv) == pytest.approx(temp_c, abs=0.08)
 
-    def test_freezing_point_fahrenheit(self):
-        # 32 °F = 0 °C; LM34 outputs 320 mV = 0.320 V
-        result = lm34_voltage_to_celsius(0.320)
-        assert abs(result - 0.0) < 0.1, f"Expected ~0 °C, got {result}"
+    @pytest.mark.parametrize("emf_mv", [-5.7, 21.0])
+    def test_inverse_refuses_emf_outside_its_range(self, emf_mv):
+        assert type_t_mv_to_celsius(emf_mv) is None
 
-    def test_zero_volts_is_minus_17_8_celsius(self):
-        # 0 V = 0 °F = -17.78 °C
-        result = lm34_voltage_to_celsius(0.0)
-        assert abs(result - (-17.78)) < 0.1, f"Expected ~-17.78 °C, got {result}"
+    def test_zero_differential_reads_the_cold_junction(self):
+        # Bench check: tc0 at room temperature reads room temperature.
+        assert thermocouple_type_t(0.0, 22.0) == pytest.approx(22.0, abs=0.05)
 
-    def test_linearity(self):
-        # Doubling the voltage from 0.5 V to 1.0 V should double °F reading
-        t1 = lm34_voltage_to_celsius(0.5)
-        t2 = lm34_voltage_to_celsius(1.0)
-        # 0.5 V = 50 °F = 10 °C; 1.0 V = 100 °F = 37.78 °C
-        assert abs(t1 - 10.0) < 0.1
-        assert abs(t2 - 37.78) < 0.1
+    def test_lox_with_room_temperature_cold_junction(self):
+        # Hot -183 C, cold 25 C: E(-183) - E(25) = -6.308 mV.
+        diff_v = (-5.316 - 0.992) / 1e3
+        assert thermocouple_type_t(diff_v, 25.0) == pytest.approx(-183.0, abs=0.1)
 
-
-# -- Cold Junction Compensation (Seebeck) ---------------------
-
-class TestSoftwareSeebeck:
-    """CJC offset and differential TC math integrations."""
-
-    def test_zero_differential_zero_cjc_gives_zero(self):
-        result = software_seebeck_type_k(0.0, 0.0)
-        assert abs(result) < 0.1, f"Expected ~0 °C, got {result}"
-
-    def test_cjc_offset_adds_correctly(self):
-        # With 0 V differential and 25 °C CJC, hot junction = CJC temp
-        # b/c the TC adds nothing
-        result = software_seebeck_type_k(0.0, 25.0)
-        # 25 °C * 40.7 µV/°C = 1017.5 µV -> type_k_uv_to_celsius(1017.5) ≈ 25.3 °C
-        assert abs(result - 25.3) < 0.5, f"Expected ~25 °C, got {result}"
-
-    def test_positive_differential_increases_temperature(self):
-        baseline = software_seebeck_type_k(0.0, 25.0)
-        higher   = software_seebeck_type_k(0.001, 25.0)   # 1 mV extra
-        assert higher > baseline, "Positive dV should increase inferred temperature"
-
-    def test_output_matches_goondaq_reference(self):
-        """
-        Cross-check against the GoonDAQ monolith formula:
-            cjc_uv  = cjc_c * 40.7
-            total   = diff_v * 1e6 + cjc_uv
-            result  = type_k_uv_to_celsius(total)
-        """
-        diff_v = 0.002      # 2 mV differential
-        cjc_c  = 23.5
-
-        # Replicate monolith manually
-        cjc_uv   = cjc_c * 40.7
-        total_uv = diff_v * 1e6 + cjc_uv
-        expected = type_k_uv_to_celsius(total_uv)
-
-        result = software_seebeck_type_k(diff_v, cjc_c)
-        assert abs(result - expected) < 1e-9, (
-            f"Mismatch with GoonDAQ reference: expected {expected}, got {result}"
-        )
+    def test_hot_junction_above_cold_junction(self):
+        # Hot 100 C, cold 25 C: 4.279 - 0.992 = 3.287 mV.
+        diff_v = (4.279 - 0.992) / 1e3
+        assert thermocouple_type_t(diff_v, 25.0) == pytest.approx(100.0, abs=0.05)
 
 
 # -- SI Unit Conversion Helpers --------------------------------
 
 class TestUnitConversion:
-    """psi <-> Pa conversion (team convention: internal SI, Jul 2026)."""
+    """psi <-> Pa (internal units are SI)."""
 
     def test_one_psi_in_pa(self):
         assert abs(psi_to_pa(1.0) - 6894.757293168361) < 1e-6
@@ -173,15 +109,14 @@ class TestUnitConversion:
         assert pa_to_psi(0.0) == 0.0
 
     def test_one_atmosphere_sanity_check(self):
-        # 14.696 psia is ~1 standard atmosphere (101325 Pa) - a good
-        # sanity check that the conversion factor is right.
+        # 14.696 psi is 1 atm (101325 Pa).
         assert abs(psi_to_pa(14.696) - 101325.0) < 1.0
 
 
 # -- Pressure Transducers -------------------------------------
 
 class TestPTConversion:
-    """Linear pressure transducer calibrations (raw psi calibration)."""
+    """Linear PT calibration in psi."""
 
     def test_default_calibration_midpoint(self):
         # slope=252, intercept=-119.5 -> at 0.5 V: 252*0.5 - 119.5 = 6.5 psi
@@ -200,7 +135,7 @@ class TestPTConversion:
 
 
 class TestPTConversionPa:
-    """Pa-native PT conversion"""
+    """PT calibration returned in Pa."""
 
     def test_matches_psi_conversion_times_factor(self):
         v, s, i = 0.5, 252.0, -119.5
@@ -233,7 +168,7 @@ class TestLoadCellConversion:
         assert abs(result - 90.0) < 1e-6
 
     def test_zero_after_tare(self):
-        # Tare @ current reading -> output should be 0
+        # Tare at the current reading -> 0.
         raw = 1.5
         force_untared = load_cell_voltage_to_force(raw, 100.0, 0.0)
         result = load_cell_voltage_to_force(raw, 100.0, 0.0, tare=force_untared)
@@ -263,7 +198,7 @@ class TestLOXDensityTable:
         os.unlink(path)
 
     def test_exact_table_point_interpolates_correctly(self):
-        # At T = 100 R = (100 * 5/9) - 273.15 °C
+        # 100 R = 100 * 5/9 - 273.15 C
         t_r = 150.0    # midpoint of our table
         t_c = t_r * (5.0 / 9.0) - 273.15
         result = lox_density_from_celsius(t_c)
@@ -272,7 +207,6 @@ class TestLOXDensityTable:
         assert abs(result - 66.0) < 0.05
 
     def test_below_range_returns_none(self):
-        # Temp below the minimum in table
         t_c = (90.0 * 5.0 / 9.0) - 273.15  # 90 R, below 100 R minimum
         result = lox_density_from_celsius(t_c)
         assert result is None
@@ -283,7 +217,6 @@ class TestLOXDensityTable:
         assert result is None
 
     def test_interpolation_is_linear(self):
-        # At exactly halfway between two table points, should be the average
         t_mid_r = 145.0
         t_mid_c = t_mid_r * (5.0 / 9.0) - 273.15
         result = lox_density_from_celsius(t_mid_c)
@@ -298,15 +231,14 @@ class TestLOXMassFlowRate:
 
     @pytest.fixture(autouse=True)
     def real_table(self):
-        # Span table across 180-240 R to cover -160 °C (≈203.67 R)
+        # 180-240 R covers -160 C (203.67 R).
         rows = [(180.0 + i * 5.0, 70.0 - i * 0.2) for i in range(13)]
         path = _write_lox_table(rows)
         load_lox_table(path)
         yield
         os.unlink(path)
 
-    # This cart measures orifice dP with a differential transducer, so the
-    # functions take dP directly and carry no built-in geometry.
+    # The functions take dP directly; geometry comes from config.
     LOX_AREA = orifice_area_m2(0.199)
     LOX_CD   = 0.6
 
@@ -342,10 +274,7 @@ class TestLOXMassFlowRate:
         assert abs(ratio - 2.0) < 0.01, f"Expected ratio ~2.0, got {ratio}"
 
     def test_matches_goondaq_formula(self):
-        """
-        Manually replicate the GoonDAQ lox_mdot() calculation and compare.
-        Uses the density value our table returns, not a hardcoded constant.
-        """
+        """Matches GoonDAQ's lox_mdot() at this table's density."""
         toi_c = -160.0
         dp_pa = psi_to_pa(100.0)
         rho_lbm = lox_density_from_celsius(toi_c)
@@ -479,7 +408,7 @@ class TestImpulseEstimate:
         assert impulse_step_estimate(0.5, None, 0.002) is None
 
     def test_manual_calculation(self):
-        """Verify against hand-computed value."""
+        """Matches a hand-computed value."""
         lox   = 0.5     # kg/s
         fuel  = 0.2     # kg/s
         dt    = 0.002   # s
@@ -505,10 +434,7 @@ class TestImpulseEstimate:
 class TestLOXSaturationPressure:
 
     def test_normal_boiling_point(self):
-        # LOX normal boiling point: -183 °C, 1 atm = 101325 Pa.
-        # The Antoine equation is a curve fit; error at NBP is ~1.6%.
-        # Should result in reasonable range & correct direction
-        # for saturation check
+        # At -183 C the Antoine fit reads ~1.6 % below 101325 Pa.
         result = lox_saturation_pressure_pa(-183.0)
         assert result is not None
         assert psi_to_pa(13.0) < result < psi_to_pa(16.5), (
@@ -516,12 +442,12 @@ class TestLOXSaturationPressure:
         )
 
     def test_above_valid_range_returns_none(self):
-        # Above critical point (~-119 °C / 154 K)
+        # Above the critical point (~-119 C / 154 K).
         result = lox_saturation_pressure_pa(-100.0)
         assert result is None
 
     def test_below_valid_range_returns_none(self):
-        # Below triple point (~-219 °C / 54 K)
+        # Below the triple point (~-219 C / 54 K).
         result = lox_saturation_pressure_pa(-220.0)
         assert result is None
 
@@ -538,12 +464,12 @@ class TestLOXSaturationPressure:
 class TestLOXBelowSaturation:
 
     def test_tank_above_saturation_returns_false(self):
-        # At NBP (-183 °C), p_sat ≈ 101325 Pa. Tank at 100 psia -> safe.
+        # At -183 C, p_sat ~ 1 atm; a 100 psia tank is above it.
         result = lox_below_saturation(psi_to_pa(100.0), -183.0)
         assert result is False
 
     def test_tank_below_saturation_returns_true(self):
-        # At NBP, p_sat ≈ 101325 Pa. Tank at 5 psia -> alert.
+        # A 5 psia tank is below it.
         result = lox_below_saturation(psi_to_pa(5.0), -183.0)
         assert result is True
 
