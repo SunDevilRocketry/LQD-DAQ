@@ -942,6 +942,48 @@ class TestFireSequencing:
         with pytest.raises(RuntimeError, match="aborted"):
             engine.start_sequence()
 
+    POST_WINDOW_STEPS = {
+        "post_record_seconds": 5.0,
+        "steps": [{"name": "only", "actions": [[0.0, "tank_depress", 1]]}],
+    }
+
+    def _fire_into_post_window(self, tmp_path, logger):
+        engine = self._engine(
+            tmp_path, logger=logger, fire_steps=self.POST_WINDOW_STEPS
+        )
+        engine.fire()
+        time.sleep(0.2)   # past the only action, inside the 5 s post window
+        assert engine._sequence_active
+        return engine
+
+    @staticmethod
+    def _finish_abort(engine):
+        engine.abort()
+        engine._sequence_thread.join(timeout=5.0)
+
+    def test_abort_in_post_window_reports_aborted_and_keeps_recording(self, tmp_path):
+        logger = _StubLogger()
+        engine = self._fire_into_post_window(tmp_path, logger)
+
+        self._finish_abort(engine)
+
+        assert engine.sequence_status()["state"] == FIRE_ABORTED
+        # Only abort.yaml stops the recording, after it has run.
+        assert logger.stop_calls == 1
+
+    def test_stop_and_seek_in_post_window_are_refused(self, tmp_path):
+        engine = self._fire_into_post_window(tmp_path, _StubLogger())
+        try:
+            t0 = time.perf_counter()
+            with pytest.raises(RuntimeError, match="post-record"):
+                engine.stop_sequence()
+            assert time.perf_counter() - t0 < 0.5, "stop blocked instead of refusing"
+            with pytest.raises(RuntimeError, match="post-record"):
+                engine.set_sequence_time(10.0)
+            assert engine._sequence_active
+        finally:
+            self._finish_abort(engine)
+
 class _StubLogger:
     """Minimal Logger stand-in for asserting recording start/stop calls."""
 

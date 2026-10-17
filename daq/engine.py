@@ -558,11 +558,12 @@ class Engine:
         Pause fire in place: outputs and recording untouched.
 
         Raises:
-            RuntimeError: no fire sequence is currently active.
+            RuntimeError: no fire is running, or it's past its last action.
         """
         with self._lock:
             if not (self._sequence_active and self._sequence_name == "fire"):
                 raise RuntimeError("No fire sequence is active")
+            self._refuse_if_actions_done()
         self._pause_flag.set()
         thread = self._sequence_thread
         if thread and thread.is_alive():
@@ -611,6 +612,7 @@ class Engine:
                 raise RuntimeError(
                     "Cannot jump backward while running - stop the sequence first"
                 )
+            self._refuse_if_actions_done()
 
         self._pause_flag.set()
         thread = self._sequence_thread
@@ -661,6 +663,17 @@ class Engine:
         if match is None:
             raise KeyError(step_name)
         return self.set_sequence_time(match.start_t)
+
+    def _refuse_if_actions_done(self) -> None:
+        """
+        Raise if the fire has applied every action (only the post-record
+        window is left, which can't be paused or seeked). Caller holds _lock.
+        """
+        total = sum(len(step.actions) for step in self._fire_steps or [])
+        if self._fire_next_idx >= total:
+            raise RuntimeError(
+                "Fire has applied every action; only post-record remains"
+            )
 
     @staticmethod
     def _step_name_for_position(
@@ -1222,14 +1235,18 @@ class Engine:
             else:
                 time.sleep(0.0005)
 
-        # An abort here still ends as "completed".
         if self._logger and post_s > 0:
             self._log(f"Sequence '{name}' complete, recording {post_s:.1f} s post-data")
             deadline = time.perf_counter() + post_s
             while time.perf_counter() < deadline:
                 if self._abort_flag.is_set():
+                    # Keep recording: abort.yaml runs next and stops it.
                     self._log("Post-record window interrupted by abort")
-                    break
+                    if is_fire:
+                        with self._lock:
+                            self._fire_state = FIRE_ABORTED
+                    self._sequence_paused()
+                    return
                 time.sleep(0.05)
 
         if self._logger:
