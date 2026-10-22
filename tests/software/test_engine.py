@@ -1642,3 +1642,118 @@ class TestColdJunctionPoll:
 
         assert engine._counters == {}
         assert any("counter read FAILED" in e for e in engine.event_log)
+
+
+class TestShutdown:
+    """stop() on live hardware runs abort.yaml to its last step, then closes."""
+
+    ABORT = {
+        "post_record_seconds": 3.0,
+        "steps": [[0.0, "ignition_arm", 0], [0.0, "lox_main", 0],
+                  [0.0, "lox_press", 0], [0.05, "lox_purge", 1],
+                  [0.8, "lox_purge", 0]],
+    }
+
+    def _engine(self, tmp_path, abort=None, logger=None):
+        """Started engine whose device records writes, CJC polls and the close."""
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir(exist_ok=True)
+        (seq_dir / "abort.yaml").write_text(yaml.safe_dump(abort or self.ABORT))
+        engine = make_engine(sequence_dir=str(seq_dir), logger=logger)
+
+        events = []
+        dev = engine._device
+        write, close, cjc = dev.write_actuator, dev.close, dev.read_cjc_celsius
+
+        def rec_write(name, state):
+            write(name, state)
+            events.append(("write", (name, state), time.perf_counter()))
+
+        def rec_close():
+            moving = any(r.moving for r in dev.actuator_states().values())
+            events.append(("close", moving, time.perf_counter()))
+            close()
+
+        def rec_cjc():
+            events.append(("cjc", None, time.perf_counter()))
+            return cjc()
+
+        dev.write_actuator, dev.close, dev.read_cjc_celsius = rec_write, rec_close, rec_cjc
+        engine.start()
+        wait_for_first_batch(engine)
+        return engine, events
+
+    @staticmethod
+    def _writes(events):
+        return [detail for kind, detail, _ in events if kind == "write"]
+
+    @staticmethod
+    def _close_index(events):
+        return next(i for i, e in enumerate(events) if e[0] == "close")
+
+    def test_idle_shutdown_skips_abort_yaml(self, tmp_path):
+        engine, events = self._engine(tmp_path)
+        engine.stop()
+        assert self._writes(events) == []
+        assert not any("Hardware live" in line for line in engine.event_log)
+
+    def test_live_shutdown_runs_every_abort_step_before_closing(self, tmp_path):
+        engine, events = self._engine(tmp_path)
+        engine.write_actuator("lox_press", 1)
+        engine.write_actuator("lox_main", 1)
+        events.clear()
+
+        engine.stop()
+
+        steps = [tuple(s[1:]) for s in self.ABORT["steps"]]
+        assert self._writes(events)[-len(steps):] == steps
+        close = self._close_index(events)
+        assert all(e[0] != "write" for e in events[close:])
+        assert events[close][1] is False, "a main was still moving at close"
+
+    def test_mains_burst_finishes_before_close(self, tmp_path):
+        engine, events = self._engine(
+            tmp_path, abort={"post_record_seconds": 0,
+                             "steps": [[0.0, "lox_main", 0]]})
+        engine.write_actuator("lox_main", 1)
+        events.clear()
+
+        engine.stop()
+
+        burst = self._writes(events).index(("lox_main", 0))
+        close = self._close_index(events)
+        assert events[close][1] is False
+        assert events[close][2] - events[burst][2] >= 0.2   # 400 steps at 2000 Hz
+
+    def test_stream_keeps_feeding_the_watchdog_during_the_abort(self, tmp_path):
+        engine, events = self._engine(tmp_path)
+        engine.write_actuator("lox_press", 1)
+        events.clear()
+
+        engine.stop()
+
+        on  = next(t for kind, d, t in events if d == ("lox_purge", 1))
+        off = next(t for kind, d, t in events if d == ("lox_purge", 0))
+        assert any(kind == "cjc" and on < t < off for kind, _, t in events)
+
+    def test_post_record_window_is_not_waited_for(self, tmp_path):
+        engine, _ = self._engine(tmp_path, logger=_StubLogger())
+        engine.write_actuator("lox_press", 1)
+
+        start = time.perf_counter()
+        engine.stop()
+
+        assert time.perf_counter() - start < 2.0   # last step 0.8 s, post 3 s
+
+    def test_shutdown_during_an_abort_waits_for_it_without_rerunning(self, tmp_path):
+        engine, events = self._engine(tmp_path)
+        engine.write_actuator("lox_press", 1)
+        engine.abort()
+
+        engine.stop()
+
+        writes = self._writes(events)
+        assert writes.count(("lox_purge", 1)) == 1
+        assert writes.count(("lox_purge", 0)) == 1
+        close = self._close_index(events)
+        assert all(e[0] != "write" for e in events[close:])

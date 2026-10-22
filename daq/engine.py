@@ -77,6 +77,9 @@ _MOCK_PULSE_HZ  = 2000.0
 # Impulse integration doesn't bridge a longer gap between scans (comms loss).
 _IMPULSE_MAX_GAP_S = 0.5
 
+# Slack on stop()'s wait for abort.yaml's last step.
+_SHUTDOWN_MARGIN_S = 1.0
+
 # SysRD 2.5.4 minimum sample rate.
 _MIN_STREAM_HZ = 200
 
@@ -267,6 +270,9 @@ class Engine:
         self._sequence_active    = False
         self._sequence_name      = ""
         self._sequence_t0:       Optional[float] = None
+        # For stop(): the last step's time, and an event set once it's written.
+        self._sequence_end_s:    float = 0.0
+        self._steps_done         = threading.Event()
 
         # Fire-only pause/seek state.
         self._pause_flag         = threading.Event()
@@ -307,10 +313,22 @@ class Engine:
         self._stream_thread.start()
 
     def stop(self) -> None:
-        """Abort, stop the stream thread, and close the device (which safes it)."""
+        """
+        Safe the cart, stop the stream thread, and close the device.
+
+        Live hardware gets abort.yaml run to its last step before the close,
+        with the stream still up so the watchdog stays fed; idle skips it.
+        """
         self._log("Engine stopping")
+        if self._is_live():
+            self._log("Hardware live at shutdown: running the abort first")
+            self.abort()
+            self._wait_for_abort_steps()
+            # Closing the device would cut a stepper burst short.
+            while any(r.moving for r in self._device.actuator_states().values()):
+                time.sleep(0.01)
+        self._halt_sequence()   # also ends abort.yaml's post-record window
         self._running = False
-        self.abort()
 
         if self._stream_thread:
             self._stream_thread.join(timeout=2.0)
@@ -940,6 +958,26 @@ class Engine:
             except Exception as exc:
                 self._log(f"ABORT: {name} write failed: {exc}")
 
+    def _is_live(self) -> bool:
+        """A sequence is running, or any actuator is energised, open or moving."""
+        with self._lock:
+            if self._sequence_active:
+                return True
+        states = self._device.actuator_states()
+        return any(r.state == 1 or r.moving for r in states.values())
+
+    def _wait_for_abort_steps(self) -> None:
+        """Wait for abort.yaml's last step (not its post-record window)."""
+        with self._lock:
+            if not (self._sequence_active and self._sequence_name == "abort"):
+                return   # the fallback ran inside abort()
+            done = self._steps_done
+            timeout = (self._sequence_t0 + self._sequence_end_s
+                       + _SHUTDOWN_MARGIN_S - time.perf_counter())
+        if not done.wait(max(timeout, 0.0)):
+            self._log("WARNING: abort.yaml not finished at shutdown; "
+                      "closing anyway")
+
     def _close_mains(self) -> None:
         """Best effort: command each stepper main closed unless it already is."""
         states = self._device.actuator_states()
@@ -1539,6 +1577,9 @@ class Engine:
             # Set here, not in the thread, so sequence_status() can't race it.
             t0 = time.perf_counter() - start_elapsed
             self._sequence_t0 = t0
+            self._sequence_end_s = steps[-1][0] if steps else 0.0
+            steps_done = threading.Event()
+            self._steps_done = steps_done
             if is_fire:
                 self._fire_t0 = t0
                 self._fire_state = FIRE_RUNNING
@@ -1556,7 +1597,7 @@ class Engine:
         self._pause_flag.clear()
         self._sequence_thread = threading.Thread(
             target=self._run_sequence,
-            args=(name, steps, post_s, is_fire, start_idx, t0),
+            args=(name, steps, post_s, is_fire, start_idx, t0, steps_done),
             name=f"daq-seq-{name}",
             daemon=True,
         )
@@ -1571,6 +1612,7 @@ class Engine:
         is_fire: bool,
         start_idx: int,
         t0: float,
+        steps_done: threading.Event,
     ) -> None:
         """Run validated steps against t0; fire checks abort/pause each tick."""
         self._log(f"Sequence '{name}' starting")
@@ -1618,6 +1660,8 @@ class Engine:
                         self._fire_position_s = target_t
             else:
                 time.sleep(0.0005)
+
+        steps_done.set()
 
         if self._logger and post_s > 0:
             self._log(f"Sequence '{name}' complete, recording {post_s:.1f} s post-data")

@@ -12,7 +12,8 @@ import yaml
 from daq.hardware import interface
 from daq.hardware.interface import LabJackT7, _dio_number
 from daq.manifest import (
-    ActuatorSpec, ChannelSpec, PT_DIRECT, PULSE_STEPPER, load_actuators, load_channels,
+    ActuatorSpec, ChannelSpec, BINARY_DIO, PT_DIRECT, PULSE_STEPPER, TC_DIFFERENTIAL,
+    load_actuators, load_channels,
 )
 
 from tests.software._helpers import REPO_ACTUATORS, REPO_CHANNELS
@@ -232,3 +233,229 @@ class TestSafingCache:
         device = self._device()
         device._safe_all_hardware()
         assert device.read_actuator("fuel_vent") == 1
+
+
+class _FakeLJM:
+    """The ljm calls on the open/stream/close path, backed by a register dict."""
+
+    HANDLE = 7
+    SERIAL = 470012345
+
+    def __init__(self):
+        self.registers = {}
+        self.events = []          # ("write", name, value) / ("stop",) / ("close",)
+        self.stream_starts = []   # (scans_per_read, n_channels, addrs, hz)
+        self.max_hz = None        # above this, eStreamStart raises SCAN_OVERLAP
+        self.start_error = None
+        self.close_error = None
+        self.reads = []           # queued eStreamRead returns
+
+    def install(self, monkeypatch):
+        for name in ("openS", "getHandleInfo", "eWriteName", "eReadName",
+                     "nameToAddress", "eStreamStart", "eStreamRead",
+                     "eStreamStop", "close"):
+            monkeypatch.setattr(interface.ljm, name, getattr(self, name))
+
+    def writes(self):
+        return [(e[1], e[2]) for e in self.events if e[0] == "write"]
+
+    def openS(self, device_type, connection_type, identifier):
+        return self.HANDLE
+
+    def getHandleInfo(self, handle):
+        return (7, 3, self.SERIAL, 0, 502, 1040)
+
+    def eWriteName(self, handle, name, value):
+        self.events.append(("write", name, value))
+        self.registers[name] = value
+
+    def eReadName(self, handle, name):
+        return self.registers.get(name, 0)
+
+    def nameToAddress(self, name):
+        return (2 * int(name[3:]), 3)   # AINn is Modbus address 2n
+
+    def eStreamStart(self, handle, scans_per_read, n_channels, addrs, hz):
+        self.stream_starts.append((scans_per_read, n_channels, list(addrs), hz))
+        if self.start_error is not None:
+            raise self.start_error
+        if self.max_hz is not None and hz > self.max_hz:
+            raise interface.ljm.LJMError(errorCode=2942,
+                                         errorString="STREAM_SCAN_OVERLAP")
+        return float(hz)
+
+    def eStreamRead(self, handle):
+        return self.reads.pop(0)
+
+    def eStreamStop(self, handle):
+        self.events.append(("stop",))
+
+    def close(self, handle):
+        self.events.append(("close",))
+        if self.close_error is not None:
+            raise self.close_error
+
+
+@pytest.fixture
+def fake_ljm(monkeypatch):
+    fake = _FakeLJM()
+    fake.install(monkeypatch)
+    return fake
+
+
+def _pt_and_tc():
+    return [
+        ChannelSpec(id="pt0", type=PT_DIRECT, unit="psi", ain="AIN0"),
+        ChannelSpec(id="tc0", type=TC_DIFFERENTIAL, unit="celsius",
+                    ain_pos="AIN2", ain_neg="AIN3"),
+    ]
+
+
+class TestStreamStart:
+
+    def test_scan_list_follows_the_shipped_manifest(self, fake_ljm):
+        channels = load_channels(REPO_CHANNELS)
+        device = LabJackT7(channels, [])
+        device._handle = _FakeLJM.HANDLE
+
+        assert device.start_stream() == 500
+
+        streamed = [c for c in channels if c.active and c.is_wired and c.is_streamed]
+        pins = [c.ain_pos if c.type == TC_DIFFERENTIAL else c.ain for c in streamed]
+        scans, n, addrs, hz = fake_ljm.stream_starts[-1]
+        assert addrs == [2 * int(pin[3:]) for pin in pins]
+        assert n == len(pins) and hz == 500 and scans == 25
+        assert device.sensor_tags == [c.id for c in streamed]
+        assert "tc0" in device.sensor_tags and "pos_lox_main" not in device.sensor_tags
+        assert device.is_streaming
+
+    def test_stream_settings_are_written_before_the_start(self, fake_ljm):
+        device = LabJackT7(_pt_and_tc(), [])
+        device._handle = _FakeLJM.HANDLE
+        device.start_stream()
+        regs = dict(fake_ljm.writes())
+        assert regs["STREAM_SETTLING_US"] == interface._SETTLING_US
+        assert regs["STREAM_RESOLUTION_INDEX"] == interface._RESOLUTION
+
+    def test_scan_overlap_halves_the_rate_until_it_fits(self, fake_ljm):
+        fake_ljm.max_hz = 150
+        device = LabJackT7(_pt_and_tc(), [], stream_hz=500)
+        device._handle = _FakeLJM.HANDLE
+
+        assert device.start_stream() == 125
+        assert [s[3] for s in fake_ljm.stream_starts] == [500, 250, 125]
+        assert device._scans_per_read == 6
+        assert device.stream_rate_hz == 125
+
+    def test_gives_up_below_10_hz(self, fake_ljm):
+        fake_ljm.max_hz = 5
+        device = LabJackT7(_pt_and_tc(), [], stream_hz=500)
+        device._handle = _FakeLJM.HANDLE
+
+        with pytest.raises(RuntimeError, match="any rate >= 10 Hz"):
+            device.start_stream()
+        assert [s[3] for s in fake_ljm.stream_starts] == [500, 250, 125, 62, 31, 15]
+        assert not device.is_streaming
+
+    def test_other_ljm_errors_are_not_retried(self, fake_ljm):
+        fake_ljm.start_error = interface.ljm.LJMError(
+            errorCode=1227, errorString="LJME_DEVICE_NOT_FOUND")
+        device = LabJackT7(_pt_and_tc(), [])
+        device._handle = _FakeLJM.HANDLE
+
+        with pytest.raises(interface.ljm.LJMError):
+            device.start_stream()
+        assert len(fake_ljm.stream_starts) == 1
+        assert not device.is_streaming
+
+    def test_refuses_with_no_wired_channel(self, fake_ljm):
+        device = LabJackT7([], [])
+        device._handle = _FakeLJM.HANDLE
+        with pytest.raises(RuntimeError, match="No wired analog channels"):
+            device.start_stream()
+        assert fake_ljm.stream_starts == []
+
+
+class TestStreamRead:
+
+    def test_read_before_start_raises(self, fake_ljm):
+        device = LabJackT7(_pt_and_tc(), [])
+        device._handle = _FakeLJM.HANDLE
+        with pytest.raises(RuntimeError, match="before start_stream"):
+            device.stream_read()
+
+    def test_batch_is_deinterleaved_by_scan_list_order(self, fake_ljm):
+        device = LabJackT7(_pt_and_tc(), [])
+        device._handle = _FakeLJM.HANDLE
+        device.start_stream()
+        fake_ljm.reads.append(([1.0, 0.01, 2.0, 0.02, 3.0, 0.03], 4, 10))
+
+        batch = device.stream_read()
+
+        assert batch["pt0"] == [1.0, 2.0, 3.0]
+        assert batch["tc0"] == [0.01, 0.02, 0.03]
+        assert batch["backlog_device"] == [4]
+        assert batch["backlog_ljm"] == [10]
+
+    def test_scan_times_are_spaced_at_the_actual_rate_ending_now(self, fake_ljm):
+        fake_ljm.max_hz = 300
+        device = LabJackT7(_pt_and_tc(), [], stream_hz=500)
+        device._handle = _FakeLJM.HANDLE
+        device.start_stream()                       # negotiates 250 Hz
+        fake_ljm.reads.append(([0.0] * 8, 0, 0))   # 4 scans x 2 channels
+
+        before = device.stream_time_s
+        times = device.stream_read()["scan_times"]
+        after = device.stream_time_s
+
+        assert len(times) == 4
+        for a, b in zip(times, times[1:]):
+            assert b - a == pytest.approx(1 / 250)
+        assert before <= times[-1] <= after
+
+
+class TestLifecycle:
+
+    def _device(self):
+        return LabJackT7(load_channels(REPO_CHANNELS), load_actuators(REPO_ACTUATORS))
+
+    def test_open_safes_every_valve_before_arming_the_watchdog(self, fake_ljm):
+        device = self._device()
+        device.open()
+
+        assert device.is_connected
+        assert device.serial_number == str(_FakeLJM.SERIAL)
+        valves = [s.dio for s in load_actuators(REPO_ACTUATORS)
+                  if s.type == BINARY_DIO and s.dio is not None]
+        assert valves and all(fake_ljm.registers[dio] == 1 for dio in valves)
+
+        writes = [name for name, _ in fake_ljm.writes()]
+        last_safe = max(i for i, name in enumerate(writes) if name in valves)
+        assert last_safe < writes.index("WATCHDOG_ENABLE_DEFAULT")
+        assert fake_ljm.registers["WATCHDOG_ENABLE_DEFAULT"] == 1
+
+    def test_close_stops_the_stream_and_safes_before_closing(self, fake_ljm):
+        device = self._device()
+        device.open()
+        device.start_stream()
+        device.write_actuator("fuel_vent", 1)
+        assert fake_ljm.registers["EIO7"] == 0          # active-low: energised
+        fake_ljm.events.clear()
+
+        device.close()
+
+        kinds = [e[0] for e in fake_ljm.events]
+        assert kinds[0] == "stop" and kinds[-1] == "close"
+        assert ("write", "EIO7", 1) in fake_ljm.events
+        assert not device.is_connected and not device.is_streaming
+        assert device._handle is None
+
+    def test_close_survives_an_ljm_error(self, fake_ljm):
+        fake_ljm.close_error = interface.ljm.LJMError(
+            errorCode=1239, errorString="LJME_RECONNECT_FAILED")
+        device = self._device()
+        device.open()
+
+        device.close()
+
+        assert not device.is_connected and device._handle is None
