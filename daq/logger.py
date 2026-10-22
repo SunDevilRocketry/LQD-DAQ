@@ -54,6 +54,9 @@ class Logger:
 
         self._csv_file:   Optional[object] = None
         self._csv_writer: Optional[csv.writer] = None
+        # <recording>_events.csv: actuator commands, aborts, refusals.
+        self._events_file:   Optional[object] = None
+        self._events_writer: Optional[csv.writer] = None
         self._current_path: str = ""
         self._flush_count  = 0
 
@@ -112,11 +115,16 @@ class Logger:
         fh = open(path, "w", newline="", buffering=1 << 17)
         writer = csv.writer(fh)
         writer.writerow(self._header())
+        events_fh = open(path[:-len(".csv")] + "_events.csv", "w", newline="")
+        events_writer = csv.writer(events_fh)
+        events_writer.writerow(["time_s", "source", "actuator", "state", "text"])
 
         with self._lock:
             self._buffer.clear()
             self._csv_file    = fh
             self._csv_writer  = writer
+            self._events_file   = events_fh
+            self._events_writer = events_writer
             self._current_path = path
             self._recording   = True
             self._flush_count = 0
@@ -145,6 +153,13 @@ class Logger:
                     pass
                 self._csv_file   = None
                 self._csv_writer = None
+            if self._events_file:
+                try:
+                    self._events_file.close()
+                except OSError:
+                    pass
+                self._events_file   = None
+                self._events_writer = None
 
         print(f"[LOGGER] Stopped. {self._rows_written} rows written to "
               f"{self._current_path}")
@@ -165,6 +180,17 @@ class Logger:
             self._rows_dropped += 1
 
         self._buffer.append(row)
+
+    def write_event(self, row: list) -> None:
+        """Write one events-CSV row now (events are rare, so unbuffered)."""
+        with self._lock:
+            if not self._recording or not self._events_writer:
+                return
+            try:
+                self._events_writer.writerow(row)
+                self._events_file.flush()
+            except OSError as exc:
+                self._last_error = f"events write failed: {exc}"
 
     # --------------------------------------------------------
     # Status & Metrics API

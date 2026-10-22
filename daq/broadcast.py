@@ -79,6 +79,7 @@ def system_state_message(engine) -> dict[str, Any]:
     sensors = {
         cid: {
             "readout": reading.value,
+            "unit":    reading.unit,   # same as the manifest's, as a cross-check
             "type":    _SENSOR_TYPES.get(types.get(cid), "unknown"),
             "status":  reading.status,
         }
@@ -98,6 +99,7 @@ def system_state_message(engine) -> dict[str, Any]:
     return envelope("system-state", {
         "streaming": bool(snap.streaming),
         "is_stale":  engine.is_data_stale,
+        "backlog":   snap.backlog,   # scans the host hasn't read yet
         "sequence": {
             "active":    bool(snap.sequence_active),
             "name":      snap.sequence_name or None,

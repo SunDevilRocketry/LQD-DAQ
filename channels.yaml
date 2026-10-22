@@ -60,13 +60,13 @@ channels:
     unit: Pa
     ain: AIN10
     cal_ref: dpt0
-    notes: "LOX injector orifice dP; QDW90A range/output UNVERIFIED"
+    notes: "LOX injector orifice dP; 0-0.4 MPa over 0-10 V per seller listing, UNVERIFIED"
   - id: dpt1
     type: pt_differential
     unit: Pa
     ain: AIN12
     cal_ref: dpt1
-    notes: "fuel injector orifice dP; QDW90A range/output UNVERIFIED"
+    notes: "fuel injector orifice dP; 0-0.4 MPa over 0-10 V per seller listing, UNVERIFIED"
 
   # -- TC: Type T on the T7 screw terminals. Feeds LOX density (estimate). --
   - id: tc0

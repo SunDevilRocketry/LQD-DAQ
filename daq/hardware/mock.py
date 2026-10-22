@@ -39,7 +39,7 @@ _PT_AMP_V      = 0.020
 _PT_PERIOD_S   = 12.0
 _PT_NOISE_V    = 0.002
 
-# ~0.6 psi at the placeholder 5.80151 psi/V.
+# ~0.6 psi at 5.80151 psi/V (0-0.4 MPa over 0-10 V).
 _DPT_BASE_V    = 0.10
 _DPT_OFFSET_V  = 0.02     # separates dpt0 from dpt1
 _DPT_AMP_V     = 0.015
@@ -61,15 +61,13 @@ _LC_OSC_PERIOD_S  = 0.8
 _LC_FIRE_NOISE_V  = 0.005
 
 _CJC_BASE_C  = 25.0
-_CJC_DRIFT_C = 0.1
+_CJC_DRIFT_C = 1.0               # slow +/-1 C swing, like a warming T7
 
 # -- Actuator Simulation Parameters ---------------------------
-_DEFAULT_MOVE_DURATION_S = 1.5   # used while steps/rate are null
 _COUNTS_PER_SECOND = 200.0       # photogate edges while moving
 
 # -- Timing Parameters ----------------------------------------
 _STREAM_HZ         = 500
-_SCANS_PER_READ    = 50          # 10 batches/s; the T7 runs 20/s
 
 
 class MockLabJack:
@@ -82,8 +80,8 @@ class MockLabJack:
         stream_hz: int = _STREAM_HZ,
     ) -> None:
         self._stream_hz      = stream_hz
-        self._scans_per_read = _SCANS_PER_READ
-        self._batch_duration = _SCANS_PER_READ / stream_hz
+        self._scans_per_read = max(1, stream_hz // 20)   # 20 batches/s, like the T7
+        self._batch_duration = self._scans_per_read / stream_hz
 
         self._lock = threading.Lock()
 
@@ -135,12 +133,14 @@ class MockLabJack:
     # --------------------------------------------------------
 
     def open(self) -> None:
-        """Simulate opening a connection to the LabJack."""
+        """Simulate opening a connection; safes outputs like the T7."""
+        self._safe_outputs()
         self._connected = True
         print("[MOCK] LabJack T7 connected (simulated)")
 
     def close(self) -> None:
-        """Simulate closing the connection."""
+        """Simulate closing the connection; safes outputs like the T7."""
+        self._safe_outputs()
         self._connected  = False
         self._streaming  = False
         print("[MOCK] LabJack T7 disconnected (simulated)")
@@ -185,6 +185,8 @@ class MockLabJack:
         t_elapsed = time.perf_counter() - self._stream_start
         batch: dict[str, list[float]] = {tag: [] for tag in self.sensor_tags}
         batch["scan_times"] = []
+        batch["backlog_device"] = [0]   # type: ignore[assignment]
+        batch["backlog_ljm"]    = [0]   # type: ignore[assignment]
 
         fire_elapsed = self._fire_elapsed()
 
@@ -200,7 +202,7 @@ class MockLabJack:
     def read_cjc_celsius(self) -> float:
         """Cold junction C, near 25 C."""
         t = time.perf_counter() - self._stream_start
-        drift = _CJC_DRIFT_C * math.sin(2 * math.pi * t / 120.0)
+        drift = _CJC_DRIFT_C * math.sin(2 * math.pi * t / 60.0)
         noise = self._noise() * 0.02
         return _CJC_BASE_C + drift + noise
 
@@ -228,11 +230,17 @@ class MockLabJack:
         Energise (1) or de-energise (0); a stepper also starts a timed move.
 
         Raises:
-            KeyError: If name is not a recognised actuator.
+            KeyError:     If name is not a recognised actuator.
+            RuntimeError: If it isn't fully wired, like the T7.
         """
         spec = self._actuator_specs.get(name)
         if spec is None:
             raise KeyError(f"Unknown actuator: '{name}'")
+        if not spec.is_wired:
+            raise RuntimeError(
+                f"Actuator '{name}' is not fully specified in actuators.yaml "
+                f"- fill in its pin/step fields before commanding it"
+            )
 
         with self._lock:
             self._actuators[name] = state
@@ -250,13 +258,17 @@ class MockLabJack:
 
     def all_safe(self) -> None:
         """Mirrors LabJackT7.all_safe(): binary_dio to 0, steppers keep their state."""
+        self._safe_outputs()
+        print("[MOCK] All actuators -> SAFE/CLOSED")
+
+    def _safe_outputs(self) -> None:
+        """binary_dio to 0 and moves cancelled; steppers keep their state."""
         with self._lock:
             for name, spec in self._actuator_specs.items():
                 if spec.type == BINARY_DIO:
                     self._actuators[name] = 0
             self._move_deadline.clear()
         self._refresh_fire_state()
-        print("[MOCK] All actuators -> SAFE/CLOSED")
 
     def actuator_states(self) -> dict[str, ActuatorReading]:
         """Returns a copy of all current mock actuator states."""
@@ -285,6 +297,11 @@ class MockLabJack:
     @property
     def serial_number(self) -> str:
         return "MOCK-000000"
+
+    @property
+    def stream_time_s(self) -> float:
+        """Now on the time_s clock (seconds since the first stream start)."""
+        return time.perf_counter() - self._stream_start
 
     @property
     def stream_rate_hz(self) -> int:
@@ -352,11 +369,9 @@ class MockLabJack:
         return thrust_v + oscillation + noise
 
     def _move_duration(self, spec: ActuatorSpec, state: int) -> float:
-        """Move time from steps / pulse rate, or the stand-in while those are null."""
+        """Move time: steps / pulse rate."""
         steps = spec.steps_open if state == 1 else spec.steps_close
-        if steps and spec.pulse_freq_hz:
-            return steps / spec.pulse_freq_hz
-        return _DEFAULT_MOVE_DURATION_S
+        return steps / spec.pulse_freq_hz
 
     def _refresh_fire_state(self) -> None:
         """Mark the fire start (every stepper main commanded open) for the LC ramp."""

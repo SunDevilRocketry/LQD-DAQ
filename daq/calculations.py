@@ -111,11 +111,6 @@ def psi_to_pa(psi: float) -> float:
     return psi * PSI_TO_PA
 
 
-def pa_to_psi(pa: float) -> float:
-    """Convert pascals to psi."""
-    return pa / PSI_TO_PA
-
-
 # -- LINEAR CALIBRATION (PTs and Load Cells) ------------------
 
 def pt_voltage_to_psi(voltage_v: float, slope: float, intercept: float) -> float:
@@ -261,10 +256,7 @@ def mixture_ratio(
 
 
 # -- TOTAL IMPULSE --------------------------------------------
-# Unused until total impulse is restored (handoff "Later").
-
-_G0_M_S2 = 9.80665
-_ISP_ESTIMATE_S = 220.0     # Guessed Isp; slated for removal
+# Unused until total impulse from the load cells is restored.
 
 def impulse_step_load_cell(
     force_lbf_prev: float,
@@ -273,21 +265,6 @@ def impulse_step_load_cell(
 ) -> float:
     """Trapezoidal impulse step [lbf*s] between two load-cell samples."""
     return 0.5 * (force_lbf_prev + force_lbf_curr) * dt_seconds
-
-
-def impulse_step_estimate(
-    lox_mdot_kg_s: Optional[float],
-    fuel_mdot_kg_s: Optional[float],
-    dt_seconds: float,
-    isp_seconds: float = _ISP_ESTIMATE_S,
-) -> Optional[float]:
-    """Impulse step [N*s] from mass flow and a guessed Isp. Slated for removal."""
-    if lox_mdot_kg_s is None or fuel_mdot_kg_s is None:
-        return None
-
-    total_mdot = lox_mdot_kg_s + fuel_mdot_kg_s
-    thrust_n = total_mdot * isp_seconds * _G0_M_S2
-    return thrust_n * dt_seconds
 
 
 # -- LOX SATURATION PRESSURE (Antoine Equation) ---------------

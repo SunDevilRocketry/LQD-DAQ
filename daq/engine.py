@@ -33,6 +33,7 @@ from daq.manifest import (
     LC_DIRECT,
     PHOTOGATE_COUNTER,
     PULSE_STEPPER,
+    BINARY_DIO,
 )
 from daq.calculations import (
     thermocouple_type_t,
@@ -65,6 +66,13 @@ _DEFAULT_CAL_BY_TYPE: dict[str, dict[str, float]] = {
 # reset it): stop it and the T7 safes every output after 5 s.
 _CJC_INTERVAL_S = 0.5
 
+# SysRD 2.5.4 minimum sample rate.
+_MIN_STREAM_HZ = 200
+
+# Warn when the host falls this far behind the stream (default; tune on the
+# cart).
+_BACKLOG_WARN_S = 0.25
+
 # LJM's missing-sample sentinel.
 _MISSING_SAMPLE = -9999.0
 
@@ -78,6 +86,9 @@ _DATA_STALE_THRESHOLD_S = 1.0
 _MAX_CONSECUTIVE_READ_ERRORS = 3
 _RECONNECT_BACKOFF_S         = 1.0    # x attempt number, capped
 _RECONNECT_BACKOFF_CAP_S     = 10.0
+
+# De-energised on pause; fire first so the e-match circuit opens first.
+_IGNITER_IDS = ("ignition_fire", "ignition_arm")
 
 # Fire lifecycle, so a dashboard can tell why sequence_active is false.
 FIRE_IDLE      = "idle"
@@ -103,6 +114,7 @@ class EngineState:
         "sequence_state",
         "using_mock", "stream_hz",
         "cjc_celsius",
+        "backlog",      # {"device": scans, "ljm": scans} still unread
     )
 
     def __init__(self) -> None:
@@ -168,7 +180,13 @@ class Engine:
         derived:        Optional[dict] = None,
         channels_path:  str = DEFAULT_CHANNELS_PATH,
         actuators_path: str = DEFAULT_ACTUATORS_PATH,
+        stream_hz:      int = 500,
     ) -> None:
+        if stream_hz < _MIN_STREAM_HZ:
+            raise ValueError(
+                f"stream.target_hz {stream_hz} is below the "
+                f"{_MIN_STREAM_HZ} Hz minimum (SysRD 2.5.4)"
+            )
         self._lock = threading.RLock()
         self._event_log: deque[str] = deque(maxlen=500)  # SR 3.5
         self._snapshot = EngineState()
@@ -176,7 +194,10 @@ class Engine:
         self._channels:  list[ChannelSpec]  = load_channels(channels_path)
         self._actuators: list[ActuatorSpec] = load_actuators(actuators_path)
 
-        self._device        = Device(self._channels, self._actuators)
+        self._device        = Device(
+            self._channels, self._actuators, stream_hz=stream_hz
+        )
+        self._backlog_warned = False
         self._logger        = logger
         self._sequence_dir  = sequence_dir
         self._thresholds    = self._convert_thresholds_to_pa(thresholds or {})
@@ -191,6 +212,8 @@ class Engine:
         self._lc_tare: dict[str, float] = {
             spec.id: 0.0 for spec in self._channels if spec.type == LC_DIRECT
         }
+        # Mean of each load cell's last batch (lbf, tared), for the next tare.
+        self._lc_batch_mean: dict[str, float] = {}
 
         # None until a good read and after a failed one, so TCs report nothing.
         self._cjc_celsius: Optional[float] = None
@@ -218,6 +241,12 @@ class Engine:
         # Set by abort(), cleared by fire(); blocks start_sequence() resumes.
         self._fire_invalidated:  bool = False
         self._fire_state:        str = FIRE_IDLE
+        # Bumped by every halt; a start or seek begun before one won't go on.
+        self._abort_gen:         int = 0
+        # Path of the recording a fire started. Only that one is ever stopped
+        # automatically; a manual recording never is.
+        self._seq_recording:     Optional[str] = None
+        self._fire_post_s:       float = 0.0
 
         self._state_listener = None
 
@@ -442,7 +471,8 @@ class Engine:
                         )
 
             self._device.write_actuator(name, state)
-            self._log(f"Manual: {name} -> {'OPEN' if state else 'CLOSED'}")
+            self._log(f"Manual: {name} -> {'OPEN' if state else 'CLOSED'}",
+                      source="manual", actuator=name, state=state)
 
     def _is_stepper(self, name: str) -> bool:
         """True if `name` is a pulse_stepper."""
@@ -451,24 +481,30 @@ class Engine:
             for spec in self._actuators
         )
 
-    def all_safe(self) -> None:
+    def deenergize(self) -> None:
         """
-        abort(), then de-energise everything.
-
-        Once abort.yaml is runnable, its purges re-energise after this.
+        Halt any sequence (no abort.yaml, recording untouched) and de-energise
+        every output. Steppers stay where they are.
         """
-        self.abort()
         self._device.all_safe()
-        self._log("ALL SAFE commanded")
+        self._halt_sequence()
+        self._device.all_safe()   # again, in case a step landed while halting
+        self._log("DEENERGIZE: every output de-energised")
 
     def tare(self) -> None:
-        """Tare the load cells on the latest snapshot value (one sample)."""
+        """
+        Tare the load cells on the mean of their last batch.
+
+        Raises:
+            RuntimeError: a fire is running (it would zero the thrust).
+        """
         with self._lock:
-            channels = self._snapshot.channels or {}
+            if self._sequence_active and self._sequence_name == "fire":
+                raise RuntimeError("Can't tare during a fire")
             for tag in self._lc_tare:
-                reading = channels.get(tag)
-                if reading is not None and reading.value is not None:
-                    self._lc_tare[tag] += reading.value
+                mean = self._lc_batch_mean.get(tag)
+                if mean is not None:
+                    self._lc_tare[tag] += mean
         self._log("Load cells tared")
 
     def fire(self) -> None:
@@ -479,11 +515,16 @@ class Engine:
             SequenceRefused: fire.yaml can't be loaded or driven.
             RuntimeError: a sequence is already running.
         """
+        with self._lock:
+            gen = self._abort_gen
         steps, post_s, fire_steps = self._validate_fire()
         if not self._start_sequence(
-            "fire", steps, post_s, is_fire=True, reset_fire=fire_steps
+            "fire", steps, post_s, is_fire=True, reset_fire=fire_steps,
+            abort_gen=gen,
         ):
-            raise RuntimeError("A sequence is already running")
+            raise RuntimeError(
+                "A sequence is already running, or an abort came in"
+            )
 
     def dump_fire_sequence(self) -> list[dict]:
         """
@@ -540,6 +581,7 @@ class Engine:
                 raise RuntimeError(
                     "Sequence was aborted - use /fire to restart from the top"
                 )
+            gen = self._abort_gen
         steps, post_s, fire_steps = self._validate_fire()
         with self._lock:
             self._fire_steps = fire_steps
@@ -547,7 +589,7 @@ class Engine:
             start_elapsed    = self._fire_position_s
         started = self._start_sequence(
             "fire", steps, post_s, is_fire=True,
-            start_idx=start_idx, start_elapsed=start_elapsed,
+            start_idx=start_idx, start_elapsed=start_elapsed, abort_gen=gen,
         )
         if not started:
             raise RuntimeError("A sequence is already active")
@@ -555,7 +597,8 @@ class Engine:
 
     def stop_sequence(self) -> dict:
         """
-        Pause fire in place: outputs and recording untouched.
+        Pause fire in place. Both igniter lines are de-energised; every other
+        output and the recording are left as they are.
 
         Raises:
             RuntimeError: no fire is running, or it's past its last action.
@@ -569,6 +612,15 @@ class Engine:
         if thread and thread.is_alive():
             thread.join(timeout=2.0)
         self._pause_flag.clear()
+        wired = {s.id for s in self._actuators if s.is_wired}
+        for name in _IGNITER_IDS:
+            if name in wired:
+                try:
+                    self._device.write_actuator(name, 0)
+                    self._log(f"Pause: {name} -> CLOSED",
+                              source="pause", actuator=name, state=0)
+                except Exception as exc:
+                    self._log(f"Pause: {name} write failed: {exc}")
         return self.sequence_status()
 
     def set_sequence_time(self, seconds: float) -> dict:
@@ -613,6 +665,7 @@ class Engine:
                     "Cannot jump backward while running - stop the sequence first"
                 )
             self._refuse_if_actions_done()
+            gen = self._abort_gen
 
         self._pause_flag.set()
         thread = self._sequence_thread
@@ -626,12 +679,15 @@ class Engine:
             idx = self._fire_next_idx
 
         while idx < len(steps) and steps[idx][0] <= target_seconds:
+            if self._abort_gen != gen:
+                raise RuntimeError("Aborted during the seek")
             target_t, act_name, state = steps[idx]
             try:
                 self._device.write_actuator(act_name, state)
                 self._log(
                     f"[fire] T+{target_t:.2f}s  "
-                    f"{act_name} -> {'OPEN' if state else 'CLOSED'} (jump)"
+                    f"{act_name} -> {'OPEN' if state else 'CLOSED'} (jump)",
+                    source="fire", actuator=act_name, state=state,
                 )
             except Exception as exc:
                 self._log(f"Actuator write error: {exc}")
@@ -643,6 +699,7 @@ class Engine:
         started = self._start_sequence(
             "fire", steps, post_s, is_fire=True,
             start_idx=self._fire_next_idx, start_elapsed=target_seconds,
+            abort_gen=gen,
         )
         if not started:
             raise RuntimeError("A sequence is already active")
@@ -700,9 +757,10 @@ class Engine:
 
     def abort(self) -> None:
         """
-        Stop any sequence, then run abort.yaml, or de-energise everything if
-        it's missing or refused. Never raises. Blocks fire resumes until
-        the next fire(). A no-op while abort.yaml is already running.
+        Halt any sequence and run abort.yaml, or, if it can't run, de-energise
+        everything and close the mains if possible. Never raises; doesn't wait
+        for the control lock. abort.yaml's T+0 off-lines (igniter, presses)
+        drop before any wait. A no-op while abort.yaml is already running.
         """
         with self._lock:
             running = self._sequence_thread
@@ -710,6 +768,91 @@ class Engine:
                     and running is not None and running.is_alive()):
                 self._log("ABORT: abort.yaml already in progress")
                 return
+
+        plan = self._abort_plan()
+        if plan is None:
+            self._device.all_safe()
+            self._halt_sequence()
+            self._device.all_safe()
+            self._log("ABORT: abort.yaml can't run, hardware -> all safe")
+            self._close_mains()
+            self._finish_seq_recording()
+            return
+
+        steps, post_s = plan
+        first_off = self._first_offs(steps)
+        self._write_offs(first_off)
+        self._halt_sequence()
+        self._write_offs(first_off)   # again, in case a step landed while halting
+        self._start_sequence("abort", steps, post_s, is_fire=False, force=True)
+
+    def _abort_plan(self) -> Optional[tuple]:
+        """abort.yaml's (steps, post_s), or None if it's missing or refused."""
+        seq_path = os.path.join(self._sequence_dir, "abort.yaml")
+        if not os.path.exists(seq_path):
+            self._log("ABORT: no abort.yaml found")
+            return None
+        try:
+            return self._validate_sequence("abort", seq_path)
+        except SequenceRefused as exc:
+            self._log(str(exc))
+            return None
+
+    def _first_offs(self, steps: list[tuple[float, str, int]]) -> list[str]:
+        """binary_dio ids abort.yaml de-energises at T+0."""
+        binary = {
+            s.id for s in self._actuators
+            if s.type == BINARY_DIO and s.is_wired
+        }
+        return [name for t, name, state in steps
+                if t == 0.0 and state == 0 and name in binary]
+
+    def _write_offs(self, names: list[str]) -> None:
+        for name in names:
+            try:
+                self._device.write_actuator(name, 0)
+                self._log(f"ABORT: {name} -> CLOSED",
+                          source="abort", actuator=name, state=0)
+            except Exception as exc:
+                self._log(f"ABORT: {name} write failed: {exc}")
+
+    def _close_mains(self) -> None:
+        """Best effort: command each stepper main closed unless it already is."""
+        states = self._device.actuator_states()
+        for spec in self._actuators:
+            if spec.type != PULSE_STEPPER:
+                continue
+            if not spec.is_wired:
+                self._log(f"ABORT: can't close {spec.id}: step settings not set")
+                continue
+            reading = states.get(spec.id)
+            if reading is not None and reading.state == 0 and not reading.moving:
+                continue
+            try:
+                self._device.write_actuator(spec.id, 0)
+                self._log(f"ABORT: {spec.id} -> CLOSED",
+                          source="abort", actuator=spec.id, state=0)
+            except Exception as exc:
+                self._log(f"ABORT: {spec.id} close failed: {exc}")
+
+    def _stop_seq_recording(self) -> None:
+        """Stop the recording a fire started, if it's still the current one."""
+        path, self._seq_recording = self._seq_recording, None
+        if (path and self._logger and self._logger.is_recording
+                and self._logger.current_path == path):
+            self._logger.stop_recording()
+
+    def _finish_seq_recording(self) -> None:
+        """Stop the fire's recording after its post-record time, off-thread."""
+        if self._seq_recording and self._logger:
+            timer = threading.Timer(self._fire_post_s, self._stop_seq_recording)
+            timer.daemon = True
+            timer.start()
+
+    def _halt_sequence(self) -> None:
+        """Stop any sequence thread; blocks fire resumes until the next fire()."""
+        with self._lock:
+            self._abort_gen += 1
             self._fire_invalidated = True
             # A paused fire has no thread to record the abort itself.
             if self._fire_state == FIRE_PAUSED:
@@ -722,34 +865,17 @@ class Engine:
             if old_thread.is_alive():
                 self._log(
                     f"WARNING: '{old_thread.name}' did not exit within 0.5s "
-                    f"of abort - waiting longer before starting abort.yaml"
+                    f"of a halt - waiting longer"
                 )
                 old_thread.join(timeout=2.0)
                 if old_thread.is_alive():
                     self._log(
                         f"WARNING: '{old_thread.name}' still alive after 2.5s "
-                        f"total - force-starting abort sequence anyway. "
-                        f"Actuator states may be contested by both threads."
+                        f"total - going on anyway. Actuator states may be "
+                        f"contested by both threads."
                     )
 
         self._abort_flag.clear()
-
-        seq_path = os.path.join(self._sequence_dir, "abort.yaml")
-        if os.path.exists(seq_path):
-            try:
-                steps, post_s = self._validate_sequence("abort", seq_path)
-            except SequenceRefused as exc:
-                self._log(str(exc))
-                self._device.all_safe()
-                self._log("ABORT: refused sequence, hardware -> all safe")
-                return
-            # force: abort preempts even a thread that's still alive.
-            self._start_sequence(
-                "abort", steps, post_s, is_fire=False, force=True
-            )
-        else:
-            self._device.all_safe()
-            self._log("ABORT: no abort.yaml found, hardware -> all safe")
 
     def update_calibration(self, tag: str, slope: float, intercept: float) -> None:
         """
@@ -817,6 +943,7 @@ class Engine:
         try:
             actual_hz = self._device.start_stream()
             self._log(f"Stream running at {actual_hz} Hz")
+            self._check_rate(actual_hz)
 
             with self._lock:
                 s = self._snapshot
@@ -849,6 +976,7 @@ class Engine:
                     if consecutive_errors >= _MAX_CONSECUTIVE_READ_ERRORS:
                         consecutive_errors = 0
                         if self._running:
+                            self._halt_on_comms_loss()
                             self._reconnect_device()
                     elif self._running:
                         time.sleep(0.1)
@@ -878,6 +1006,41 @@ class Engine:
             with self._lock:
                 object.__setattr__(self._snapshot, "streaming", False)
 
+    def _check_rate(self, actual_hz: int) -> None:
+        """Warn if the T7 had to drop below the SysRD minimum."""
+        if actual_hz < _MIN_STREAM_HZ:
+            self._log(
+                f"WARNING: stream at {actual_hz} Hz, below the "
+                f"{_MIN_STREAM_HZ} Hz minimum (SysRD 2.5.4)"
+            )
+
+    def _check_backlog(self, backlog: dict[str, int]) -> None:
+        """Log once when the host falls behind the stream, and once on recovery."""
+        limit = _BACKLOG_WARN_S * self._device.stream_rate_hz
+        behind = max(backlog.values()) > limit
+        if behind and not self._backlog_warned:
+            self._log(
+                f"WARNING: host falling behind the stream "
+                f"(backlog device {backlog['device']}, LJM {backlog['ljm']} scans)"
+            )
+        elif not behind and self._backlog_warned:
+            self._log("Stream backlog back to normal")
+        self._backlog_warned = behind
+
+    def _halt_on_comms_loss(self) -> None:
+        """
+        Treat comms loss mid-sequence as an abort: halt it (no abort.yaml, the
+        T7 is unreachable; the reconnect safes the outputs) and end the fire's
+        recording after its post-record time.
+        """
+        with self._lock:
+            name = self._sequence_name if self._sequence_active else None
+        if name is None:
+            return
+        self._log(f"Comms lost during '{name}': treated as an abort")
+        self._halt_sequence()
+        self._finish_seq_recording()
+
     def _sleep_interruptible(self, duration: float) -> None:
         """Sleep in 0.1 s steps so stop() is noticed."""
         deadline = time.perf_counter() + duration
@@ -887,8 +1050,7 @@ class Engine:
     def _reconnect_device(self) -> None:
         """
         close/open/restart with backoff until it works or stop() is called.
-
-        close() safes the hardware but cached actuator states stay.
+        open() safes the outputs, so the reported states match afterwards.
         """
         self._log("Device connection lost - attempting to reconnect...")
         attempt = 0
@@ -921,6 +1083,7 @@ class Engine:
                     f"Reconnected on attempt {attempt}: stream running at "
                     f"{actual_hz} Hz"
                 )
+                self._check_rate(actual_hz)
                 return
             except Exception as exc:
                 self._log(f"Reconnect attempt {attempt} failed: {exc}")
@@ -1005,6 +1168,11 @@ class Engine:
 
         cjc_c = self._cjc_celsius
         now_epoch = time.time()
+        backlog = {
+            "device": int(batch.get("backlog_device", [0])[0]),
+            "ljm":    int(batch.get("backlog_ljm", [0])[0]),
+        }
+        self._check_backlog(backlog)
 
         # Per-scan values for the CSV.
         eng_rows: dict[str, list[Optional[float]]] = {}
@@ -1019,6 +1187,11 @@ class Engine:
                 continue
 
             eng_rows[spec.id] = self._scale_channel(spec, raw, cjc_c)
+            if spec.type == LC_DIRECT:
+                values = [v for v in eng_rows[spec.id] if v is not None]
+                if values:
+                    with self._lock:
+                        self._lc_batch_mean[spec.id] = sum(values) / len(values)
 
             if spec.type == TC_DIFFERENTIAL:
                 # Average first: per-scan noise dominates a mV signal.
@@ -1057,6 +1230,7 @@ class Engine:
         object.__setattr__(new_snap, "stream_hz",       self._device.stream_rate_hz)
         object.__setattr__(new_snap, "using_mock",      USING_MOCK)
         object.__setattr__(new_snap, "cjc_celsius",     cjc_c)
+        object.__setattr__(new_snap, "backlog",         backlog)
         object.__setattr__(new_snap, "channels",        channels)
         object.__setattr__(new_snap, "derived",         self._compute_derived(latest))
         object.__setattr__(new_snap, "actuators",       dict(self._device.actuator_states()))
@@ -1146,11 +1320,13 @@ class Engine:
         start_idx: int = 0,
         start_elapsed: float = 0.0,
         reset_fire: Optional[list[FireStep]] = None,
+        abort_gen: Optional[int] = None,
     ) -> bool:
         """
         Start a sequence thread. Returns False if one is alive, unless force
-        (abort). start_idx/start_elapsed resume a fire mid-timeline;
-        reset_fire restarts the fire position from 0 with these steps.
+        (abort), or if a halt came in since abort_gen was read.
+        start_idx/start_elapsed resume a fire mid-timeline; reset_fire
+        restarts the fire position from 0 with these steps.
         """
         # A thread that has marked itself done can still read as alive for a
         # moment; let it exit rather than refuse.
@@ -1162,6 +1338,8 @@ class Engine:
                 prev.join(timeout=0.5)
 
         with self._lock:
+            if abort_gen is not None and abort_gen != self._abort_gen:
+                return False
             thread_alive = (
                 self._sequence_thread is not None
                 and self._sequence_thread.is_alive()
@@ -1211,18 +1389,18 @@ class Engine:
         self._log(f"Sequence '{name}' starting")
 
         if is_fire and self._logger and not self._logger.is_recording:
-            self._logger.start_recording(prefix="hotfire")
+            self._seq_recording = self._logger.start_recording(prefix="hotfire")
+        if is_fire:
+            self._fire_post_s = post_s
 
         idx = start_idx
 
         while idx < len(steps):
-            if self._abort_flag.is_set() and is_fire:
-                self._log(
-                    "Sequence aborted - exiting. "
-                    "abort() will handle the abort sequence launch."
-                )
-                with self._lock:
-                    self._fire_state = FIRE_ABORTED
+            if self._abort_flag.is_set():
+                self._log(f"Sequence '{name}' halted")
+                if is_fire:
+                    with self._lock:
+                        self._fire_state = FIRE_ABORTED
                 self._sequence_paused()
                 return
 
@@ -1241,7 +1419,8 @@ class Engine:
                     self._device.write_actuator(act_name, state)
                     self._log(
                         f"[{name}] T+{target_t:.2f}s  "
-                        f"{act_name} -> {'OPEN' if state else 'CLOSED'}"
+                        f"{act_name} -> {'OPEN' if state else 'CLOSED'}",
+                        source=name, actuator=act_name, state=state,
                     )
                 except Exception as exc:
                     self._log(f"Actuator write error: {exc}")
@@ -1267,8 +1446,7 @@ class Engine:
                     return
                 time.sleep(0.05)
 
-        if self._logger:
-            self._logger.stop_recording()
+        self._stop_seq_recording()
 
         self._log(f"Sequence '{name}' finished")
         if is_fire:
@@ -1383,9 +1561,20 @@ class Engine:
     # Internal logging (SR 3.5)
     # --------------------------------------------------------
 
-    def _log(self, message: str) -> None:
-        """Timestamp, append to the event log, and print."""
+    def _log(
+        self, message: str, source: str = "engine",
+        actuator: str = "", state: object = "",
+    ) -> None:
+        """
+        Timestamp, append to the event log, and print. While recording, also
+        write it to the events CSV on the recording's time_s clock.
+        """
         entry = f"{time.strftime('%H:%M:%S')} {message}"
         with self._lock:
             self._event_log.append(entry)
         print(f"[ENGINE] {entry}")
+        logger = self._logger
+        if logger is not None and logger.is_recording:
+            logger.write_event([
+                f"{self._device.stream_time_s:.6f}", source, actuator, state, message,
+            ])

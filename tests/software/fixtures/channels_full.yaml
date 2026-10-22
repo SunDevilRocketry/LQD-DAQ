@@ -1,8 +1,8 @@
 # tests/software/fixtures/channels_full.yaml
 #
 # Every channel active with a pin, so the photogate path is tested too.
-# Pins are arbitrary and not a wiring plan; the mock doesn't check them
-# (the counters on CIO2/CIO3 wouldn't work on a T7).
+# AIN pins are arbitrary and not a wiring plan; the photogates use the
+# cart's FIO6/FIO7, where the T7 has counters.
 
 channels:
   - id: pt0
@@ -59,13 +59,13 @@ channels:
   - id: pos_lox_main
     type: photogate_counter
     unit: counts
-    dio: CIO2
+    dio: FIO6
     cal_ref: null
     active: true
   - id: pos_fuel_main
     type: photogate_counter
     unit: counts
-    dio: CIO3
+    dio: FIO7
     cal_ref: null
     active: true
 

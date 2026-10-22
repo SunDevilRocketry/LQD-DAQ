@@ -14,7 +14,6 @@ from daq.calculations import (
     type_t_mv_to_celsius,
     thermocouple_type_t,
     psi_to_pa,
-    pa_to_psi,
     PSI_TO_PA,
     pt_voltage_to_psi,
     pt_voltage_to_pa,
@@ -26,7 +25,6 @@ from daq.calculations import (
     orifice_area_m2,
     mixture_ratio,
     impulse_step_load_cell,
-    impulse_step_estimate,
     lox_saturation_pressure_pa,
     lox_below_saturation,
 )
@@ -101,12 +99,8 @@ class TestUnitConversion:
     def test_one_psi_in_pa(self):
         assert abs(psi_to_pa(1.0) - 6894.757293168361) < 1e-6
 
-    def test_round_trip(self):
-        assert abs(pa_to_psi(psi_to_pa(37.2)) - 37.2) < 1e-9
-
     def test_zero(self):
         assert psi_to_pa(0.0) == 0.0
-        assert pa_to_psi(0.0) == 0.0
 
     def test_one_atmosphere_sanity_check(self):
         # 14.696 psi is 1 atm (101325 Pa).
@@ -390,43 +384,6 @@ class TestImpulseLoadCell:
     def test_zero_dt_gives_zero(self):
         result = impulse_step_load_cell(500.0, 500.0, 0.0)
         assert result == 0.0
-
-
-# -- Total Impulse (Mass Flow Method) -------------------------
-
-class TestImpulseEstimate:
-
-    def test_returns_positive_for_valid_inputs(self):
-        result = impulse_step_estimate(0.5, 0.2, 0.002)
-        assert result is not None
-        assert result > 0.0
-
-    def test_none_lox_returns_none(self):
-        assert impulse_step_estimate(None, 0.2, 0.002) is None
-
-    def test_none_fuel_returns_none(self):
-        assert impulse_step_estimate(0.5, None, 0.002) is None
-
-    def test_manual_calculation(self):
-        """Matches a hand-computed value."""
-        lox   = 0.5     # kg/s
-        fuel  = 0.2     # kg/s
-        dt    = 0.002   # s
-        isp   = 220.0   # s
-        g0    = 9.80665 # m/s²
-        total_mdot = lox + fuel
-        thrust = total_mdot * isp * g0
-        expected = thrust * dt
-
-        result = impulse_step_estimate(lox, fuel, dt, isp_seconds=isp)
-        assert result is not None
-        assert abs(result - expected) < 1e-9
-
-    def test_higher_flow_gives_higher_impulse(self):
-        lo = impulse_step_estimate(0.3, 0.12, 0.002)
-        hi = impulse_step_estimate(0.6, 0.24, 0.002)
-        assert lo is not None and hi is not None
-        assert hi > lo
 
 
 # -- LOX Saturation Pressure (Antoine Fit) --------------------

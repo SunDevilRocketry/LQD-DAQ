@@ -369,11 +369,6 @@ class LabJackT7:
         the valve where it is, so reporting 0 would claim a closed main.
         """
         self._safe_all_hardware()
-        with self._lock:
-            for name, spec in self._actuator_specs.items():
-                if spec.type == BINARY_DIO:
-                    self._actuators[name] = 0
-            self._move_deadline.clear()
         print("[T7] All actuators -> SAFE/CLOSED")
 
     def actuator_states(self) -> dict[str, ActuatorReading]:
@@ -403,6 +398,11 @@ class LabJackT7:
     @property
     def serial_number(self) -> str:
         return getattr(self, "_serial", "UNKNOWN")
+
+    @property
+    def stream_time_s(self) -> float:
+        """Now on the time_s clock (seconds since the first stream start)."""
+        return time.perf_counter() - self._stream_start
 
     @property
     def stream_rate_hz(self) -> int:
@@ -524,9 +524,13 @@ class LabJackT7:
         self._n_channels  = len(names)
 
     def _safe_all_hardware(self) -> None:
-        """Drive every binary_dio line high (de-energised) and stop stepper bursts."""
+        """
+        Drive every binary_dio line high (de-energised) and stop stepper
+        bursts. The cached states drop to 0 only if every write succeeded.
+        """
         if self._handle is None:
             return
+        all_ok = True
         for spec in self._actuator_specs.values():
             try:
                 if spec.type == BINARY_DIO and spec.dio is not None:
@@ -536,26 +540,50 @@ class LabJackT7:
                     if spec.ena_dio is not None:
                         ljm.eWriteName(self._handle, spec.ena_dio, 1)   # de-assert enable
             except ljm.LJMError:
-                pass
+                all_ok = False
+        if all_ok:
+            with self._lock:
+                for name, spec in self._actuator_specs.items():
+                    if spec.type == BINARY_DIO:
+                        self._actuators[name] = 0
+                self._move_deadline.clear()
 
     def _arm_watchdog(self) -> None:
-        """Arm the watchdog to drive the binary_dio lines high on comms loss."""
+        """
+        Arm the watchdog to drive the binary_dio lines high on comms loss.
+        The *_DEFAULT registers live in flash, so only differing ones are
+        written. It stays armed after exit, so the cart fails safe.
+        """
         h = self._handle
         if self._actuator_mask == 0:
             print("[T7] WARNING: no binary_dio actuator pins assigned - "
                   "watchdog NOT armed")
             return
 
-        ljm.eWriteName(h, "WATCHDOG_ENABLE_DEFAULT",        0)
-        ljm.eWriteName(h, "WATCHDOG_TIMEOUT_S_DEFAULT",     _WATCHDOG_TIMEOUT_S)
-        ljm.eWriteName(h, "WATCHDOG_DIO_ENABLE_DEFAULT",    1)
+        desired = {
+            "WATCHDOG_TIMEOUT_S_DEFAULT":     _WATCHDOG_TIMEOUT_S,
+            "WATCHDOG_RESET_ENABLE_DEFAULT":  0,   # no reboot on timeout
+            "WATCHDOG_DIO_ENABLE_DEFAULT":    1,
+            # Inhibit every line outside the mask.
+            "WATCHDOG_DIO_INHIBIT_DEFAULT":   (~self._actuator_mask) & 0xFFFFFFFF,
+            "WATCHDOG_DIO_DIRECTION_DEFAULT": self._actuator_mask,
+            "WATCHDOG_DIO_STATE_DEFAULT":     self._actuator_mask,
+        }
+        changed = {
+            name: value for name, value in desired.items()
+            if int(ljm.eReadName(h, name)) != value
+        }
+        enabled = int(ljm.eReadName(h, "WATCHDOG_ENABLE_DEFAULT")) == 1
 
-        # Inhibit every line outside the mask.
-        inhibit = (~self._actuator_mask) & 0xFFFFFFFF
-        ljm.eWriteName(h, "WATCHDOG_DIO_INHIBIT_DEFAULT",   inhibit)
-        ljm.eWriteName(h, "WATCHDOG_DIO_DIRECTION_DEFAULT", self._actuator_mask)
-        ljm.eWriteName(h, "WATCHDOG_DIO_STATE_DEFAULT",     self._actuator_mask)
-        ljm.eWriteName(h, "WATCHDOG_ENABLE_DEFAULT",        1)
-        print(f"[T7] Watchdog armed: {_WATCHDOG_TIMEOUT_S} s timeout, "
-              f"valves and igniter -> safe on comms loss "
-              f"(stepper lines excluded)")
+        if changed:
+            # The watchdog must be disabled before its other registers change.
+            ljm.eWriteName(h, "WATCHDOG_ENABLE_DEFAULT", 0)
+            for name, value in changed.items():
+                ljm.eWriteName(h, name, value)
+        if changed or not enabled:
+            ljm.eWriteName(h, "WATCHDOG_ENABLE_DEFAULT", 1)
+            print(f"[T7] Watchdog armed: {_WATCHDOG_TIMEOUT_S} s timeout, "
+                  f"valves and igniter -> safe on comms loss "
+                  f"(stepper lines excluded)")
+        else:
+            print("[T7] Watchdog already configured; nothing written")

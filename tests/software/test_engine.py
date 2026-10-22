@@ -5,6 +5,7 @@ daq/engine.py against MockLabJack: snapshots, actuators, reconnect,
 thresholds, staleness, sequences and the CJC poll.
 """
 
+import csv
 import json
 import threading
 import time
@@ -22,6 +23,7 @@ from daq.engine import (
     Engine,
     SequenceRefused,
 )
+from daq.logger import Logger
 from daq.manifest import load_actuators
 
 from tests.software._helpers import (
@@ -30,6 +32,7 @@ from tests.software._helpers import (
     REPO_ACTUATORS,
     REPO_CONFIG,
     UNWIRED_ACTUATORS,
+    full_channels,
     make_engine,
     wait_for_first_batch,
 )
@@ -110,10 +113,10 @@ class TestEngine:
         snap = self.engine.snapshot
         assert snap.actuators["fuel_vent"].state == 1
 
-    def test_all_safe_clears_actuators(self):
+    def test_deenergize_clears_actuators(self):
         self.engine.write_actuator("fuel_vent", 1)
         time.sleep(0.05)
-        self.engine.all_safe()
+        self.engine.deenergize()
         time.sleep(0.15)
         snap = self.engine.snapshot
         assert snap.actuators["fuel_vent"].state == 0
@@ -232,6 +235,52 @@ class TestEngineReconnect:
         )
 
         engine.stop()
+
+    def test_comms_loss_mid_fire_aborts_and_states_match(self, tmp_path):
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir()
+        (seq_dir / "fire.yaml").write_text(yaml.safe_dump({
+            "post_record_seconds": 0,
+            "steps": [
+                {"name": "open", "actions": [[0.0, "tank_depress", 1]]},
+                {"name": "later", "actions": [[100.0, "fuel_purge", 1]]},
+            ],
+        }))
+        (seq_dir / "abort.yaml").write_text(yaml.safe_dump(
+            {"post_record_seconds": 0, "steps": [[0.0, "tank_depress", 0]]}
+        ))
+        engine = make_engine(sequence_dir=str(seq_dir))
+        engine.start()
+        try:
+            wait_for_first_batch(engine)
+            engine.fire()
+            time.sleep(0.2)
+            assert engine._device.actuator_states()["tank_depress"].state == 1
+
+            device = engine._device
+            original = device.stream_read
+            fails = {"n": 0}
+
+            def flaky():
+                if fails["n"] < 3:
+                    fails["n"] += 1
+                    raise RuntimeError("simulated comms loss")
+                return original()
+
+            device.stream_read = flaky
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                if any("Reconnected" in e for e in engine.event_log):
+                    break
+                time.sleep(0.1)
+            time.sleep(0.3)   # a batch after the reconnect
+
+            assert not engine._sequence_active
+            assert engine.sequence_status()["state"] == FIRE_ABORTED
+            assert engine.snapshot.actuators["tank_depress"].state == 0
+            assert not any("Sequence 'abort' starting" in e for e in engine.event_log)
+        finally:
+            engine.stop()
 
     def test_stream_flag_goes_false_during_outage(self):
         """streaming goes False as soon as reads fail."""
@@ -492,7 +541,7 @@ class TestUnwiredActuatorGate:
 
         engine.abort()
         self._wait_for_sequence_end(engine)
-        assert calls == ["all_safe"]
+        assert calls and set(calls) == {"all_safe"}
 
     def test_sequence_naming_an_actuator_that_does_not_exist_is_refused(
         self, tmp_path
@@ -707,7 +756,7 @@ class TestFireRefusalReachesTheCaller:
 
         engine.abort()   # must not raise
 
-        assert calls == ["all_safe"]
+        assert calls and set(calls) == {"all_safe"}
         assert any("REFUSED" in e for e in engine.event_log)
 
     @pytest.mark.parametrize("state", [2, -1, 0.5, True, "1"])
@@ -725,7 +774,7 @@ class TestFireRefusalReachesTheCaller:
 
         engine.abort()
 
-        assert calls == ["all_safe"]
+        assert calls and set(calls) == {"all_safe"}
         assert any("state must be 0 or 1" in e for e in engine.event_log)
 
 
@@ -842,7 +891,8 @@ class TestFireSequencing:
         calls = []
         orig_write = engine._device.write_actuator
         def spy(name, state):
-            calls.append((name, state))
+            if not name.startswith("ignition_"):   # pause's own igniter-off writes
+                calls.append((name, state))
             return orig_write(name, state)
         engine._device.write_actuator = spy
 
@@ -1056,6 +1106,234 @@ class TestCalibrationFile:
         assert saved["PT"]["ptX"] == {"slope": 1.0, "intercept": 0.0}
         assert saved["PT"]["pt0"] == {"slope": 410.0, "intercept": -1.0}
 
+
+class TestAbortAndDeenergize:
+    """/deenergize halts without abort.yaml; /abort safes the igniter first."""
+
+    FIRE = {
+        "post_record_seconds": 0.3,
+        "steps": [
+            {"name": "arm", "actions": [[0.0, "ignition_arm", 1]]},
+            {"name": "later", "actions": [[100.0, "fuel_purge", 1]]},
+        ],
+    }
+    ABORT = {
+        "post_record_seconds": 0,
+        "steps": [[0.0, "ignition_arm", 0], [0.0, "lox_press", 0],
+                  [0.05, "lox_purge", 1], [1.0, "lox_purge", 0]],
+    }
+
+    @classmethod
+    def _engine(cls, tmp_path, abort=None, logger=None, actuators_path=None):
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir(exist_ok=True)
+        (seq_dir / "fire.yaml").write_text(yaml.safe_dump(cls.FIRE))
+        (seq_dir / "abort.yaml").write_text(yaml.safe_dump(abort or cls.ABORT))
+        kwargs = {"sequence_dir": str(seq_dir), "logger": logger}
+        if actuators_path:
+            kwargs["actuators_path"] = actuators_path
+        return make_engine(**kwargs)
+
+    @staticmethod
+    def _state(engine, name):
+        return engine._device.actuator_states()[name].state
+
+    def test_deenergize_halts_a_fire_without_abort_yaml(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine.fire()
+        time.sleep(0.1)
+        assert self._state(engine, "ignition_arm") == 1
+
+        engine.deenergize()
+
+        assert not engine._sequence_active
+        assert engine.sequence_status()["state"] == FIRE_ABORTED
+        assert self._state(engine, "ignition_arm") == 0
+        assert not any("Sequence 'abort' starting" in e for e in engine.event_log)
+        with pytest.raises(RuntimeError, match="aborted"):
+            engine.start_sequence()
+
+    def test_pause_drops_the_igniter_and_nothing_else(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine.fire()
+        time.sleep(0.1)
+        engine._device.write_actuator("ignition_fire", 1)
+        engine._device.write_actuator("lox_purge", 1)
+
+        engine.stop_sequence()
+
+        assert self._state(engine, "ignition_arm") == 0
+        assert self._state(engine, "ignition_fire") == 0
+        assert self._state(engine, "lox_purge") == 1
+
+    def test_tare_is_refused_during_a_fire(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine.fire()
+        try:
+            with pytest.raises(RuntimeError, match="during a fire"):
+                engine.tare()
+        finally:
+            engine.stop_sequence()
+
+    def test_tare_uses_the_batch_mean(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine._lc_batch_mean = {"lc0": 12.5, "lc1": -3.0}
+        engine.tare()
+        assert engine._lc_tare == {"lc0": 12.5, "lc1": -3.0}
+
+    def test_deenergize_halts_abort_yaml(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine.abort()
+        abort_thread = engine._sequence_thread
+        time.sleep(0.1)
+        assert self._state(engine, "lox_purge") == 1
+
+        engine.deenergize()
+
+        abort_thread.join(timeout=1.0)
+        assert not abort_thread.is_alive()
+        assert self._state(engine, "lox_purge") == 0
+
+    def test_abort_drops_the_igniter_before_waiting(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine._device.write_actuator("ignition_arm", 1)
+        # A sequence thread that ignores the abort flag for 1 s.
+        stuck = threading.Thread(target=time.sleep, args=(1.0,))
+        stuck.start()
+        engine._sequence_thread = stuck
+        engine._sequence_active = True
+        engine._sequence_name = "fire"
+
+        aborting = threading.Thread(target=engine.abort)
+        aborting.start()
+        time.sleep(0.2)
+        try:
+            assert aborting.is_alive(), "abort should still be waiting on the thread"
+            assert self._state(engine, "ignition_arm") == 0
+        finally:
+            aborting.join(timeout=5.0)
+            engine._sequence_thread.join(timeout=5.0)
+
+    def test_a_start_begun_before_a_halt_is_refused(self, tmp_path):
+        engine = self._engine(tmp_path)
+        gen = engine._abort_gen
+        engine.deenergize()
+        steps, post_s, fire_steps = engine._validate_fire()
+        assert not engine._start_sequence(
+            "fire", steps, post_s, is_fire=True, abort_gen=gen
+        )
+
+    def test_fallback_abort_closes_wired_mains(self, tmp_path):
+        bad = {"post_record_seconds": 0, "steps": [[0.0, "ignition_arm", 2]]}
+        engine = self._engine(tmp_path, abort=bad)
+        engine._device.write_actuator("lox_main", 1)
+
+        engine.abort()
+
+        assert self._state(engine, "lox_main") == 0
+        assert any("lox_main -> CLOSED" in e for e in engine.event_log)
+
+    def test_fallback_abort_reports_unwired_mains(self, tmp_path):
+        needs_mains = {"post_record_seconds": 0, "steps": [[0.0, "lox_main", 0]]}
+        engine = self._engine(
+            tmp_path, abort=needs_mains, actuators_path=REPO_ACTUATORS
+        )
+        engine.abort()
+        assert any("can't close lox_main" in e for e in engine.event_log)
+
+    def test_fallback_abort_stops_the_fire_recording_after_post_record(self, tmp_path):
+        bad = {"post_record_seconds": 0, "steps": [[0.0, "ignition_arm", 2]]}
+        logger = _StubLogger()
+        engine = self._engine(tmp_path, abort=bad, logger=logger)
+        engine.fire()
+        time.sleep(0.1)
+
+        engine.abort()
+        assert logger.is_recording, "stopped before post_record_seconds"
+        time.sleep(0.5)            # fire.yaml's post_record_seconds is 0.3
+        assert not logger.is_recording
+
+    def test_fallback_abort_never_stops_a_manual_recording(self, tmp_path):
+        bad = {"post_record_seconds": 0, "steps": [[0.0, "ignition_arm", 2]]}
+        logger = _StubLogger()
+        logger.start_recording("manual")
+        engine = self._engine(tmp_path, abort=bad, logger=logger)
+        engine.fire()
+        time.sleep(0.1)
+
+        engine.abort()
+        time.sleep(0.5)
+        assert logger.is_recording
+
+
+class TestStreamRateAndBacklog:
+    """config.yaml's target_hz reaches the driver; a lagging host is reported."""
+
+    def test_target_hz_reaches_the_driver(self):
+        engine = Engine(
+            channels_path=FULL_CHANNELS, actuators_path=FULL_ACTUATORS,
+            stream_hz=400,
+        )
+        assert engine._device.stream_rate_hz == 400
+
+    def test_rate_below_the_sysrd_minimum_is_refused(self):
+        with pytest.raises(ValueError, match="200 Hz minimum"):
+            Engine(
+                channels_path=FULL_CHANNELS, actuators_path=FULL_ACTUATORS,
+                stream_hz=150,
+            )
+
+    def test_backlog_warns_once_and_recovers(self):
+        engine = make_engine()
+        engine._check_backlog({"device": 10_000, "ljm": 0})
+        engine._check_backlog({"device": 10_000, "ljm": 0})
+        engine._check_backlog({"device": 0, "ljm": 0})
+        log = engine.event_log
+        assert sum("falling behind" in e for e in log) == 1
+        assert any("back to normal" in e for e in log)
+
+    def test_snapshot_carries_the_backlog(self):
+        engine = make_engine()
+        engine.start()
+        try:
+            wait_for_first_batch(engine)
+            assert engine.snapshot.backlog == {"device": 0, "ljm": 0}
+        finally:
+            engine.stop()
+
+
+class TestEventsCsv:
+    """Actuator commands land in <recording>_events.csv on the time_s clock."""
+
+    def test_fire_and_manual_commands_are_recorded(self, tmp_path):
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir()
+        (seq_dir / "fire.yaml").write_text(yaml.safe_dump({
+            "post_record_seconds": 0,
+            "steps": [{"name": "only", "actions": [[0.0, "tank_depress", 1]]}],
+        }))
+        (seq_dir / "abort.yaml").write_text(yaml.safe_dump(
+            {"post_record_seconds": 0, "steps": [[0.0, "tank_depress", 0]]}
+        ))
+        logger = Logger(output_dir=str(tmp_path / "data"), channels=full_channels())
+        logger.open()
+        engine = make_engine(sequence_dir=str(seq_dir), logger=logger)
+        try:
+            path = logger.start_recording("manual")
+            engine.write_actuator("fuel_vent", 1)
+            engine.fire()
+            engine._sequence_thread.join(timeout=5.0)
+            logger.stop_recording()
+        finally:
+            logger.close()
+
+        with open(path[:-len(".csv")] + "_events.csv") as f:
+            rows = list(csv.DictReader(f))
+        picked = {(r["source"], r["actuator"], r["state"]) for r in rows}
+        assert ("manual", "fuel_vent", "1") in picked
+        assert ("fire", "tank_depress", "1") in picked
+        assert all(float(r["time_s"]) >= 0 for r in rows)
+
 class _StubLogger:
     """Minimal Logger stand-in for asserting recording start/stop calls."""
 
@@ -1063,6 +1341,7 @@ class _StubLogger:
         self._recording = False
         self.stop_calls = 0
         self.start_calls = 0
+        self.current_path = ""
 
     @property
     def is_recording(self):
@@ -1071,12 +1350,17 @@ class _StubLogger:
     def start_recording(self, prefix="data"):
         self.start_calls += 1
         self._recording = True
+        self.current_path = f"{prefix}_{self.start_calls}.csv"
+        return self.current_path
 
     def stop_recording(self):
         self.stop_calls += 1
         self._recording = False
 
     def write_row(self, row_vals):
+        pass
+
+    def write_event(self, row):
         pass
 
 

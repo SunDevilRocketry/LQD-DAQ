@@ -68,6 +68,7 @@ class TestAPI:
         data = r.json()
         assert data["ok"] is True
         assert "stream_hz" in data
+        assert "backlog" in data
 
     def test_status_reports_unwired_actuators(self):
         """The shipped manifest: both mains have no step counts yet."""
@@ -135,8 +136,13 @@ class TestAPI:
         r = api_client.post("/actuator", json={"name": "mystery_valve", "state": 1})
         assert r.status_code == 422
 
-    def test_safe_endpoint(self, api_client):
-        r = api_client.post("/safe")
+    def test_status_reports_null_name_when_idle(self, api_client):
+        _ensure_idle(api_client)
+        time.sleep(0.2)   # a batch after going idle
+        assert api_client.get("/status").json()["sequence_name"] is None
+
+    def test_deenergize_endpoint(self, api_client):
+        r = api_client.post("/deenergize")
         assert r.status_code == 200
         assert r.json()["ok"] is True
 
@@ -366,10 +372,10 @@ class _BlockingStubEngine:
         self._block("fire")
 
     def abort(self):
-        self._block("abort")
+        self.calls.append("abort")
 
-    def all_safe(self):
-        self._block("all_safe")
+    def deenergize(self):
+        self.calls.append("deenergize")
 
     def start_sequence(self):
         return self._block(
@@ -395,7 +401,7 @@ def stub_client():
 
 
 class TestControlLockSynchronization:
-    """Busy lock: /actuator, /fire, /sequence/* get 423; /abort and /safe wait."""
+    """Busy lock: /actuator, /fire, /sequence/* get 423; /abort, /deenergize skip it."""
 
     def test_actuator_busy_returns_423(self, stub_client):
         client, stub = stub_client
@@ -412,6 +418,7 @@ class TestControlLockSynchronization:
 
         r2 = client.post("/actuator", json={"name": "lox_main", "state": 1})
         assert r2.status_code == 423
+        assert r2.json() == {"detail": "busy"}
 
         stub.release.set()
         t1.join(timeout=2.0)
@@ -437,10 +444,8 @@ class TestControlLockSynchronization:
         stub.release.set()
         t1.join(timeout=2.0)
 
-    def test_abort_never_discarded_blocks_until_free(self, stub_client):
+    def test_abort_and_deenergize_skip_a_busy_lock(self, stub_client):
         client, stub = stub_client
-        result = {}
-
         t1 = threading.Thread(
             target=lambda: client.post(
                 "/actuator", json={"name": "lox_main", "state": 1}
@@ -448,45 +453,14 @@ class TestControlLockSynchronization:
         )
         t1.start()
         assert stub.entered.wait(timeout=2.0)
-
-        def call_abort():
-            result["r2"] = client.post("/abort")
-
-        t2 = threading.Thread(target=call_abort)
-        t2.start()
-        # /abort must be blocked on the lock...
-        # it hasn't been serviced yet while /actuator still holds it.
-        t2.join(timeout=0.3)
-        assert t2.is_alive(), "/abort returned without waiting for the lock"
-
-        stub.release.set()
-        t2.join(timeout=2.0)
-        assert result["r2"].status_code == 200
-
-        t1.join(timeout=2.0)
-
-    def test_safe_never_discarded_blocks_until_free(self, stub_client):
-        client, stub = stub_client
-        result = {}
-
-        t1 = threading.Thread(
-            target=lambda: client.post(
-                "/actuator", json={"name": "lox_main", "state": 1}
-            )
-        )
-        t1.start()
-        assert stub.entered.wait(timeout=2.0)
-
-        def call_safe():
-            result["r2"] = client.post("/safe")
-
-        t2 = threading.Thread(target=call_safe)
-        t2.start()
-        t2.join(timeout=0.3)
-        assert t2.is_alive(), "/safe returned without waiting for the lock"
-
-        stub.release.set()
-        t2.join(timeout=2.0)
-        assert result["r2"].status_code == 200
-
-        t1.join(timeout=2.0)
+        try:
+            for path, call in (("/abort", "abort"), ("/deenergize", "deenergize"),
+                               ("/safe", "deenergize")):
+                t0 = time.perf_counter()
+                r = client.post(path)
+                assert r.status_code == 200
+                assert time.perf_counter() - t0 < 0.5, f"{path} waited for the lock"
+                assert stub.calls[-1] == call
+        finally:
+            stub.release.set()
+            t1.join(timeout=2.0)

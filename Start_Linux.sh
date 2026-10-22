@@ -162,6 +162,10 @@ else
     exit 1
 fi
 
+if [ "$1" = "--test" ] || [ "$1" = "--test-live" ]; then
+    pip install -r requirements-dev.txt -q
+fi
+
 if [ "$1" = "--test" ]; then
     echo "=== Running test suite (mock hardware, no LabJack required) ==="
     "$PYEXE" -m pytest tests/software tests/test_calculations.py -v

@@ -29,6 +29,19 @@ def writes(monkeypatch):
     return calls
 
 
+def _fake_t7(monkeypatch, registers):
+    """Back eReadName/eWriteName with a dict; returns the list of writes."""
+    written = []
+    def write(handle, name, value):
+        written.append(name)
+        registers[name] = value
+    monkeypatch.setattr(interface.ljm, "eWriteName", write)
+    monkeypatch.setattr(
+        interface.ljm, "eReadName", lambda handle, name: registers.get(name, 0)
+    )
+    return written
+
+
 def _mask(*names):
     bits = 0
     for name in names:
@@ -46,7 +59,7 @@ def _stepper(**extra):
 
 class TestWatchdogMask:
 
-    def test_shipped_manifest_covers_exactly_the_relay_and_igniter_lines(self, writes):
+    def test_shipped_manifest_covers_the_relay_and_igniter_lines(self, monkeypatch):
         device = LabJackT7(
             load_channels(REPO_CHANNELS), load_actuators(REPO_ACTUATORS)
         )
@@ -55,11 +68,26 @@ class TestWatchdogMask:
         assert device._actuator_mask == expected
 
         device._handle = 1
+        registers = {"WATCHDOG_RESET_ENABLE_DEFAULT": 1}   # left on in flash
+        _fake_t7(monkeypatch, registers)
         device._arm_watchdog()
-        regs = dict(writes)
-        assert regs["WATCHDOG_DIO_DIRECTION_DEFAULT"] == expected
-        assert regs["WATCHDOG_DIO_STATE_DEFAULT"] == expected
-        assert regs["WATCHDOG_DIO_INHIBIT_DEFAULT"] == (~expected) & 0xFFFFFFFF
+        assert registers["WATCHDOG_DIO_DIRECTION_DEFAULT"] == expected
+        assert registers["WATCHDOG_DIO_STATE_DEFAULT"] == expected
+        assert registers["WATCHDOG_DIO_INHIBIT_DEFAULT"] == (~expected) & 0xFFFFFFFF
+        assert registers["WATCHDOG_RESET_ENABLE_DEFAULT"] == 0
+        assert registers["WATCHDOG_ENABLE_DEFAULT"] == 1
+
+    def test_rearming_an_unchanged_config_writes_nothing(self, monkeypatch):
+        device = LabJackT7([], load_actuators(REPO_ACTUATORS))
+        device._handle = 1
+        registers = {}
+        written = _fake_t7(monkeypatch, registers)
+        device._arm_watchdog()
+        written.clear()
+
+        device._arm_watchdog()
+
+        assert written == [], f"flash written again: {written}"
 
 
 class TestOptionalStepperEnable:
@@ -180,3 +208,26 @@ class TestStreamClock:
         device.start_stream()
 
         assert device._stream_start == started
+
+
+class TestSafingCache:
+    """Reported states drop to 0 only when the safing writes reached the T7."""
+
+    def _device(self):
+        device = LabJackT7([], load_actuators(REPO_ACTUATORS))
+        device._handle = 1
+        device._actuators["fuel_vent"] = 1
+        return device
+
+    def test_successful_safing_clears_the_cache(self, writes):
+        device = self._device()
+        device._safe_all_hardware()
+        assert device.read_actuator("fuel_vent") == 0
+
+    def test_failed_safing_keeps_the_cache(self, monkeypatch):
+        def fail(handle, name, value):
+            raise interface.ljm.LJMError(errorCode=1, errorString="comms lost")
+        monkeypatch.setattr(interface.ljm, "eWriteName", fail)
+        device = self._device()
+        device._safe_all_hardware()
+        assert device.read_actuator("fuel_vent") == 1

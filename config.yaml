@@ -14,7 +14,7 @@ paths:
   lox_table:     "daq/LOX_table_100_0-260_99R.csv"  # LOX density; source UNVERIFIED
 
 stream:
-  target_hz: 500       # not read; the driver fixes 500 Hz
+  target_hz: 500       # requested rate; 200 minimum (SysRD 2.5.4)
 
 # Injector mass flow and O/F (calculated), published under `derived`.
 # A null or inactive input makes that output null. orifice_count must match

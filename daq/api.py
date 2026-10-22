@@ -11,7 +11,7 @@ HTTP API over the Engine (FastAPI).
   GET  /logger            recording status
   GET  /sequence          fire.yaml phases
   POST /actuator          manual command (409 mid-sequence)
-  POST /safe              abort, then de-energise everything
+  POST /deenergize        halt any sequence, de-energise everything (/safe: old name)
   POST /fire              fire.yaml from T=0
   POST /abort             abort.yaml, or all-off if it can't run
   POST /sequence/start    resume fire
@@ -25,7 +25,8 @@ HTTP API over the Engine (FastAPI).
   POST /log/stop          stop it
 
 Errors are FastAPI's {"detail": ...}. /actuator, /fire and /sequence/*
-return 423 if the control lock is busy; /safe and /abort wait for it.
+return 423 {"detail": "busy"} if the control lock is busy; /deenergize and
+/abort never take it.
 """
 
 from __future__ import annotations
@@ -36,9 +37,9 @@ import time
 from contextlib import contextmanager
 from typing import Optional, Any
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from daq.engine import SequenceRefused
@@ -69,14 +70,19 @@ class _ControlLockBusy(Exception):
 
 
 @contextmanager
-def _control_guard(*, blocking: bool):
-    """Hold _control_lock; blocking=False raises _ControlLockBusy if taken."""
-    if not _control_lock.acquire(blocking=blocking):
+def _control_guard():
+    """Hold _control_lock; raises _ControlLockBusy if it's taken."""
+    if not _control_lock.acquire(blocking=False):
         raise _ControlLockBusy()
     try:
         yield
     finally:
         _control_lock.release()
+
+
+def _busy() -> JSONResponse:
+    """423 for a busy control lock."""
+    return JSONResponse(status_code=423, content={"detail": "busy"})
 
 
 def set_engine(engine, logger=None) -> None:
@@ -179,8 +185,9 @@ def get_status():
         "ok":                 snap.streaming,
         "using_mock":         snap.using_mock,
         "stream_hz":          snap.stream_hz,
+        "backlog":            snap.backlog,
         "sequence_active":    snap.sequence_active,
-        "sequence_name":      snap.sequence_name,
+        "sequence_name":      snap.sequence_name or None,
         "sequence_step":      snap.sequence_step,
         "sequence_state":     snap.sequence_state,
         "unwired_actuators":  eng.unwired_actuators,
@@ -302,10 +309,10 @@ def post_actuator(cmd: ActuatorCommand):
     if cmd.state not in (0, 1):
         raise HTTPException(status_code=422, detail="state must be 0 or 1")
     try:
-        with _control_guard(blocking=False):
+        with _control_guard():
             eng.write_actuator(cmd.name, cmd.state)
     except _ControlLockBusy:
-        return Response(status_code=423)
+        return _busy()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except KeyError as exc:
@@ -313,13 +320,17 @@ def post_actuator(cmd: ActuatorCommand):
     return {"ok": True, "name": cmd.name, "state": cmd.state}
 
 
+@app.post("/deenergize")
+def post_deenergize():
+    """Halt any sequence and de-energise every output. Never waits for the lock."""
+    _require_engine().deenergize()
+    return {"ok": True}
+
+
 @app.post("/safe")
 def post_safe():
-    """abort(), then de-energise everything. Waits for the control lock."""
-    eng = _require_engine()
-    with _control_guard(blocking=True):
-        eng.all_safe()
-    return {"ok": True}
+    """Old name for /deenergize; kept for one release."""
+    return post_deenergize()
 
 
 @app.post("/fire")
@@ -330,10 +341,10 @@ def post_fire():
     """
     eng = _require_engine()
     try:
-        with _control_guard(blocking=False):
+        with _control_guard():
             eng.fire()
     except _ControlLockBusy:
-        return Response(status_code=423)
+        return _busy()
     except (SequenceRefused, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     return {"ok": True, "sequence": "fire"}
@@ -343,11 +354,9 @@ def post_fire():
 def post_abort():
     """
     abort.yaml, or all-off if it can't run; /events says which. Always 200.
-    Waits for the control lock, up to ~2 s behind another route.
+    Never waits for the control lock.
     """
-    eng = _require_engine()
-    with _control_guard(blocking=True):
-        eng.abort()
+    _require_engine().abort()
     return {"ok": True}
 
 
@@ -356,23 +365,23 @@ def post_sequence_start():
     """Resume fire from its position. 409 after an abort (use /fire), 423 if busy."""
     eng = _require_engine()
     try:
-        with _control_guard(blocking=False):
+        with _control_guard():
             return eng.start_sequence()
     except _ControlLockBusy:
-        return Response(status_code=423)
+        return _busy()
     except (SequenceRefused, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
 
 @app.post("/sequence/stop")
 def post_sequence_stop():
-    """Pause fire; outputs and recording untouched. 423 if busy."""
+    """Pause fire: igniter off, other outputs and recording kept. 423 if busy."""
     eng = _require_engine()
     try:
-        with _control_guard(blocking=False):
+        with _control_guard():
             return eng.stop_sequence()
     except _ControlLockBusy:
-        return Response(status_code=423)
+        return _busy()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -385,10 +394,10 @@ def post_sequence_time(req: SequenceTimeRequest):
     """
     eng = _require_engine()
     try:
-        with _control_guard(blocking=False):
+        with _control_guard():
             return eng.set_sequence_time(req.seconds)
     except _ControlLockBusy:
-        return Response(status_code=423)
+        return _busy()
     except (SequenceRefused, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -398,10 +407,10 @@ def post_sequence_step(req: SequenceStepRequest):
     """/sequence/time to a named step's start. 422 unknown step, 423 if busy."""
     eng = _require_engine()
     try:
-        with _control_guard(blocking=False):
+        with _control_guard():
             return eng.jump_to_step(req.name)
     except _ControlLockBusy:
-        return Response(status_code=423)
+        return _busy()
     except (SequenceRefused, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except KeyError as exc:
@@ -410,9 +419,12 @@ def post_sequence_step(req: SequenceStepRequest):
 
 @app.post("/tare")
 def post_tare():
-    """Tare load cells on one sample; not locked out mid-fire."""
+    """Tare load cells on their last batch's mean; 409 during a fire."""
     eng = _require_engine()
-    eng.tare()
+    try:
+        eng.tare()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     return {"ok": True}
 
 

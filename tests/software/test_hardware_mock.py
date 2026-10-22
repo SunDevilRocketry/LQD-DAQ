@@ -1,12 +1,19 @@
 """tests/software/test_hardware_mock.py: MockLabJack timing, data and actuators."""
 
+import math
 import time
 
 import pytest
 
 from daq.hardware.mock import MockLabJack
+from daq.manifest import BINARY_DIO, ActuatorSpec
 
 from tests.software._helpers import full_actuators, full_channels
+
+# 0.4 MPa (58.015 psi) over 0-10 V; seller listing, UNVERIFIED until the label
+# is read.
+_DPT_FULL_SCALE_PSI = 58.015
+_DPT_PSI_PER_V      = _DPT_FULL_SCALE_PSI / 10.0
 
 
 class TestMockLabJack:
@@ -44,14 +51,13 @@ class TestMockLabJack:
     def test_batch_has_correct_scan_count(self):
         batch = self.device.stream_read()
         n = len(batch["scan_times"])
-        assert n == 50, f"Expected 50 scans/batch, got {n}"
+        assert n == 25, f"Expected 25 scans/batch (20 batches/s), got {n}"
 
     def test_all_channels_have_matching_length(self):
         batch = self.device.stream_read()
         n = len(batch["scan_times"])
-        for tag, values in batch.items():
-            if tag == "scan_times":
-                continue
+        for tag in self.device.sensor_tags:
+            values = batch[tag]
             assert len(values) == n, f"{tag} length mismatch: {len(values)} != {n}"
 
     def test_scan_times_are_monotonically_increasing(self):
@@ -137,13 +143,34 @@ class TestMockLabJack:
         d.close()
 
     def test_batch_timing_is_approximately_correct(self):
-        # One batch at 500 Hz / 50 scans = 0.1 s
+        # One batch at 500 Hz / 25 scans = 0.05 s, like the T7
         t0 = time.perf_counter()
         self.device.stream_read()
         elapsed = time.perf_counter() - t0
-        assert 0.08 < elapsed < 0.15, (
-            f"Batch timing {elapsed:.3f} s out of expected 0.1 s range"
+        assert 0.03 < elapsed < 0.09, (
+            f"Batch timing {elapsed:.3f} s out of expected 0.05 s range"
         )
+
+    def test_tc_and_lc_samples_stay_finite(self):
+        """The dashboard once saw NaN from the mock TC/LC."""
+        self.device.write_actuator("lox_main", 1)
+        self.device.write_actuator("fuel_main", 1)   # fire: LCs ramp
+        for _ in range(10):
+            batch = self.device.stream_read()
+            for tag in ("tc0", "lc0", "lc1"):
+                assert all(math.isfinite(v) for v in batch[tag]), tag
+
+    def test_unwired_actuator_is_refused_like_the_t7(self):
+        spec = ActuatorSpec(id="spare", type=BINARY_DIO, dio=None)
+        device = MockLabJack(self.channels, [spec])
+        with pytest.raises(RuntimeError, match="not fully specified"):
+            device.write_actuator("spare", 1)
+
+    def test_close_safes_the_outputs(self):
+        self.device.write_actuator("fuel_vent", 1)
+        self.device.close()
+        assert self.device.read_actuator("fuel_vent") == 0
+        self.device.open()
 
     def test_sensor_tags_property(self):
         tags = self.device.sensor_tags
@@ -204,8 +231,8 @@ class TestMockStepper:
 
 class TestDifferentialPtSimulation:
     """
-    The mock dP signal must stay small next to the PT signal (it once reused
-    the PT signal). The real dPT range is UNVERIFIED.
+    The mock dP signal must stay inside the dPT's span and small next to the
+    PT signal. Span 0-0.4 MPa over 0-10 V (seller listing; UNVERIFIED).
     """
 
     def test_orifice_dp_stays_in_a_plausible_band(self):
@@ -219,8 +246,8 @@ class TestDifferentialPtSimulation:
             device.close()
 
         for tag in ("dpt0", "dpt1"):
-            psi = [v * 500.0 for v in batch[tag]]   # old slope; real one UNVERIFIED
-            assert all(0.0 < p < 100.0 for p in psi), (
+            psi = [v * _DPT_PSI_PER_V for v in batch[tag]]
+            assert all(0.0 < p < _DPT_FULL_SCALE_PSI for p in psi), (
                 f"{tag} simulated outside a plausible orifice dP band: "
                 f"min={min(psi):.1f} max={max(psi):.1f} psi"
             )

@@ -128,6 +128,7 @@ def main() -> None:
         derived=cfg.get("derived"),
         channels_path=_resolve(paths["channels"]),
         actuators_path=_resolve(paths["actuators"]),
+        stream_hz=int(cfg["stream"]["target_hz"]),
     )
     print(f"[MAIN] Manifest: {len(engine.channel_specs)} channels, "
           f"{len(engine.actuator_specs)} actuators")

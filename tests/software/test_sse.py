@@ -132,10 +132,22 @@ class TestEnvelope:
     def test_system_state_payload_shape(self):
         engine = make_engine()
         payload = system_state_message(engine)["payload"]
-        for key in ("streaming", "is_stale", "sequence", "sensors", "valves", "derived"):
+        for key in ("streaming", "is_stale", "backlog", "sequence", "sensors",
+                    "valves", "derived"):
             assert key in payload, f"missing payload key: {key}"
         assert set(payload["sequence"]) == {"active", "name", "elapsed_s", "state"}
         assert payload["sequence"]["state"] == "idle"  # fresh engine, fire never run
+
+    def test_sensors_carry_their_unit(self):
+        engine = make_engine()
+        engine.start()
+        try:
+            wait_for_first_batch(engine)
+            sensors = system_state_message(engine)["payload"]["sensors"]
+        finally:
+            engine.stop()
+        assert sensors["pt0"]["unit"] == "Pa"
+        assert sensors["tc0"]["unit"] == "celsius"
 
     def test_derived_lists_mass_flows_and_ratio(self):
         engine = make_engine()

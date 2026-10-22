@@ -31,7 +31,7 @@ Run it from the repo root: `config.yaml` and the paths inside it are relative to
 ## Test
 
 ```bash
-bash Start_Linux.sh --test        # mock-hardware suite, same as CI
+bash Start_Linux.sh --test        # mock-hardware suite, same as CI (installs requirements-dev.txt)
 bash Start_Linux.sh --test-live   # bench only: needs a T7 plugged in
 ```
 

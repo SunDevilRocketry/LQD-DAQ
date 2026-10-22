@@ -106,3 +106,14 @@ class TestLogger:
 
         assert not self.logger.is_recording
         assert "No space left" in self.logger.last_error
+
+    def test_events_file_rides_along_with_the_recording(self):
+        path = self.logger.start_recording("evt")
+        self.logger.write_event(["1.5", "manual", "fuel_vent", 1, "fuel_vent -> OPEN"])
+        self.logger.stop_recording()
+        self.logger.write_event(["2.0", "manual", "x", 0, "after stop"])   # ignored
+
+        with open(path[:-len(".csv")] + "_events.csv") as f:
+            rows = list(csv.reader(f))
+        assert rows[0] == ["time_s", "source", "actuator", "state", "text"]
+        assert rows[1:] == [["1.5", "manual", "fuel_vent", "1", "fuel_vent -> OPEN"]]

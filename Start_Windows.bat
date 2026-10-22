@@ -54,11 +54,13 @@ echo === Liquids DAQ ===
 exit /b %errorlevel%
 
 :run_tests
+pip install -r requirements-dev.txt -q
 echo === Running test suite (mock hardware, no LabJack required) ===
 %PYEXE% -m pytest tests/software tests/test_calculations.py -v
 exit /b %errorlevel%
 
 :run_tests_live
+pip install -r requirements-dev.txt -q
 echo === Running live-hardware test suite (LabJack T7 must be attached) ===
 %PYEXE% -m pytest tests/hardware_live -v
 exit /b %errorlevel%
