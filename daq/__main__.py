@@ -129,6 +129,8 @@ def main() -> None:
         channels_path=_resolve(paths["channels"]),
         actuators_path=_resolve(paths["actuators"]),
         stream_hz=int(cfg["stream"]["target_hz"]),
+        # Mock only: placeholder step counts so sequences run without hardware.
+        mock_stepper_defaults=_hw.USING_MOCK,
     )
     print(f"[MAIN] Manifest: {len(engine.channel_specs)} channels, "
           f"{len(engine.actuator_specs)} actuators")

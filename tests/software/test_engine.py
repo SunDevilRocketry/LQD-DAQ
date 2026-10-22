@@ -7,6 +7,7 @@ thresholds, staleness, sequences and the CJC poll.
 
 import csv
 import json
+import os
 import threading
 import time
 
@@ -1333,6 +1334,32 @@ class TestEventsCsv:
         assert ("manual", "fuel_vent", "1") in picked
         assert ("fire", "tank_depress", "1") in picked
         assert all(float(r["time_s"]) >= 0 for r in rows)
+
+
+class TestMockStepperDefaults:
+    """--mock fills missing step counts so sequences run; hardware stays strict."""
+
+    @staticmethod
+    def _engine(mock_defaults):
+        return Engine(
+            channels_path=FULL_CHANNELS, actuators_path=REPO_ACTUATORS,
+            sequence_dir=os.path.join(os.path.dirname(REPO_ACTUATORS), "sequences"),
+            mock_stepper_defaults=mock_defaults,
+        )
+
+    def test_mock_can_fire_the_shipped_sequence(self):
+        engine = self._engine(True)
+        assert engine.unwired_actuators == []
+        assert any("MOCK: lox_main" in e for e in engine.event_log)
+        engine.fire()
+        try:
+            assert engine._sequence_active
+        finally:
+            engine.stop_sequence()
+
+    def test_without_the_flag_the_mains_stay_unwired(self):
+        unwired = sorted(self._engine(False).unwired_actuators)
+        assert unwired == ["fuel_main", "lox_main"]
 
 class _StubLogger:
     """Minimal Logger stand-in for asserting recording start/stop calls."""

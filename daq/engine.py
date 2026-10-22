@@ -14,7 +14,7 @@ import time
 import threading
 import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import yaml
@@ -65,6 +65,11 @@ _DEFAULT_CAL_BY_TYPE: dict[str, dict[str, float]] = {
 # CJC + counter poll. Also the watchdog keep-alive (stream data doesn't
 # reset it): stop it and the T7 safes every output after 5 s.
 _CJC_INTERVAL_S = 0.5
+
+# --mock only: stand-ins for stepper step counts/rate that aren't set yet,
+# so sequences can be exercised without hardware numbers.
+_MOCK_STEPS     = 400
+_MOCK_PULSE_HZ  = 2000.0
 
 # SysRD 2.5.4 minimum sample rate.
 _MIN_STREAM_HZ = 200
@@ -181,6 +186,7 @@ class Engine:
         channels_path:  str = DEFAULT_CHANNELS_PATH,
         actuators_path: str = DEFAULT_ACTUATORS_PATH,
         stream_hz:      int = 500,
+        mock_stepper_defaults: bool = False,
     ) -> None:
         if stream_hz < _MIN_STREAM_HZ:
             raise ValueError(
@@ -189,16 +195,18 @@ class Engine:
             )
         self._lock = threading.RLock()
         self._event_log: deque[str] = deque(maxlen=500)  # SR 3.5
+        self._logger = logger
         self._snapshot = EngineState()
 
         self._channels:  list[ChannelSpec]  = load_channels(channels_path)
         self._actuators: list[ActuatorSpec] = load_actuators(actuators_path)
+        if mock_stepper_defaults:
+            self._actuators = [self._mock_stepper(s) for s in self._actuators]
 
         self._device        = Device(
             self._channels, self._actuators, stream_hz=stream_hz
         )
         self._backlog_warned = False
-        self._logger        = logger
         self._sequence_dir  = sequence_dir
         self._thresholds    = self._convert_thresholds_to_pa(thresholds or {})
         self._derived_cfg   = derived or {}
@@ -346,6 +354,22 @@ class Engine:
     def unwired_actuators(self) -> list[str]:
         """Ids of actuators with missing pins or step settings; they can't be driven."""
         return [spec.id for spec in self._actuators if not spec.is_wired]
+
+    def _mock_stepper(self, spec: ActuatorSpec) -> ActuatorSpec:
+        """Fill a pinned stepper's missing step counts/rate (mock only)."""
+        if (spec.type != PULSE_STEPPER or spec.step_dio is None
+                or spec.dir_dio is None or spec.is_wired):
+            return spec
+        self._log(
+            f"MOCK: {spec.id} has no step counts/rate; using placeholders "
+            f"({_MOCK_STEPS} steps at {_MOCK_PULSE_HZ:.0f} Hz)"
+        )
+        return replace(
+            spec,
+            steps_open=spec.steps_open or _MOCK_STEPS,
+            steps_close=spec.steps_close or _MOCK_STEPS,
+            pulse_freq_hz=spec.pulse_freq_hz or _MOCK_PULSE_HZ,
+        )
 
     def _default_calibration(self) -> dict[str, dict[str, float]]:
         """Per-channel calibration from the type defaults."""
@@ -1574,7 +1598,7 @@ class Engine:
             self._event_log.append(entry)
         print(f"[ENGINE] {entry}")
         logger = self._logger
-        if logger is not None and logger.is_recording:
+        if logger is not None and logger.is_recording and hasattr(self, "_device"):
             logger.write_event([
                 f"{self._device.stream_time_s:.6f}", source, actuator, state, message,
             ])
