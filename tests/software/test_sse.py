@@ -13,6 +13,7 @@ import time
 import httpx
 import pytest
 import uvicorn
+import yaml
 
 import daq.api as api_module
 from daq.api import app
@@ -135,8 +136,30 @@ class TestEnvelope:
         for key in ("streaming", "is_stale", "backlog", "sequence", "sensors",
                     "valves", "derived"):
             assert key in payload, f"missing payload key: {key}"
-        assert set(payload["sequence"]) == {"active", "name", "elapsed_s", "state"}
+        assert set(payload["sequence"]) == {
+            "active", "name", "elapsed_s", "state", "step", "time_ms", "server_time_ms",
+        }
         assert payload["sequence"]["state"] == "idle"  # fresh engine, fire never run
+
+    def test_frames_carry_the_fire_clock(self, tmp_path):
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir()
+        (seq_dir / "fire.yaml").write_text(yaml.safe_dump({
+            "post_record_seconds": 0,
+            "steps": [{"name": "later", "actions": [[100.0, "fuel_purge", 1]]}],
+        }))
+        engine = make_engine(sequence_dir=str(seq_dir))
+        engine.fire()
+        try:
+            time.sleep(0.2)
+            seq = system_state_message(engine)["payload"]["sequence"]
+            assert seq["time_ms"] >= 150
+            assert seq["server_time_ms"] > 0
+        finally:
+            engine.stop_sequence()
+        paused = system_state_message(engine)["payload"]["sequence"]["time_ms"]
+        time.sleep(0.1)
+        assert system_state_message(engine)["payload"]["sequence"]["time_ms"] == paused
 
     def test_sensors_carry_their_unit(self):
         engine = make_engine()

@@ -153,6 +153,21 @@ class SequenceRefused(RuntimeError):
     """A sequence can't run; raised on the caller's thread before it starts."""
 
 
+class ResumeMismatch(RuntimeError):
+    """Resume refused: actuators differ from what the fire has applied."""
+
+    def __init__(self, differences: list[dict]) -> None:
+        self.differences = differences
+        listed = ", ".join(
+            f"{d['actuator']} (expected {d['expected']}, actual {d['actual']})"
+            for d in differences
+        )
+        super().__init__(
+            f"Actuators differ from the fire: {listed}. "
+            f"Resume with on_mismatch 'keep' or 'converge'."
+        )
+
+
 @dataclass(frozen=True)
 class FireStep:
     """One named phase of fire.yaml; start_t (earliest action) is the jump target."""
@@ -591,15 +606,25 @@ class Engine:
             "sequence_time_ms":  int(round(elapsed * 1000)),
         }
 
-    def start_sequence(self) -> dict:
+    def start_sequence(self, on_mismatch: str = "refuse") -> dict:
         """
         Resume fire.yaml from the current position (like fire(), no reset).
 
+        Each actuator is checked against the last state the fire applied to
+        it. On a difference, on_mismatch picks: "refuse" (raise), "keep"
+        (resume with the manual state) or "converge" (set the expected
+        state first). Actuators the fire hasn't touched yet aren't checked.
+
         Raises:
+            ValueError: unknown on_mismatch.
+            ResumeMismatch: a difference and on_mismatch is "refuse".
             SequenceRefused: fire.yaml can't be loaded or driven.
             RuntimeError: a sequence (fire or abort) is already active, or
                           the position was invalidated by an abort.
         """
+        if on_mismatch not in ("refuse", "keep", "converge"):
+            raise ValueError(f"on_mismatch must be refuse, keep or converge, "
+                             f"not {on_mismatch!r}")
         with self._lock:
             if self._fire_invalidated:
                 raise RuntimeError(
@@ -611,6 +636,23 @@ class Engine:
             self._fire_steps = fire_steps
             start_idx        = self._fire_next_idx
             start_elapsed    = self._fire_position_s
+
+        differences = self._resume_differences(steps[:start_idx])
+        if differences:
+            if on_mismatch == "refuse":
+                raise ResumeMismatch(differences)
+            for d in differences:
+                if on_mismatch == "converge":
+                    self._device.write_actuator(d["actuator"], d["expected"])
+                    self._log(
+                        f"Resume: {d['actuator']} -> "
+                        f"{'OPEN' if d['expected'] else 'CLOSED'} (converge)",
+                        source="converge", actuator=d["actuator"],
+                        state=d["expected"],
+                    )
+                else:
+                    self._log(f"Resume: keeping {d['actuator']} at {d['actual']}")
+
         started = self._start_sequence(
             "fire", steps, post_s, is_fire=True,
             start_idx=start_idx, start_elapsed=start_elapsed, abort_gen=gen,
@@ -618,6 +660,20 @@ class Engine:
         if not started:
             raise RuntimeError("A sequence is already active")
         return self.sequence_status()
+
+    def _resume_differences(
+        self, applied: list[tuple[float, str, int]]
+    ) -> list[dict]:
+        """Actuators whose state differs from the last one the fire applied."""
+        expected: dict[str, int] = {}
+        for _, name, state in applied:
+            expected[name] = state
+        actual = self._device.actuator_states()
+        return [
+            {"actuator": name, "expected": state, "actual": actual[name].state}
+            for name, state in expected.items()
+            if name in actual and actual[name].state != state
+        ]
 
     def stop_sequence(self) -> dict:
         """

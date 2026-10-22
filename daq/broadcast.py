@@ -96,6 +96,8 @@ def system_state_message(engine) -> dict[str, Any]:
         for aid, reading in (snap.actuators or {}).items()
     }
 
+    fire = engine.sequence_status()
+
     return envelope("system-state", {
         "streaming": bool(snap.streaming),
         "is_stale":  engine.is_data_stale,
@@ -105,6 +107,11 @@ def system_state_message(engine) -> dict[str, Any]:
             "name":      snap.sequence_name or None,
             "elapsed_s": engine.sequence_elapsed_s,
             "state":     snap.sequence_state,  # fire lifecycle
+            # Fire clock, same as the /sequence/* responses: runs on after
+            # completion, freezes on pause or abort.
+            "step":           fire["step"],
+            "time_ms":        fire["sequence_time_ms"],
+            "server_time_ms": fire["server_time_ms"],
         },
         "sensors": sensors,
         "valves":  valves,

@@ -22,6 +22,7 @@ from daq.engine import (
     FIRE_PAUSED,
     FIRE_RUNNING,
     Engine,
+    ResumeMismatch,
     SequenceRefused,
 )
 from daq.logger import Logger
@@ -1360,6 +1361,75 @@ class TestMockStepperDefaults:
     def test_without_the_flag_the_mains_stay_unwired(self):
         unwired = sorted(self._engine(False).unwired_actuators)
         assert unwired == ["fuel_main", "lox_main"]
+
+
+class TestResumeMismatch:
+    """Play after manual changes: refuse with the list, or keep, or converge."""
+
+    FIRE = {
+        "post_record_seconds": 0,
+        "steps": [
+            {"name": "arm", "actions": [[0.0, "ignition_arm", 1],
+                                        [0.0, "lox_purge", 1]]},
+            {"name": "later", "actions": [[100.0, "fuel_purge", 1]]},
+        ],
+    }
+
+    def _paused(self, tmp_path):
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir()
+        (seq_dir / "fire.yaml").write_text(yaml.safe_dump(self.FIRE))
+        engine = make_engine(sequence_dir=str(seq_dir))
+        engine.fire()
+        time.sleep(0.1)
+        engine.stop_sequence()          # pause also turns ignition_arm off
+        engine.write_actuator("lox_purge", 0)
+        return engine
+
+    @staticmethod
+    def _state(engine, name):
+        return engine._device.actuator_states()[name].state
+
+    def test_refuse_lists_the_differences(self, tmp_path):
+        engine = self._paused(tmp_path)
+        with pytest.raises(ResumeMismatch) as exc:
+            engine.start_sequence()
+        assert exc.value.differences == [
+            {"actuator": "ignition_arm", "expected": 1, "actual": 0},
+            {"actuator": "lox_purge", "expected": 1, "actual": 0},
+        ]
+        assert not engine._sequence_active
+
+    def test_keep_resumes_with_the_manual_state(self, tmp_path):
+        engine = self._paused(tmp_path)
+        engine.start_sequence(on_mismatch="keep")
+        try:
+            assert engine._sequence_active
+            assert self._state(engine, "lox_purge") == 0
+        finally:
+            engine.stop_sequence()
+
+    def test_converge_restores_the_sequence_state(self, tmp_path):
+        engine = self._paused(tmp_path)
+        engine.start_sequence(on_mismatch="converge")
+        try:
+            assert engine._sequence_active
+            assert self._state(engine, "lox_purge") == 1
+            assert self._state(engine, "ignition_arm") == 1
+        finally:
+            engine.stop_sequence()
+
+    def test_untouched_actuators_are_not_checked(self, tmp_path):
+        engine = self._paused(tmp_path)
+        engine.write_actuator("fuel_purge", 1)   # fire only sets it at T+100
+        with pytest.raises(ResumeMismatch) as exc:
+            engine.start_sequence()
+        assert "fuel_purge" not in {d["actuator"] for d in exc.value.differences}
+
+    def test_unknown_mode_is_refused(self, tmp_path):
+        engine = self._paused(tmp_path)
+        with pytest.raises(ValueError):
+            engine.start_sequence(on_mismatch="maybe")
 
 class _StubLogger:
     """Minimal Logger stand-in for asserting recording start/stop calls."""

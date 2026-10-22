@@ -6,6 +6,7 @@ import time
 import types
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 import daq.api as api_module
@@ -282,6 +283,41 @@ class TestAPI:
 
         _start(api_client, "/fire")   # fresh fire clears the invalidation
         api_client.post("/sequence/stop")
+
+    def test_sequence_start_mismatch_409_lists_differences(self, tmp_path):
+        seq_dir = tmp_path / "sequences"
+        seq_dir.mkdir()
+        (seq_dir / "fire.yaml").write_text(yaml.safe_dump({
+            "post_record_seconds": 0,
+            "steps": [
+                {"name": "purge", "actions": [[0.0, "lox_purge", 1]]},
+                {"name": "later", "actions": [[100.0, "fuel_purge", 1]]},
+            ],
+        }))
+        engine = make_engine(sequence_dir=str(seq_dir))
+        prev_engine, prev_logger = api_module._engine, api_module._logger
+        api_module.set_engine(engine)
+        try:
+            client = TestClient(app)
+            engine.fire()
+            time.sleep(0.1)
+            engine.stop_sequence()
+            engine.write_actuator("lox_purge", 0)
+
+            r = client.post("/sequence/start")
+            assert r.status_code == 409
+            assert r.json()["differences"] == [
+                {"actuator": "lox_purge", "expected": 1, "actual": 0}
+            ]
+            assert client.post(
+                "/sequence/start", json={"on_mismatch": "maybe"}
+            ).status_code == 422
+
+            r = client.post("/sequence/start", json={"on_mismatch": "converge"})
+            assert r.status_code == 200
+            engine.stop_sequence()
+        finally:
+            api_module.set_engine(prev_engine, prev_logger)
 
     def test_snapshot_does_not_error_under_concurrent_polls(self, api_client):
         """10 rapid-fire polls should all return 200."""

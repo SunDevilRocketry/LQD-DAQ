@@ -14,7 +14,7 @@ HTTP API over the Engine (FastAPI).
   POST /deenergize        halt any sequence, de-energise everything (/safe: old name)
   POST /fire              fire.yaml from T=0
   POST /abort             abort.yaml, or all-off if it can't run
-  POST /sequence/start    resume fire
+  POST /sequence/start    resume fire; on_mismatch: refuse / keep / converge
   POST /sequence/stop     pause fire in place
   POST /sequence/time     seek the fire clock (forward-only while running)
   POST /sequence/step     seek to a named step
@@ -35,14 +35,14 @@ import asyncio
 import threading
 import time
 from contextlib import contextmanager
-from typing import Optional, Any
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from daq.engine import SequenceRefused
+from daq.engine import ResumeMismatch, SequenceRefused
 from daq.broadcast import (
     SSE_KEEPALIVE,
     Broadcaster,
@@ -139,6 +139,10 @@ class CalibrationUpdate(BaseModel):
 
 class LogStartRequest(BaseModel):
     prefix: str = "manual_log"
+
+
+class SequenceStartRequest(BaseModel):
+    on_mismatch: Literal["refuse", "keep", "converge"] = "refuse"
 
 
 class SequenceTimeRequest(BaseModel):
@@ -361,14 +365,25 @@ def post_abort():
 
 
 @app.post("/sequence/start")
-def post_sequence_start():
-    """Resume fire from its position. 409 after an abort (use /fire), 423 if busy."""
+def post_sequence_start(req: Optional[SequenceStartRequest] = None):
+    """
+    Resume fire from its position. Body {"on_mismatch": "refuse" | "keep" |
+    "converge"} (default refuse): if an actuator differs from what the fire
+    applied, refuse gives 409 with a "differences" list. Also 409 after an
+    abort (use /fire); 423 if busy.
+    """
     eng = _require_engine()
+    mode = req.on_mismatch if req else "refuse"
     try:
         with _control_guard():
-            return eng.start_sequence()
+            return eng.start_sequence(on_mismatch=mode)
     except _ControlLockBusy:
         return _busy()
+    except ResumeMismatch as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc), "differences": exc.differences},
+        )
     except (SequenceRefused, RuntimeError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
