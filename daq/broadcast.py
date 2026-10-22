@@ -20,6 +20,7 @@ from daq.manifest import (
     TC_DIFFERENTIAL,
     LC_DIRECT,
     PHOTOGATE_COUNTER,
+    VOLTAGE,
 )
 
 
@@ -33,6 +34,7 @@ _SENSOR_TYPES = {
     TC_DIFFERENTIAL:   "temperature",
     LC_DIRECT:         "force",
     PHOTOGATE_COUNTER: "position",
+    VOLTAGE:           "voltage",
 }
 
 
@@ -82,6 +84,7 @@ def system_state_message(engine) -> dict[str, Any]:
             "unit":    reading.unit,   # same as the manifest's, as a cross-check
             "type":    _SENSOR_TYPES.get(types.get(cid), "unknown"),
             "status":  reading.status,
+            "label":   reading.label,   # config.yaml `labels` band, or null
         }
         for cid, reading in (snap.channels or {}).items()
     }

@@ -99,6 +99,7 @@ class TestAPI:
         derived = api_client.get("/snapshot").json()["derived"]
         assert set(derived) == {
             "lox_mass_flow_rate_kg_s", "fuel_mass_flow_rate_kg_s", "mixture_ratio",
+            "total_impulse_lbf_s", "lox_boiling_advisory",
         }
 
     def test_actuators_endpoint(self, api_client):

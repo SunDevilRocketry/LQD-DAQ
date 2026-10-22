@@ -188,6 +188,7 @@ class TestChannelConfig:
         assert regs["AIN0_RANGE"] == 10.0 and regs["AIN0_NEGATIVE_CH"] == 199
         assert regs["AIN1_RANGE"] == 10.0          # load cell, 0-10 V
         assert regs["AIN2_RANGE"] == 0.1 and regs["AIN2_NEGATIVE_CH"] == 3
+        assert regs["AIN13_RANGE"] == 10.0 and regs["AIN13_NEGATIVE_CH"] == 199
         assert not any(name.endswith("_RESOLUTION_INDEX") for name, _ in writes)
 
 

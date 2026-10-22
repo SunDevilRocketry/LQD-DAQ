@@ -160,6 +160,16 @@ class TestMockLabJack:
             for tag in ("tc0", "lc0", "lc1"):
                 assert all(math.isfinite(v) for v in batch[tag]), tag
 
+    def test_igniter_sense_follows_the_igniter_lines(self):
+        def level():
+            values = self.device.stream_read()["ign_sense"]
+            return sum(values) / len(values)
+        assert level() == pytest.approx(4.4, abs=0.05)      # safe, no e-match
+        self.device.write_actuator("ignition_arm", 1)
+        assert level() == pytest.approx(9.0, abs=0.05)      # armed
+        self.device.write_actuator("ignition_fire", 1)
+        assert level() == pytest.approx(2.0, abs=0.05)      # firing
+
     def test_unwired_actuator_is_refused_like_the_t7(self):
         spec = ActuatorSpec(id="spare", type=BINARY_DIO, dio=None)
         device = MockLabJack(self.channels, [spec])
@@ -174,7 +184,8 @@ class TestMockLabJack:
 
     def test_sensor_tags_property(self):
         tags = self.device.sensor_tags
-        assert tags == ["pt0", "pt1", "pt2", "dpt0", "dpt1", "tc0", "lc0", "lc1"]
+        assert tags == ["pt0", "pt1", "pt2", "dpt0", "dpt1", "tc0", "lc0", "lc1",
+                        "ign_sense"]
 
     def test_noise_is_not_constant(self):
         # Two batches should not be identical (PRNG is running)

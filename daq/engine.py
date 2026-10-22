@@ -34,6 +34,7 @@ from daq.manifest import (
     PHOTOGATE_COUNTER,
     PULSE_STEPPER,
     BINARY_DIO,
+    VOLTAGE,
 )
 from daq.calculations import (
     thermocouple_type_t,
@@ -44,6 +45,8 @@ from daq.calculations import (
     lox_mass_flow_rate,
     fuel_mass_flow_rate,
     mixture_ratio,
+    impulse_step_load_cell,
+    lox_below_saturation,
 )
 
 
@@ -70,6 +73,9 @@ _CJC_INTERVAL_S = 0.5
 # so sequences can be exercised without hardware numbers.
 _MOCK_STEPS     = 400
 _MOCK_PULSE_HZ  = 2000.0
+
+# Impulse integration doesn't bridge a longer gap between scans (comms loss).
+_IMPULSE_MAX_GAP_S = 0.5
 
 # SysRD 2.5.4 minimum sample rate.
 _MIN_STREAM_HZ = 200
@@ -198,6 +204,7 @@ class Engine:
         logger=None,
         thresholds:     Optional[dict] = None,
         derived:        Optional[dict] = None,
+        labels:         Optional[dict] = None,
         channels_path:  str = DEFAULT_CHANNELS_PATH,
         actuators_path: str = DEFAULT_ACTUATORS_PATH,
         stream_hz:      int = 500,
@@ -225,6 +232,13 @@ class Engine:
         self._sequence_dir  = sequence_dir
         self._thresholds    = self._convert_thresholds_to_pa(thresholds or {})
         self._derived_cfg   = derived or {}
+        self._labels        = labels or {}
+        # Total impulse of the current/last fire run (lbf*s); None before one.
+        self._impulse:         Optional[float] = None
+        self._impulse_running: bool = False
+        self._impulse_prev:    Optional[tuple[float, float]] = None
+        self._impulse_gen:     int = 0
+        self._boiling:         bool = False
 
         self._cal_path = cal_path
         self._cal = self._default_calibration()
@@ -437,11 +451,35 @@ class Engine:
 
         lox_mdot  = _mdot("lox")
         fuel_mdot = _mdot("fuel")
+
+        # Advisory only: True when the LOX tank (gauge + local atmosphere) is
+        # below saturation at the inlet TC. Nothing acts on it.
+        boil = self._derived_cfg.get("lox_boiling") or {}
+        tank_pa = latest.get(boil.get("tank_channel"))
+        temp_c  = latest.get(boil.get("temp_channel"))
+        atm_psi = boil.get("atmospheric_psi")
+        boiling = None
+        if tank_pa is not None and temp_c is not None and atm_psi is not None:
+            boiling = lox_below_saturation(tank_pa + psi_to_pa(atm_psi), temp_c)
+
+        with self._lock:
+            impulse = self._impulse
         return {
             "lox_mass_flow_rate_kg_s":  lox_mdot,
             "fuel_mass_flow_rate_kg_s": fuel_mdot,
             "mixture_ratio":            mixture_ratio(lox_mdot, fuel_mdot),
+            "total_impulse_lbf_s":      impulse,
+            "lox_boiling_advisory":     boiling,
         }
+
+    def _channel_label(self, tag: str, value: Optional[float]) -> Optional[str]:
+        """Name of the first config.yaml `labels` band holding value, or None."""
+        if value is None:
+            return None
+        for name, (lo, hi) in (self._labels.get(tag) or {}).items():
+            if lo <= value <= hi:
+                return name
+        return None
 
     def _channel_status(self, tag: str, value: Optional[float]) -> Optional[str]:
         """
@@ -529,6 +567,12 @@ class Engine:
         self._halt_sequence()
         self._device.all_safe()   # again, in case a step landed while halting
         self._log("DEENERGIZE: every output de-energised")
+        if self._impulse_running:   # thrust can tail off; keep integrating
+            timer = threading.Timer(
+                self._fire_post_s, self._end_impulse, args=(self._impulse_gen,)
+            )
+            timer.daemon = True
+            timer.start()
 
     def tare(self) -> None:
         """
@@ -915,19 +959,64 @@ class Engine:
             except Exception as exc:
                 self._log(f"ABORT: {spec.id} close failed: {exc}")
 
-    def _stop_seq_recording(self) -> None:
-        """Stop the recording a fire started, if it's still the current one."""
-        path, self._seq_recording = self._seq_recording, None
+    def _end_fire_run(
+        self, path: Optional[str] = None, gen: Optional[int] = None
+    ) -> None:
+        """
+        End a fire run: log its total impulse and stop the recording it
+        started. path/gen pin a delayed call to its own run, so a newer fire
+        is left alone; without them, the current run ends.
+        """
+        self._end_impulse(gen)
+        if gen is None:
+            path = self._seq_recording
+        if path and path == self._seq_recording:
+            self._seq_recording = None
         if (path and self._logger and self._logger.is_recording
                 and self._logger.current_path == path):
             self._logger.stop_recording()
 
     def _finish_seq_recording(self) -> None:
-        """Stop the fire's recording after its post-record time, off-thread."""
-        if self._seq_recording and self._logger:
-            timer = threading.Timer(self._fire_post_s, self._stop_seq_recording)
+        """End the fire run after its post-record time, off-thread."""
+        path, gen = self._seq_recording, self._impulse_gen
+        if path or self._impulse_running:
+            timer = threading.Timer(
+                self._fire_post_s, self._end_fire_run, args=(path, gen)
+            )
             timer.daemon = True
             timer.start()
+
+    def _end_impulse(self, gen: Optional[int] = None) -> None:
+        """Stop integrating and log the total, unless a newer fire took over."""
+        with self._lock:
+            stale = gen is not None and gen != self._impulse_gen
+            if not self._impulse_running or stale:
+                return
+            self._impulse_running = False
+            total = self._impulse
+        self._log(f"Total impulse: {total:.1f} lbf*s")
+
+    def _accumulate_impulse(
+        self, scan_times: list[float], eng_rows: dict[str, list[Optional[float]]]
+    ) -> None:
+        """Trapezoid-integrate the summed load cells while a fire run is live."""
+        channels = (self._derived_cfg.get("impulse") or {}).get("channels") or []
+        if not channels:
+            return
+        with self._lock:
+            if not self._impulse_running:
+                return
+            prev, total = self._impulse_prev, self._impulse
+            for i, t in enumerate(scan_times):
+                rows = [eng_rows.get(ch) for ch in channels]
+                if any(row is None or row[i] is None for row in rows):
+                    prev = None
+                    continue
+                force = sum(row[i] for row in rows)
+                if prev is not None and 0.0 < t - prev[0] <= _IMPULSE_MAX_GAP_S:
+                    total += impulse_step_load_cell(prev[1], force, t - prev[0])
+                prev = (t, force)
+            self._impulse_prev, self._impulse = prev, total
 
     def _halt_sequence(self) -> None:
         """Stop any sequence thread; blocks fire resumes until the next fire()."""
@@ -1232,6 +1321,9 @@ class Engine:
                 for v in raw
             ]
 
+        if spec.type == VOLTAGE:
+            return [None if v == _MISSING_SAMPLE else v for v in raw]
+
         return [None] * len(raw)
 
     def _process_batch(self, batch: dict[str, list[float]]) -> None:
@@ -1293,9 +1385,20 @@ class Engine:
                 unit         = spec.unit,
                 status       = self._channel_status(spec.id, latest.get(spec.id)),
                 last_updated = now_epoch if spec.id in latest else None,
+                label        = self._channel_label(spec.id, latest.get(spec.id)),
             )
             for spec in self._channels
         }
+
+        self._accumulate_impulse(scan_times, eng_rows)
+        derived = self._compute_derived(latest)
+        boiling = derived["lox_boiling_advisory"] is True
+        if boiling != self._boiling:
+            self._boiling = boiling
+            self._log(
+                "ADVISORY: LOX tank below saturation pressure (not acted on)"
+                if boiling else "ADVISORY cleared: LOX tank above saturation"
+            )
 
         # One locked read, so a frame can't mix before/after a transition.
         with self._lock:
@@ -1312,7 +1415,7 @@ class Engine:
         object.__setattr__(new_snap, "cjc_celsius",     cjc_c)
         object.__setattr__(new_snap, "backlog",         backlog)
         object.__setattr__(new_snap, "channels",        channels)
-        object.__setattr__(new_snap, "derived",         self._compute_derived(latest))
+        object.__setattr__(new_snap, "derived",         derived)
         object.__setattr__(new_snap, "actuators",       dict(self._device.actuator_states()))
         object.__setattr__(new_snap, "sequence_active", seq_active)
         object.__setattr__(new_snap, "sequence_name",   seq_name)
@@ -1444,6 +1547,10 @@ class Engine:
                     self._fire_position_s  = 0.0
                     self._fire_next_idx    = 0
                     self._fire_invalidated = False
+                    self._impulse          = 0.0
+                    self._impulse_running  = True
+                    self._impulse_prev     = None
+                    self._impulse_gen     += 1
 
         self._abort_flag.clear()
         self._pause_flag.clear()
@@ -1526,7 +1633,7 @@ class Engine:
                     return
                 time.sleep(0.05)
 
-        self._stop_seq_recording()
+        self._end_fire_run()
 
         self._log(f"Sequence '{name}' finished")
         if is_fire:

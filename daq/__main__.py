@@ -38,6 +38,7 @@ _DEFAULT_CONFIG = {
     "stream":  {"target_hz": 500},
     "thresholds": {},  # listed so config.yaml merges into them
     "derived": {},
+    "labels": {},
 }
 
 
@@ -126,6 +127,7 @@ def main() -> None:
         sequence_dir=sequence_dir,
         thresholds=cfg.get("thresholds"),
         derived=cfg.get("derived"),
+        labels=cfg.get("labels"),
         channels_path=_resolve(paths["channels"]),
         actuators_path=_resolve(paths["actuators"]),
         stream_hz=int(cfg["stream"]["target_hz"]),

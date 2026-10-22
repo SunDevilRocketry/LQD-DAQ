@@ -22,6 +22,8 @@ PT_DIFFERENTIAL   = "pt_differential"
 TC_DIFFERENTIAL   = "tc_differential"
 LC_DIRECT         = "lc_direct"
 PHOTOGATE_COUNTER = "photogate_counter"
+# Plain volts, no calibration (e.g. the igniter sense node).
+VOLTAGE           = "voltage"
 
 # Actuator types
 BINARY_DIO    = "binary_dio"
@@ -29,7 +31,7 @@ PULSE_STEPPER = "pulse_stepper"
 
 # Read via the AIN stream; photogate counters are polled out-of-band.
 _STREAMED_TYPES = frozenset(
-    {PT_DIRECT, PT_DIFFERENTIAL, TC_DIFFERENTIAL, LC_DIRECT}
+    {PT_DIRECT, PT_DIFFERENTIAL, TC_DIFFERENTIAL, LC_DIRECT, VOLTAGE}
 )
 
 # AIN16+ refused: extended (Mux80) channels drive MIO0-2, the igniter lines.
@@ -78,7 +80,7 @@ class ChannelSpec:
     @property
     def is_wired(self) -> bool:
         """True if the manifest names a physical pin for this channel."""
-        if self.type in (PT_DIRECT, PT_DIFFERENTIAL, LC_DIRECT):
+        if self.type in (PT_DIRECT, PT_DIFFERENTIAL, LC_DIRECT, VOLTAGE):
             return self.ain is not None
         if self.type == TC_DIFFERENTIAL:
             return self.ain_pos is not None and self.ain_neg is not None
@@ -123,12 +125,14 @@ class ChannelReading:
     One channel's latest value.
 
     `status`: NOMINAL | CAUTION | WARNING, UNCONFIGURED (no bands), or None
-    (bands but no value).
+    (bands but no value). `label`: the config.yaml `labels` band the value
+    falls in, or None.
     """
     value:        Optional[float]
     unit:         str
     status:       Optional[str]
     last_updated: Optional[float] # epoch seconds
+    label:        Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -179,7 +183,7 @@ def load_channels(path: str) -> list[ChannelSpec]:
         if cid in seen:
             raise ValueError(f"channels.yaml: duplicate channel id '{cid}'")
         if ctype not in (PT_DIRECT, PT_DIFFERENTIAL, TC_DIFFERENTIAL,
-                         LC_DIRECT, PHOTOGATE_COUNTER):
+                         LC_DIRECT, PHOTOGATE_COUNTER, VOLTAGE):
             raise ValueError(
                 f"channels.yaml: channel '{cid}' has unknown type '{ctype}'"
             )

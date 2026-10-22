@@ -182,6 +182,7 @@ class TestEnvelope:
             engine.stop()
         assert set(derived) == {
             "lox_mass_flow_rate_kg_s", "fuel_mass_flow_rate_kg_s", "mixture_ratio",
+            "total_impulse_lbf_s", "lox_boiling_advisory",
         }
 
     def test_system_state_is_json_serializable(self):

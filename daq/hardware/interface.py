@@ -28,6 +28,7 @@ from daq.manifest import (
     TC_DIFFERENTIAL,
     LC_DIRECT,
     PHOTOGATE_COUNTER,
+    VOLTAGE,
     check_ain,
 )
 
@@ -424,7 +425,7 @@ class LabJackT7:
         Resolution is stream-wide (STREAM_RESOLUTION_INDEX in start_stream()).
         """
         for spec in self._stream_channels:
-            if spec.type in (PT_DIRECT, PT_DIFFERENTIAL, LC_DIRECT):
+            if spec.type in (PT_DIRECT, PT_DIFFERENTIAL, LC_DIRECT, VOLTAGE):
                 ljm.eWriteName(self._handle, f"{spec.ain}_NEGATIVE_CH", 199)
                 ljm.eWriteName(self._handle, f"{spec.ain}_RANGE",       10.0)
             elif spec.type == TC_DIFFERENTIAL:

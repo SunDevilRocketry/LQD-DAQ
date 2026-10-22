@@ -32,6 +32,16 @@ derived:
     orifice_count:         1
     discharge_coefficient: 0.67
     density_kg_m3:         800.0    # IPA, approximate
+  # Summed thrust, integrated over each fire run (reset at /fire), lbf*s.
+  impulse:
+    channels:              [lc0, lc1]
+  # Advisory flag only, nothing acts on it: LOX tank (gauge + atmosphere)
+  # below saturation at the inlet TC. tc0 isn't rated below 0 C and sits at
+  # the inlet, not in the tank.
+  lox_boiling:
+    tank_channel:          pt0
+    temp_channel:          tc0
+    atmospheric_psi:       14.7     # UNVERIFIED: sea level; set the site's value
 
 # Display bands only (SR 3.2.2 / 3.2.3.1): nothing acts on them. Keyed by
 # channel id, in psig / C / lbf. No entry = UNCONFIGURED. Empty until
@@ -40,3 +50,12 @@ derived:
 #     normal:  [<lo>, <hi>]
 #     warning: [<lo>, <hi>]
 thresholds: {}
+
+# Named value bands per channel; a reading's `label` is the first band that
+# holds its value, else null. Set ign_sense's from a bench measurement.
+# Format:
+#   ign_sense:
+#     safe_with_ematch: [<lo>, <hi>]
+#     armed:            [<lo>, <hi>]
+labels:
+  ign_sense: {}

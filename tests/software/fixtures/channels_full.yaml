@@ -56,6 +56,12 @@ channels:
     cal_ref: lc1
     active: true
 
+  - id: ign_sense
+    type: voltage
+    unit: V
+    ain: AIN13
+    cal_ref: null
+
   - id: pos_lox_main
     type: photogate_counter
     unit: counts

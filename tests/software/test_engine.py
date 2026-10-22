@@ -630,14 +630,10 @@ class TestDerivedChannels:
     def _engine(self, cfg=None):
         return make_engine(derived=cfg if cfg is not None else self.CFG)
 
-    def test_all_three_outputs_are_always_present(self):
+    def test_every_output_is_always_present(self):
         """Shape is stable even with no config - values go null, keys don't."""
         result = make_engine(derived={})._compute_derived(self._latest())
-        assert set(result) == {
-            "lox_mass_flow_rate_kg_s",
-            "fuel_mass_flow_rate_kg_s",
-            "mixture_ratio",
-        }
+        assert set(result) == _DERIVED_KEYS
         assert all(v is None for v in result.values())
 
     def test_fuel_flow_computes_without_a_thermocouple(self):
@@ -1430,6 +1426,148 @@ class TestResumeMismatch:
         engine = self._paused(tmp_path)
         with pytest.raises(ValueError):
             engine.start_sequence(on_mismatch="maybe")
+
+
+class TestIgniterSense:
+    """ign_sense: raw volts on AIN13, named by config.yaml `labels` bands."""
+
+    BANDS = {"ign_sense": {"no_ematch": [4.0, 5.0], "armed": [8.0, 10.0]}}
+
+    @staticmethod
+    def _reading(engine):
+        engine.start()
+        try:
+            wait_for_first_batch(engine)
+            return engine.snapshot.channels["ign_sense"]
+        finally:
+            engine.stop()
+
+    def test_reports_volts(self):
+        reading = self._reading(make_engine())
+        assert reading.unit == "V"
+        assert 4.3 < reading.value < 4.5     # mock: no e-match fitted
+        assert reading.label is None         # no bands configured
+
+    def test_label_from_bands(self):
+        engine = Engine(
+            channels_path=FULL_CHANNELS, actuators_path=FULL_ACTUATORS,
+            labels=self.BANDS,
+        )
+        assert self._reading(engine).label == "no_ematch"
+
+    def test_value_outside_every_band_has_no_label(self):
+        engine = Engine(
+            channels_path=FULL_CHANNELS, actuators_path=FULL_ACTUATORS,
+            labels={"ign_sense": {"armed": [8.0, 10.0]}},
+        )
+        assert self._reading(engine).label is None
+
+
+class TestTotalImpulse:
+    """lc0 + lc1 integrated over each fire run, reset at /fire."""
+
+    IMPULSE = {"impulse": {"channels": ["lc0", "lc1"]}}
+
+    def _engine(self, tmp_path=None):
+        kwargs = {"derived": self.IMPULSE}
+        if tmp_path is not None:
+            seq_dir = tmp_path / "sequences"
+            seq_dir.mkdir()
+            (seq_dir / "fire.yaml").write_text(yaml.safe_dump({
+                "post_record_seconds": 0,
+                "steps": [{"name": "only", "actions": [[0.0, "tank_depress", 1]]}],
+            }))
+            kwargs["sequence_dir"] = str(seq_dir)
+        return make_engine(**kwargs)
+
+    @staticmethod
+    def _running(engine):
+        engine._impulse, engine._impulse_running = 0.0, True
+
+    def test_constant_thrust_integrates_exactly(self):
+        engine = self._engine()
+        self._running(engine)
+        times = [i * 0.002 for i in range(501)]          # 0..1 s at 500 Hz
+        engine._accumulate_impulse(times, {"lc0": [100.0] * 501, "lc1": [50.0] * 501})
+        assert engine._impulse == pytest.approx(150.0)
+
+    def test_batches_join_but_a_long_gap_is_not_bridged(self):
+        engine = self._engine()
+        self._running(engine)
+        engine._accumulate_impulse([0.0, 0.1], {"lc0": [10.0, 10.0], "lc1": [0.0, 0.0]})
+        engine._accumulate_impulse([0.2], {"lc0": [10.0], "lc1": [0.0]})
+        assert engine._impulse == pytest.approx(2.0)     # 0.2 s at 10 lbf
+        engine._accumulate_impulse([5.0], {"lc0": [10.0], "lc1": [0.0]})
+        assert engine._impulse == pytest.approx(2.0)     # 4.8 s outage skipped
+
+    def test_missing_sample_breaks_the_trapezoid(self):
+        engine = self._engine()
+        self._running(engine)
+        engine._accumulate_impulse(
+            [0.0, 0.1, 0.2], {"lc0": [10.0, None, 10.0], "lc1": [0.0, 0.0, 0.0]}
+        )
+        assert engine._impulse == 0.0
+
+    def test_fire_resets_and_the_end_of_the_run_logs_the_total(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine._impulse = 999.0
+        engine.fire()
+        assert engine._impulse_running
+        engine._sequence_thread.join(timeout=5.0)
+        assert not engine._impulse_running
+        assert engine._compute_derived({})["total_impulse_lbf_s"] == 0.0
+        assert any("Total impulse: 0.0 lbf*s" in e for e in engine.event_log)
+
+    def test_a_stale_timer_leaves_a_newer_run_alone(self):
+        engine = self._engine()
+        self._running(engine)
+        engine._impulse_gen = 5
+        engine._end_impulse(gen=4)
+        assert engine._impulse_running
+
+
+class TestLoxBoilingAdvisory:
+    """Flag only: LOX tank (gauge + atmosphere) below saturation at tc0."""
+
+    BOIL = {"lox_boiling": {"tank_channel": "pt0", "temp_channel": "tc0",
+                            "atmospheric_psi": 14.7}}
+
+    def _flag(self, latest, cfg=None):
+        engine = make_engine(derived=cfg if cfg is not None else self.BOIL)
+        return engine._compute_derived(latest)["lox_boiling_advisory"]
+
+    def test_tank_at_ambient_with_cold_lox_is_flagged(self):
+        # ~1 atm absolute, p_sat at -170 C is ~3.3 bar.
+        assert self._flag({"pt0": 0.0, "tc0": -170.0}) is True
+
+    def test_pressurised_tank_is_not_flagged(self):
+        assert self._flag({"pt0": psi_to_pa(100.0), "tc0": -170.0}) is False
+
+    def test_no_value_outside_the_fit_or_without_inputs(self):
+        assert self._flag({"pt0": 0.0, "tc0": 20.0}) is None       # room temp
+        assert self._flag({"pt0": 0.0}) is None                    # no tc0
+        assert self._flag({"pt0": 0.0, "tc0": -170.0}, cfg={}) is None
+
+    def test_transitions_are_logged_once(self):
+        engine = make_engine(derived=self.BOIL)
+        engine._cjc_celsius = 25.0
+        cold_tc = -0.006062          # Type T: E(-170 C) - E(25 C), in volts
+
+        def batch(pt0_volts):
+            return {"scan_times": [0.0], "pt0": [pt0_volts], "tc0": [cold_tc]}
+
+        engine._process_batch(batch(0.0))       # 0 psig: below saturation
+        engine._process_batch(batch(0.0))
+        engine._process_batch(batch(0.25))      # 100 psig: above
+        log = engine.event_log
+        assert sum("ADVISORY: LOX tank below saturation" in e for e in log) == 1
+        assert any("ADVISORY cleared" in e for e in log)
+
+_DERIVED_KEYS = {
+    "lox_mass_flow_rate_kg_s", "fuel_mass_flow_rate_kg_s", "mixture_ratio",
+    "total_impulse_lbf_s", "lox_boiling_advisory",
+}
+
 
 class _StubLogger:
     """Minimal Logger stand-in for asserting recording start/stop calls."""

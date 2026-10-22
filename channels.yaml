@@ -91,6 +91,13 @@ channels:
     cal_ref: lc1
     active: true
 
+  # -- Igniter sense node: raw volts, labelled by config.yaml `labels`. --
+  - id: ign_sense
+    type: voltage
+    unit: V
+    ain: AIN13
+    cal_ref: null
+
   # -- Photogates (L0004): stepper travel counts, telemetry only. --
   - id: pos_lox_main
     type: photogate_counter

@@ -26,6 +26,7 @@ from daq.manifest import (
     TC_DIFFERENTIAL,
     LC_DIRECT,
     PHOTOGATE_COUNTER,
+    VOLTAGE,
 )
 
 
@@ -59,6 +60,13 @@ _LC_RAMP_S        = 0.5
 _LC_OSC_V         = 0.1
 _LC_OSC_PERIOD_S  = 0.8
 _LC_FIRE_NOISE_V  = 0.005
+
+# Igniter sense node, calculated from the igniter schematic: no e-match
+# fitted (until testing), armed (~battery), firing.
+_IGN_SAFE_V    = 4.4
+_IGN_ARMED_V   = 9.0
+_IGN_FIRING_V  = 2.0
+_IGN_NOISE_V   = 0.01
 
 _CJC_BASE_C  = 25.0
 _CJC_DRIFT_C = 1.0               # slow +/-1 C swing, like a warming T7
@@ -342,7 +350,16 @@ class MockLabJack:
             )
         if spec.type == LC_DIRECT:
             return self._lc_sample(fire_elapsed)
+        if spec.type == VOLTAGE:
+            return self._igniter_sense_sample()
         return 0.0
+
+    def _igniter_sense_sample(self) -> float:
+        """The only voltage channel is the igniter sense node; follow its lines."""
+        armed  = self._actuators.get("ignition_arm") == 1
+        firing = armed and self._actuators.get("ignition_fire") == 1
+        level = _IGN_FIRING_V if firing else _IGN_ARMED_V if armed else _IGN_SAFE_V
+        return level + self._noise() * _IGN_NOISE_V
 
     def _sine_sample(
         self,

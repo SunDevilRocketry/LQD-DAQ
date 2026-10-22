@@ -117,3 +117,10 @@ class TestLogger:
             rows = list(csv.reader(f))
         assert rows[0] == ["time_s", "source", "actuator", "state", "text"]
         assert rows[1:] == [["1.5", "manual", "fuel_vent", "1", "fuel_vent -> OPEN"]]
+
+    def test_voltage_channel_gets_csv_columns(self):
+        path = self.logger.start_recording("cols")
+        self.logger.stop_recording()
+        with open(path) as f:
+            header = next(csv.reader(f))
+        assert "ign_sense_raw_V" in header and "ign_sense_eng_V" in header
