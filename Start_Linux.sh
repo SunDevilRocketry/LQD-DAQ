@@ -31,7 +31,7 @@ install() {
 
     if [ -z "$PYEXE" ]; then
         echo "ERROR: no Python interpreter found (tried 'python3' and 'python')."
-        echo "Install Python 3.10+ and re-run."
+        echo "Install Python 3.11+ and re-run."
         exit 1
     fi
 

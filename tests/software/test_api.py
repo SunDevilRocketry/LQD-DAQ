@@ -32,7 +32,8 @@ def _wait_until_idle(api_client, timeout=30.0):
 
 
 def _ensure_idle(api_client, timeout=60.0):
-    """Wait for idle without POST /abort, which would add another ~10 s cycle."""
+    """Halt whatever an earlier test left running (/deenergize), then wait."""
+    api_client.post("/deenergize")
     _wait_until_idle(api_client, timeout=timeout)
 
 
@@ -253,8 +254,10 @@ class TestAPI:
 
     def test_sequence_start_stop_roundtrip(self, api_client):
         _ensure_idle(api_client)
+        _start(api_client, "/fire")
+        assert api_client.post("/sequence/stop").status_code == 200   # pause
 
-        body = _start(api_client, "/sequence/start")
+        body = _start(api_client, "/sequence/start")                  # resume
         assert set(body) == {"step", "state", "server_time_ms", "sequence_time_ms"}
 
         r_stop = api_client.post("/sequence/stop")
@@ -277,7 +280,7 @@ class TestAPI:
         _start(api_client, "/fire")
         time.sleep(0.1)
         api_client.post("/abort")
-        _wait_until_idle(api_client)  # abort.yaml's own ~10s tail
+        _ensure_idle(api_client)      # cut abort.yaml's tail short
 
         r = api_client.post("/sequence/start")
         assert r.status_code == 409
@@ -491,8 +494,7 @@ class TestControlLockSynchronization:
         t1.start()
         assert stub.entered.wait(timeout=2.0)
         try:
-            for path, call in (("/abort", "abort"), ("/deenergize", "deenergize"),
-                               ("/safe", "deenergize")):
+            for path, call in (("/abort", "abort"), ("/deenergize", "deenergize")):
                 t0 = time.perf_counter()
                 r = client.post(path)
                 assert r.status_code == 200

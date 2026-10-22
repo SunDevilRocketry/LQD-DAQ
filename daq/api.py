@@ -11,7 +11,7 @@ HTTP API over the Engine (FastAPI).
   GET  /logger            recording status
   GET  /sequence          fire.yaml phases
   POST /actuator          manual command (409 mid-sequence)
-  POST /deenergize        halt any sequence, de-energise everything (/safe: old name)
+  POST /deenergize        halt any sequence, de-energise everything
   POST /fire              fire.yaml from T=0
   POST /abort             abort.yaml, or all-off if it can't run
   POST /sequence/start    resume fire; on_mismatch: refuse / keep / converge
@@ -329,12 +329,6 @@ def post_deenergize():
     """Halt any sequence and de-energise every output. Never waits for the lock."""
     _require_engine().deenergize()
     return {"ok": True}
-
-
-@app.post("/safe")
-def post_safe():
-    """Old name for /deenergize; kept for one release."""
-    return post_deenergize()
 
 
 @app.post("/fire")

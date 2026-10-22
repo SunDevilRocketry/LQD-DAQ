@@ -18,7 +18,7 @@ On Windows, use `Start_Windows.bat` with the same flags. Without the LabJack LJM
 
 ### Manual install (pyproject.toml)
 
-The start scripts install from `requirements.txt`. To install the package yourself instead (Python 3.10+):
+The start scripts install from `requirements.txt`. To install the package yourself instead (Python 3.11+):
 
 ```bash
 python3 -m venv .venv

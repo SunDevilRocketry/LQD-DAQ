@@ -41,7 +41,7 @@ if not defined PYEXE (
 )
 if not defined PYEXE (
     echo ERROR: no Python interpreter found ^(tried 'python' and 'py'^).
-    echo Install Python 3.10+ from https://www.python.org/downloads/ and re-run.
+    echo Install Python 3.11+ from https://www.python.org/downloads/ and re-run.
     pause
     exit /b 1
 )
@@ -81,7 +81,7 @@ if not defined PYEXE (
 )
 if not defined PYEXE (
     echo ERROR: no Python interpreter found ^(tried 'python' and 'py -3'^).
-    echo Install Python 3.10+ from https://www.python.org/downloads/
+    echo Install Python 3.11+ from https://www.python.org/downloads/
     echo and make sure to check "Add python.exe to PATH" during setup.
     exit /b 1
 )

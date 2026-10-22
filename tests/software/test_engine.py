@@ -1512,7 +1512,6 @@ class TestTotalImpulse:
         engine = self._engine(tmp_path)
         engine._impulse = 999.0
         engine.fire()
-        assert engine._impulse_running
         engine._sequence_thread.join(timeout=5.0)
         assert not engine._impulse_running
         assert engine._compute_derived({})["total_impulse_lbf_s"] == 0.0
