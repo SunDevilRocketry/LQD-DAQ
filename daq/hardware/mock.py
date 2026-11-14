@@ -5,7 +5,7 @@ Simulated LabJack T7 for hardware-free runs and tests. Same public
 interface as hardware/interface.py; keep the two in sync.
 
 Signals: sine drift plus noise; load cells ramp once both mains are open;
-counters advance while their stepper moves.
+a photogate is blocked while its main is closed and idle.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import time
 import threading
-from typing import Sequence
+from typing import Optional, Sequence
 
 from daq.manifest import (
     ActuatorReading,
@@ -25,7 +25,7 @@ from daq.manifest import (
     PT_DIFFERENTIAL,
     TC_DIFFERENTIAL,
     LC_DIRECT,
-    PHOTOGATE_COUNTER,
+    PHOTOGATE,
     VOLTAGE,
 )
 
@@ -72,7 +72,6 @@ _CJC_BASE_C  = 25.0
 _CJC_DRIFT_C = 1.0               # slow +/-1 C swing, like a warming T7
 
 # -- Actuator Simulation Parameters ---------------------------
-_COUNTS_PER_SECOND = 200.0       # photogate edges while moving
 
 # -- Timing Parameters ----------------------------------------
 _STREAM_HZ         = 500
@@ -86,6 +85,7 @@ class MockLabJack:
         channels:  Sequence[ChannelSpec]  = (),
         actuators: Sequence[ActuatorSpec] = (),
         stream_hz: int = _STREAM_HZ,
+        ip:        Optional[str] = None,   # unused; matches LabJackT7
     ) -> None:
         self._stream_hz      = stream_hz
         self._scans_per_read = max(1, stream_hz // 20)   # 20 batches/s, like the T7
@@ -96,9 +96,9 @@ class MockLabJack:
         self._stream_channels = [
             spec for spec in channels if spec.active and spec.is_streamed
         ]
-        self._counter_channels = [
+        self._photogates = [
             spec for spec in channels
-            if spec.active and spec.type == PHOTOGATE_COUNTER
+            if spec.active and spec.type == PHOTOGATE
         ]
         # Per-PT voltage offset, assigned by manifest order.
         self._pt_index = {
@@ -122,9 +122,6 @@ class MockLabJack:
 
         # Per stepper: the move is in flight until perf_counter() passes this.
         self._move_deadline: dict[str, float] = {}
-        # Accumulated simulated photogate counts, keyed by channel id.
-        self._counts: dict[str, float] = {spec.id: 0.0 for spec in self._counter_channels}
-        self._last_count_update: float = 0.0
 
         self._connected      = False
         self._streaming      = False
@@ -214,20 +211,18 @@ class MockLabJack:
         noise = self._noise() * 0.02
         return _CJC_BASE_C + drift + noise
 
-    def read_counters(self) -> dict[str, float]:
-        """Photogate counts by channel id; each advances while its stepper moves."""
+    def read_photogates(self) -> dict[str, int]:
+        """Photogate levels by channel id: 0 (blocked) while its main is closed and idle."""
         now = time.perf_counter()
+        active = {spec.id for spec in self._photogates}
         with self._lock:
-            dt = now - self._last_count_update if self._last_count_update else 0.0
-            self._last_count_update = now
-
-            for spec in self._steppers:
-                if spec.position_feedback not in self._counts:
-                    continue
-                if self._move_deadline.get(spec.id, 0.0) > now:
-                    self._counts[spec.position_feedback] += _COUNTS_PER_SECOND * dt
-
-            return dict(self._counts)
+            return {
+                spec.position_feedback: int(
+                    self._actuators[spec.id] == 1
+                    or self._move_deadline.get(spec.id, 0.0) > now
+                )
+                for spec in self._steppers if spec.position_feedback in active
+            }
 
     # --------------------------------------------------------
     # Actuator control

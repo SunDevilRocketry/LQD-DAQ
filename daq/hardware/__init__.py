@@ -11,9 +11,9 @@ Usage:
 """
  
 try:
-    from labjack import ljm as _ljm                         # Probe LJM driver availability
+    from labjack.ljm.ljm import _staticLib                  # Probe LJM driver availability; import * hides this name
 
-    if getattr(_ljm, "_staticLib", None) is None:
+    if _staticLib is None:
         raise ImportError("LJM native library not found")
 
     from daq.hardware.interface import LabJackT7 as Device

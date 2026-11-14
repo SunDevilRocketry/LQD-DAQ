@@ -26,7 +26,7 @@ from daq.engine import (
     SequenceRefused,
 )
 from daq.logger import Logger
-from daq.manifest import load_actuators
+from daq.manifest import ActuatorReading, load_actuators
 
 from tests.software._helpers import (
     FULL_ACTUATORS,
@@ -98,13 +98,19 @@ class TestEngine:
         assert actuators["lox_main"].moving is True
         assert actuators["lox_purge"].moving is False
 
-    def test_photogate_counter_is_reported(self):
-        """Position feedback is telemetry, polled out-of-band like CJC."""
+    def test_photogate_level_and_position_follow_the_main(self):
+        """Polled out-of-band like CJC: blocked/closed at rest, clear/open after opening."""
+        time.sleep(0.6)   # at least one out-of-band poll
+        snap = self.engine.snapshot
+        assert snap.channels["pos_lox_main"].value == 0
+        assert snap.actuators["lox_main"].position == "closed"
+
         self.engine.write_actuator("lox_main", 1)
-        time.sleep(1.2)   # cover at least two out-of-band poll ticks
-        reading = self.engine.snapshot.channels["pos_lox_main"]
-        assert reading.value is not None
-        assert reading.unit == "counts"
+        time.sleep(1.2)   # burst done, then at least one more poll
+        snap = self.engine.snapshot
+        assert snap.channels["pos_lox_main"].value == 1
+        assert snap.actuators["lox_main"].position == "open"
+        assert snap.actuators["lox_purge"].position is None
 
     def test_snapshot_using_mock_true(self):
         assert self.engine.snapshot.using_mock is True
@@ -1599,7 +1605,7 @@ class _StubLogger:
 
 
 class TestColdJunctionPoll:
-    """A failed CJC/counter read is logged and blanks the value, never a guessed CJC."""
+    """A failed CJC/photogate read is logged and blanks the value, never a guessed CJC."""
 
     @staticmethod
     def _tc_spec(engine):
@@ -1631,17 +1637,56 @@ class TestColdJunctionPoll:
         assert engine._cjc_celsius == 21.0
         assert any("CJC read recovered" in e for e in engine.event_log)
 
-    def test_failed_counter_read_is_logged_and_clears_counts(self):
+    def test_failed_photogate_read_is_logged_and_clears_levels(self):
         engine = make_engine()
-        engine._counters = {"pos_lox_main": 12.0}
+        engine._photogates = {"pos_lox_main": 1}
 
         def boom():
             raise RuntimeError("LJM timeout")
-        engine._device.read_counters = boom
+        engine._device.read_photogates = boom
         engine._poll_out_of_band()
 
-        assert engine._counters == {}
-        assert any("counter read FAILED" in e for e in engine.event_log)
+        assert engine._photogates == {}
+        assert any("Photogate read FAILED" in e for e in engine.event_log)
+
+
+class TestMainPosition:
+    """Photogate blocked = closed; clear = opening/closing during a burst, else open."""
+
+    @staticmethod
+    def _position(level, state, moving):
+        engine = make_engine()
+        engine._photogates = {"pos_lox_main": level}
+        spec = next(s for s in engine._actuators if s.id == "lox_main")
+        return engine._main_position(spec, ActuatorReading(state=state, moving=moving))
+
+    @pytest.mark.parametrize("level, state, moving, expected", [
+        (0, 0, False, "closed"),
+        (0, 1, True,  "closed"),    # opening, flag still in the beam
+        (1, 1, True,  "opening"),
+        (1, 1, False, "open"),
+        (1, 0, True,  "closing"),
+        (1, 0, False, "open"),      # close finished short of the beam
+        (None, 1, False, None),     # no photogate reading
+    ])
+    def test_position(self, level, state, moving, expected):
+        assert self._position(level, state, moving) == expected
+
+    def test_idle_disagreement_warns_once_per_episode(self):
+        engine = make_engine()
+        warnings = lambda: [e for e in engine.event_log if "photogate reads" in e]
+
+        engine._photogates = {"pos_lox_main": 1}     # commanded closed, beam clear
+        engine._check_positions()
+        engine._check_positions()
+        assert len(warnings()) == 1
+        assert "lox_main commanded CLOSED but its photogate reads clear" in warnings()[0]
+
+        engine._photogates = {"pos_lox_main": 0}     # agrees again
+        engine._check_positions()
+        engine._photogates = {"pos_lox_main": 1}
+        engine._check_positions()
+        assert len(warnings()) == 2
 
 
 class TestShutdown:

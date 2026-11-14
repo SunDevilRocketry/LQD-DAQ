@@ -39,7 +39,7 @@ class Logger:
         self._output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        # Columns: active streamed channels only (counters aren't per scan).
+        # Columns: active streamed channels only (photogates aren't per scan).
         self._channels: list[ChannelSpec] = [
             spec for spec in (channels or [])
             if spec.active and spec.is_streamed

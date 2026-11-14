@@ -53,7 +53,7 @@ class TestLogger:
         self.logger.stop_recording()
         with open(path) as f:
             header = next(csv.reader(f))
-        # pt7 is inactive; photogate counters aren't sampled per scan.
+        # pt7 is inactive; photogates aren't sampled per scan.
         assert not any(c.startswith("pt7_") for c in header)
         assert not any(c.startswith("pos_") for c in header)
 

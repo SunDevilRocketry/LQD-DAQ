@@ -16,6 +16,7 @@ sys.path.insert(
 
 import pytest
 
+from daq.__main__ import _load_config
 from daq.engine import DEFAULT_ACTUATORS_PATH, DEFAULT_CHANNELS_PATH
 from daq.hardware.interface import LabJackT7
 from daq.manifest import BINARY_DIO, load_actuators, load_channels
@@ -33,7 +34,8 @@ def actuators():
 
 @pytest.fixture
 def device(channels, actuators):
-    dev = LabJackT7(channels, actuators)
+    config = os.path.join(os.path.dirname(__file__), "..", "..", "config.yaml")
+    dev = LabJackT7(channels, actuators, ip=_load_config(config)["t7"]["ip"])
     dev.open()
     try:
         yield dev
@@ -70,7 +72,7 @@ class TestPhysicalConnection:
     def test_physical_actuator_round_trip(self, device, actuators):
         """
         Energise then de-energise the binary_dio actuator named in
-        LQD_LIVE_ACTUATOR; skipped if unset. Never name one with gas connected.
+        LQD_LIVE_ACTUATOR; skipped if unset.
         """
         name = os.environ.get("LQD_LIVE_ACTUATOR")
         if not name:

@@ -1,8 +1,7 @@
 # tests/software/fixtures/channels_full.yaml
 #
-# Every channel active with a pin, so the photogate path is tested too.
-# AIN pins are arbitrary and not a wiring plan; the photogates use the
-# cart's FIO6/FIO7, where the T7 has counters.
+# Every channel active w/ a pin.
+# AIN pins are arbitrary.
 
 channels:
   - id: pt0
@@ -63,20 +62,19 @@ channels:
     cal_ref: null
 
   - id: pos_lox_main
-    type: photogate_counter
-    unit: counts
+    type: photogate
+    unit: state
     dio: FIO6
     cal_ref: null
     active: true
   - id: pos_fuel_main
-    type: photogate_counter
-    unit: counts
+    type: photogate
+    unit: state
     dio: FIO7
     cal_ref: null
     active: true
 
-  # Left inactive on purpose, so the "declared but not present" path is
-  # covered too: it must appear in the channel set with a null value.
+  # Left inactive on purpose for testing.
   - id: pt7
     type: pt_direct
     unit: Pa

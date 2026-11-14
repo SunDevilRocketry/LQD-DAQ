@@ -23,6 +23,7 @@ from daq.hardware import Device, USING_MOCK
 from daq.manifest import (
     ChannelReading,
     ChannelSpec,
+    ActuatorReading,
     ActuatorSpec,
     load_channels,
     load_actuators,
@@ -31,7 +32,7 @@ from daq.manifest import (
     PRESSURE_TYPES,
     TC_DIFFERENTIAL,
     LC_DIRECT,
-    PHOTOGATE_COUNTER,
+    PHOTOGATE,
     PULSE_STEPPER,
     BINARY_DIO,
     VOLTAGE,
@@ -65,7 +66,7 @@ _DEFAULT_CAL_BY_TYPE: dict[str, dict[str, float]] = {
     LC_DIRECT: {"slope": 440.92, "intercept": 0.0},
 }
 
-# CJC + counter poll. Also the watchdog keep-alive (stream data doesn't
+# CJC + photogate poll. Also the watchdog keep-alive (stream data doesn't
 # reset it): stop it and the T7 safes every output after 5 s.
 _CJC_INTERVAL_S = 0.5
 
@@ -211,6 +212,7 @@ class Engine:
         channels_path:  str = DEFAULT_CHANNELS_PATH,
         actuators_path: str = DEFAULT_ACTUATORS_PATH,
         stream_hz:      int = 500,
+        t7_ip:          Optional[str] = None,
         mock_stepper_defaults: bool = False,
     ) -> None:
         if stream_hz < _MIN_STREAM_HZ:
@@ -229,7 +231,7 @@ class Engine:
             self._actuators = [self._mock_stepper(s) for s in self._actuators]
 
         self._device        = Device(
-            self._channels, self._actuators, stream_hz=stream_hz
+            self._channels, self._actuators, stream_hz=stream_hz, ip=t7_ip
         )
         self._backlog_warned = False
         self._sequence_dir  = sequence_dir
@@ -259,9 +261,12 @@ class Engine:
         self._cjc_celsius: Optional[float] = None
         self._last_cjc_read: float = 0.0
         self._cjc_failing: bool = False
-        self._counters_failing: bool = False
+        self._photogates_failing: bool = False
 
-        self._counters: dict[str, float] = {}
+        # 0 = blocked (main closed), 1 = clear.
+        self._photogates: dict[str, int] = {}
+        # Warn once per disagreement, not on every poll.
+        self._position_warned: set[str] = set()
 
         self._last_batch_perf_time: float = 0.0
 
@@ -1306,7 +1311,7 @@ class Engine:
 
     def _poll_out_of_band(self) -> None:
         """
-        Read CJC and counters (the watchdog keep-alive). A failure clears the
+        Read CJC and photogates (the watchdog keep-alive). A failure clears the
         value and logs once per outage.
         """
         try:
@@ -1321,15 +1326,44 @@ class Engine:
             self._cjc_failing = True
 
         try:
-            self._counters = dict(self._device.read_counters())
-            if self._counters_failing:
-                self._log("Photogate counter read recovered")
-            self._counters_failing = False
+            self._photogates = dict(self._device.read_photogates())
+            if self._photogates_failing:
+                self._log("Photogate read recovered")
+            self._photogates_failing = False
         except Exception as exc:
-            self._counters = {}
-            if not self._counters_failing:
-                self._log(f"Photogate counter read FAILED: {exc}")
-            self._counters_failing = True
+            self._photogates = {}
+            if not self._photogates_failing:
+                self._log(f"Photogate read FAILED: {exc}")
+            self._photogates_failing = True
+        self._check_positions()
+
+    def _check_positions(self) -> None:
+        """Warn once when an idle main's photogate disagrees with its command."""
+        states = self._device.actuator_states()
+        for spec in self._actuators:
+            level = self._photogates.get(spec.position_feedback)
+            reading = states.get(spec.id)
+            if level is None or reading is None or reading.moving or level == reading.state:
+                self._position_warned.discard(spec.id)
+            elif spec.id not in self._position_warned:
+                self._position_warned.add(spec.id)
+                self._log(
+                    f"WARNING: {spec.id} commanded "
+                    f"{'OPEN' if reading.state else 'CLOSED'} but its photogate "
+                    f"reads {'clear' if level else 'blocked'}",
+                    source="position", actuator=spec.id,
+                )
+
+    def _main_position(self, spec: ActuatorSpec, reading: ActuatorReading) -> Optional[str]:
+        """Blocked = closed; clear = opening/closing while a burst runs, else open."""
+        level = self._photogates.get(spec.position_feedback)
+        if level is None:
+            return None
+        if level == 0:
+            return "closed"
+        if reading.moving:
+            return "opening" if reading.state == 1 else "closing"
+        return "open"
 
     def _scale_channel(
         self, spec: ChannelSpec, raw: list[float], cjc_c: Optional[float]
@@ -1414,8 +1448,8 @@ class Engine:
                 latest[spec.id] = eng_rows[spec.id][-1]
 
         for spec in self._channels:
-            if spec.active and spec.type == PHOTOGATE_COUNTER:
-                latest[spec.id] = self._counters.get(spec.id)
+            if spec.active and spec.type == PHOTOGATE:
+                latest[spec.id] = self._photogates.get(spec.id)
 
         channels = {
             spec.id: ChannelReading(
@@ -1454,7 +1488,12 @@ class Engine:
         object.__setattr__(new_snap, "backlog",         backlog)
         object.__setattr__(new_snap, "channels",        channels)
         object.__setattr__(new_snap, "derived",         derived)
-        object.__setattr__(new_snap, "actuators",       dict(self._device.actuator_states()))
+        states = self._device.actuator_states()
+        actuators = {
+            spec.id: replace(states[spec.id], position=self._main_position(spec, states[spec.id]))
+            for spec in self._actuators if spec.id in states
+        }
+        object.__setattr__(new_snap, "actuators",       actuators)
         object.__setattr__(new_snap, "sequence_active", seq_active)
         object.__setattr__(new_snap, "sequence_name",   seq_name)
         object.__setattr__(new_snap, "sequence_step",   seq_step)

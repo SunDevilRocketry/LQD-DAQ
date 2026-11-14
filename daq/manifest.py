@@ -21,7 +21,7 @@ PT_DIRECT         = "pt_direct"
 PT_DIFFERENTIAL   = "pt_differential"
 TC_DIFFERENTIAL   = "tc_differential"
 LC_DIRECT         = "lc_direct"
-PHOTOGATE_COUNTER = "photogate_counter"
+PHOTOGATE         = "photogate"
 # Plain volts, no calibration (e.g. the igniter sense node).
 VOLTAGE           = "voltage"
 
@@ -29,7 +29,7 @@ VOLTAGE           = "voltage"
 BINARY_DIO    = "binary_dio"
 PULSE_STEPPER = "pulse_stepper"
 
-# Read via the AIN stream; photogate counters are polled out-of-band.
+# Read via the AIN stream; photogates are polled out-of-band.
 _STREAMED_TYPES = frozenset(
     {PT_DIRECT, PT_DIFFERENTIAL, TC_DIFFERENTIAL, LC_DIRECT, VOLTAGE}
 )
@@ -70,7 +70,7 @@ class ChannelSpec:
     ain:      Optional[str] = None   # pt_direct / pt_differential / lc_direct
     ain_pos:  Optional[str] = None   # tc_differential
     ain_neg:  Optional[str] = None   # tc_differential
-    dio:      Optional[str] = None   # photogate_counter
+    dio:      Optional[str] = None   # photogate
 
     @property
     def is_streamed(self) -> bool:
@@ -84,7 +84,7 @@ class ChannelSpec:
             return self.ain is not None
         if self.type == TC_DIFFERENTIAL:
             return self.ain_pos is not None and self.ain_neg is not None
-        if self.type == PHOTOGATE_COUNTER:
+        if self.type == PHOTOGATE:
             return self.dio is not None
         return False
 
@@ -103,7 +103,7 @@ class ActuatorSpec:
     steps_open:    Optional[int]   = None
     steps_close:   Optional[int]   = None
     pulse_freq_hz: Optional[float] = None
-    # Photogate channel id; only the mock reads it.
+    # Photogate channel id that reports this main's position.
     position_feedback: Optional[str] = None
 
     @property
@@ -143,9 +143,12 @@ class ActuatorReading:
     `state`: commanded, 1 = energised, 0 = de-energised.
     `moving`: True while a stepper move is in flight; always False for
     binary_dio.
+    `position`: a main's "closed"/"opening"/"open"/"closing" from its
+    photogate, or None without one.
     """
-    state:  int
-    moving: bool = False
+    state:    int
+    moving:   bool = False
+    position: Optional[str] = None
 
 
 def _ain_name(value: Any) -> Optional[str]:
@@ -183,7 +186,7 @@ def load_channels(path: str) -> list[ChannelSpec]:
         if cid in seen:
             raise ValueError(f"channels.yaml: duplicate channel id '{cid}'")
         if ctype not in (PT_DIRECT, PT_DIFFERENTIAL, TC_DIFFERENTIAL,
-                         LC_DIRECT, PHOTOGATE_COUNTER, VOLTAGE):
+                         LC_DIRECT, PHOTOGATE, VOLTAGE):
             raise ValueError(
                 f"channels.yaml: channel '{cid}' has unknown type '{ctype}'"
             )

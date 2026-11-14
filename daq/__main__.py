@@ -36,7 +36,8 @@ _DEFAULT_CONFIG = {
         "lox_table":    "daq/LOX_table_100_0-260_99R.csv",
     },
     "stream":  {"target_hz": 500},
-    "thresholds": {},  # listed so config.yaml merges into them
+    "t7":      {"ip": "192.168.1.207"},
+    "thresholds": {},
     "derived": {},
     "labels": {},
 }
@@ -131,6 +132,7 @@ def main() -> None:
         channels_path=_resolve(paths["channels"]),
         actuators_path=_resolve(paths["actuators"]),
         stream_hz=int(cfg["stream"]["target_hz"]),
+        t7_ip=cfg["t7"]["ip"],
         # Mock only: placeholder step counts so sequences run without hardware.
         mock_stepper_defaults=_hw.USING_MOCK,
     )

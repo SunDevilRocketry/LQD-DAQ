@@ -1,26 +1,24 @@
 # sequences/fire.yaml: hot-fire timeline, [t_s, actuator_id, state] from
 # T=0 at /fire; 1 = energise. Step names are /sequence/step targets; a step
 # starts at its earliest action.
-# PLACEHOLDER timings from the old Goondaq DAQ; Liquids confirms the real
-# sequence. Arm leads fire (RC on-delay) and fire releases first.
+# SDR Liquids 11/24 fire sheet; vents are normally closed, so 1 = open.
 
 post_record_seconds: 5.0
 
 steps:
   - name: purge_open
     actions:
-      - [1.10, "lox_purge",  1]
-      - [1.10, "fuel_purge", 1]
-  - name: ignition_arm
-    actions:
-      - [3.00, "ignition_arm", 1]
+      - [1.00, "lox_purge",  1]
+      - [1.00, "fuel_purge", 1]
   - name: ignition_on
     actions:
+      # Arm 0.1 s early so the igniter's RC on-delay has passed at the sheet's IGN ON.
+      - [3.90, "ignition_arm",  1]
       - [4.00, "ignition_fire", 1]
   - name: ignition_off
     actions:
       - [4.50, "ignition_fire", 0]
-      - [4.60, "ignition_arm",  0]
+      - [4.50, "ignition_arm",  0]
   - name: purge_close
     actions:
       - [4.90, "lox_purge",  0]
@@ -28,22 +26,24 @@ steps:
   - name: main_valves_open
     actions:
       - [5.00, "lox_main",  1]
-      - [5.05, "fuel_main", 1]
+      - [5.10, "fuel_main", 1]
   - name: main_valves_close
     actions:
-      - [15.00, "lox_main",  0]
-      - [15.10, "fuel_main", 0]
+      - [10.05, "lox_main",  0]
+      - [10.10, "fuel_main", 0]
   - name: purge_reopen
     actions:
-      - [15.10, "lox_purge",  1]
-      - [15.20, "fuel_purge", 1]
-  - name: press_vent_close
+      - [10.10, "lox_purge",  1]
+      - [10.15, "fuel_purge", 1]
+  - name: press_close
     actions:
-      - [16.00, "lox_press",  0]
-      - [16.00, "fuel_press", 0]
-      - [16.00, "tank_depress", 0]
-      - [16.00, "fuel_vent",  0]
+      - [11.05, "lox_press",  0]
+      - [11.05, "fuel_press", 0]
+  - name: vent_open
+    actions:
+      - [11.55, "tank_depress", 1]
+      - [11.55, "fuel_vent",    1]
   - name: purge_final_close
     actions:
-      - [21.00, "lox_purge",  0]
-      - [21.00, "fuel_purge", 0]
+      - [16.55, "lox_purge",  0]
+      - [16.55, "fuel_purge", 0]

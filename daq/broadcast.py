@@ -19,7 +19,7 @@ from daq.manifest import (
     PT_DIFFERENTIAL,
     TC_DIFFERENTIAL,
     LC_DIRECT,
-    PHOTOGATE_COUNTER,
+    PHOTOGATE,
     VOLTAGE,
 )
 
@@ -33,7 +33,7 @@ _SENSOR_TYPES = {
     PT_DIFFERENTIAL:   "pressure",
     TC_DIFFERENTIAL:   "temperature",
     LC_DIRECT:         "force",
-    PHOTOGATE_COUNTER: "position",
+    PHOTOGATE:         "position",
     VOLTAGE:           "voltage",
 }
 
@@ -95,6 +95,8 @@ def system_state_message(engine) -> dict[str, Any]:
             # "open" means energised.
             "status": "open" if reading.state == 1 else "closed",
             "moving": reading.moving,
+            # Mains only: photogate-based closed/opening/open/closing, else null.
+            "position": reading.position,
         }
         for aid, reading in (snap.actuators or {}).items()
     }

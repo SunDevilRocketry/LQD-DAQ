@@ -59,9 +59,9 @@ actuators:
     pulse_freq_hz: null
     notes: "no accel ramp; start with a conservative pulse rate"
     position_feedback:
-      enabled: false
+      enabled: true
       source: pos_lox_main
-      note: "reported via channels.yaml only, not closed-loop"
+      note: "display and log warnings only, not closed-loop"
 
   - id: fuel_main
     type: pulse_stepper
@@ -72,6 +72,6 @@ actuators:
     steps_close: null
     pulse_freq_hz: null
     position_feedback:
-      enabled: false
+      enabled: true
       source: pos_fuel_main
-      note: "reported via channels.yaml only, not closed-loop"
+      note: "display and log warnings only, not closed-loop"

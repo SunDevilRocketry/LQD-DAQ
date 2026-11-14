@@ -27,16 +27,21 @@ from daq.manifest import (
     PT_DIFFERENTIAL,
     TC_DIFFERENTIAL,
     LC_DIRECT,
-    PHOTOGATE_COUNTER,
+    PHOTOGATE,
     VOLTAGE,
     check_ain,
 )
 
 
 # CJC: internal sensor minus 3 C for the AIN0-3 screw terminals (LabJack 18.0).
-_CJC_REGISTER          = "TEMPERATURE_DEVICE_K"
+# AIN14 is its raw voltage; TEMPERATURE_DEVICE_K is refused while streaming.
+_CJC_AIN               = "AIN14"
+_CJC_K_PER_VOLT        = -92.6
+_CJC_K_OFFSET          = 467.6
 _CJC_SCREW_TERMINAL_C  = -3.0
 _KELVIN_OFFSET         = 273.15
+# Only a successful reply resets the watchdog, and the T7 answers this mid-stream.
+_KEEPALIVE_REGISTER    = "FIO_STATE"
 
 # -- Stream & Safety Parameters -------------------------------
 _STREAM_HZ       = 500
@@ -54,7 +59,6 @@ _DIO_EF_CLOCK_DIV    = 8
 _DIO_EF_TICK_HZ      = _DIO_EF_CORE_HZ // _DIO_EF_CLOCK_DIV
 
 _DIO_EF_INDEX_PULSE_OUT = 2
-_DIO_EF_INDEX_COUNTER   = 8
 
 # Bank -> flat DIO number (MIO0 = DIO20).
 _DIO_BANK_OFFSETS = {"FIO": 0, "EIO": 8, "CIO": 16, "MIO": 20}
@@ -76,6 +80,11 @@ def _dio_number(name: str) -> int:
     raise ValueError(f"Unrecognised DIO register name: '{name}'")
 
 
+def _ef_prefix(name: str) -> str:
+    """DIO_EF register prefix: LJM accepts DIO3_EF_*, not FIO3_EF_*."""
+    return f"DIO{_dio_number(name)}"
+
+
 class LabJackT7:
     """LabJack T7 driver; same public interface as MockLabJack."""
 
@@ -84,8 +93,10 @@ class LabJackT7:
         channels:  Sequence[ChannelSpec],
         actuators: Sequence[ActuatorSpec],
         stream_hz: int = _STREAM_HZ,
+        ip:        Optional[str] = None,
     ) -> None:
         self._stream_hz      = stream_hz
+        self._ip             = ip
         self._scans_per_read = _SCANS_PER_READ
 
         self._handle: Optional[int] = None
@@ -98,8 +109,8 @@ class LabJackT7:
         self._stream_channels = [
             spec for spec in self._channels if spec.is_streamed
         ]
-        self._counter_channels = [
-            spec for spec in self._channels if spec.type == PHOTOGATE_COUNTER
+        self._photogates = [
+            spec for spec in self._channels if spec.type == PHOTOGATE
         ]
 
         for spec in self._channels:
@@ -126,6 +137,7 @@ class LabJackT7:
         self._scan_tags:    list[str] = []
         self._scan_addrs:   list[int] = []
         self._n_channels:   int = 0
+        self._cjc_volts:    Optional[float] = None
 
         # Shared CLOCK0 roll value, set in _configure_steppers().
         self._pulse_roll: int = 0
@@ -161,12 +173,12 @@ class LabJackT7:
         Raises:
             ljm.LJMError: If no T7 is found or connection fails.
         """
-        self._handle = ljm.openS("T7", "ANY", "ANY")
+        # Ethernet only: USB may be plugged in for power, and ANY would pick it.
+        self._handle = ljm.openS("T7", "ETHERNET", self._ip)
         info = ljm.getHandleInfo(self._handle)
         self._serial = str(info[2])
 
         self._configure_channels()
-        self._configure_counters()
         self._configure_steppers()
         self._safe_all_hardware()
         self._arm_watchdog()
@@ -205,7 +217,7 @@ class LabJackT7:
         """
         self._build_scan_list()
 
-        if self._n_channels == 0:
+        if not self._stream_channels:
             raise RuntimeError(
                 "No wired analog channels in channels.yaml - nothing to "
                 "stream. Fill in the ain/ain_pos/ain_neg fields for the "
@@ -304,24 +316,24 @@ class LabJackT7:
             for i, tag in enumerate(self._scan_tags):
                 batch[tag].append(data[base + i])
 
+        # LJM marks skipped samples -9999; keep the last good mean if all are.
+        good = [v for v in batch.pop(_CJC_AIN) if v != -9999.0]
+        if good:
+            self._cjc_volts = sum(good) / len(good)
         return batch
 
     def read_cjc_celsius(self) -> float:
-        """Cold junction C. Command-response, so it also resets the watchdog."""
-        kelvin = ljm.eReadName(self._handle, _CJC_REGISTER)
+        """Cold junction C from the streamed AIN14, after a watchdog keep-alive read."""
+        ljm.eReadName(self._handle, _KEEPALIVE_REGISTER)
+        kelvin = self._cjc_volts * _CJC_K_PER_VOLT + _CJC_K_OFFSET
         return kelvin - _KELVIN_OFFSET + _CJC_SCREW_TERMINAL_C
 
-    def read_counters(self) -> dict[str, float]:
-        """Photogate edge counts by channel id; a failed read is omitted, not zeroed."""
-        counts: dict[str, float] = {}
-        for spec in self._counter_channels:
-            try:
-                counts[spec.id] = ljm.eReadName(
-                    self._handle, f"{spec.dio}_EF_READ_A"
-                )
-            except ljm.LJMError:
-                continue
-        return counts
+    def read_photogates(self) -> dict[str, int]:
+        """Photogate levels by channel id: 0 = blocked, 1 = clear."""
+        if not self._photogates:
+            return {}
+        state = int(ljm.eReadName(self._handle, "DIO_STATE"))
+        return {spec.id: (state >> _dio_number(spec.dio)) & 1 for spec in self._photogates}
 
     # --------------------------------------------------------
     # Actuator control
@@ -433,14 +445,6 @@ class LabJackT7:
                 ljm.eWriteName(self._handle, f"{spec.ain_pos}_NEGATIVE_CH", neg_num)
                 ljm.eWriteName(self._handle, f"{spec.ain_pos}_RANGE",       0.1)
 
-    def _configure_counters(self) -> None:
-        """Puts each photogate DIO into DIO_EF Counter mode."""
-        for spec in self._counter_channels:
-            ljm.eWriteName(self._handle, f"{spec.dio}_EF_ENABLE", 0)
-            ljm.eWriteName(self._handle, f"{spec.dio}_EF_INDEX",
-                           _DIO_EF_INDEX_COUNTER)
-            ljm.eWriteName(self._handle, f"{spec.dio}_EF_ENABLE", 1)
-
     def _configure_steppers(self) -> None:
         """
         Configure DIO_EF CLOCK0 once for every STEP line.
@@ -475,7 +479,7 @@ class LabJackT7:
         ljm.eWriteName(self._handle, "DIO_EF_CLOCK0_ENABLE",  1)
 
         for spec in steppers:
-            ljm.eWriteName(self._handle, f"{spec.step_dio}_EF_ENABLE", 0)
+            ljm.eWriteName(self._handle, f"{_ef_prefix(spec.step_dio)}_EF_ENABLE", 0)
             if spec.ena_dio is not None:
                 ljm.eWriteName(self._handle, spec.ena_dio, 1)   # start disabled
 
@@ -493,7 +497,7 @@ class LabJackT7:
         if spec.ena_dio is not None:
             ljm.eWriteName(self._handle, spec.ena_dio, 0)   # active-low enable
 
-        step_dio = spec.step_dio
+        step_dio = _ef_prefix(spec.step_dio)
         ljm.eWriteName(self._handle, f"{step_dio}_EF_ENABLE",   0)
         ljm.eWriteName(self._handle, f"{step_dio}_EF_INDEX",    _DIO_EF_INDEX_PULSE_OUT)
         ljm.eWriteName(self._handle, f"{step_dio}_EF_CONFIG_A", roll // 2)  # 50% duty
@@ -511,7 +515,7 @@ class LabJackT7:
         Build the eStreamStart address list.
 
         A TC streams its positive AIN only (NEGATIVE_CH sets the pair). The
-        CJC and counters are polled instead; TEMPERATURE_DEVICE_K can't stream.
+        CJC's AIN14 goes last; photogates are polled instead.
         """
         names: list[str] = []
         tags:  list[str] = []
@@ -519,6 +523,8 @@ class LabJackT7:
         for spec in self._stream_channels:
             tags.append(spec.id)
             names.append(spec.ain_pos if spec.type == TC_DIFFERENTIAL else spec.ain)
+        tags.append(_CJC_AIN)
+        names.append(_CJC_AIN)
 
         self._scan_tags   = tags
         self._scan_addrs  = [ljm.nameToAddress(name)[0] for name in names]
@@ -537,7 +543,7 @@ class LabJackT7:
                 if spec.type == BINARY_DIO and spec.dio is not None:
                     ljm.eWriteName(self._handle, spec.dio, 1)   # active-low: 1 = safe
                 elif spec.type == PULSE_STEPPER and spec.is_wired:
-                    ljm.eWriteName(self._handle, f"{spec.step_dio}_EF_ENABLE", 0)
+                    ljm.eWriteName(self._handle, f"{_ef_prefix(spec.step_dio)}_EF_ENABLE", 0)
                     if spec.ena_dio is not None:
                         ljm.eWriteName(self._handle, spec.ena_dio, 1)   # de-assert enable
             except ljm.LJMError:

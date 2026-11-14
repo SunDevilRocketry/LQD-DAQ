@@ -1,5 +1,6 @@
 """tests/software/test_main.py: config loading and startup in daq/__main__.py."""
 
+import importlib
 import os
 import types
 
@@ -29,6 +30,16 @@ def test_refuses_to_run_on_mock_unless_asked(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         main()
     assert exc.value.code == 1
+
+
+@pytest.mark.parametrize("lib, driver", [(object(), "LabJackT7"), (None, "MockLabJack")])
+def test_driver_choice_follows_the_ljm_library(monkeypatch, lib, driver):
+    """_staticLib lives in labjack.ljm.ljm; the package's import * hides it."""
+    monkeypatch.setattr(hw, "Device", hw.Device)
+    monkeypatch.setattr(hw, "USING_MOCK", hw.USING_MOCK)
+    monkeypatch.setattr("labjack.ljm.ljm._staticLib", lib)
+    importlib.reload(hw)
+    assert hw.Device.__name__ == driver
 
 
 class TestLoadConfig:

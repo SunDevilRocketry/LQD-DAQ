@@ -44,7 +44,7 @@ class TestMockLabJack:
         assert "pt7" not in batch
 
     def test_stream_omits_out_of_band_channels(self):
-        """Photogate counters are polled separately, not scanned."""
+        """Photogates are polled separately, not scanned."""
         batch = self.device.stream_read()
         assert "pos_lox_main" not in batch
 
@@ -224,20 +224,19 @@ class TestMockStepper:
         self.device.write_actuator("lox_purge", 1)
         assert self.device.actuator_states()["lox_purge"].moving is False
 
-    def test_counters_advance_only_while_moving(self):
-        self.device.read_counters()          # establish the time baseline
-        before = self.device.read_counters()["pos_lox_main"]
+    def test_photogate_blocked_only_while_closed_and_idle(self):
+        level = lambda: self.device.read_photogates()["pos_lox_main"]
+        assert level() == 0
 
         self.device.write_actuator("lox_main", 1)
-        time.sleep(0.1)                      # inside the 0.2 s burst
-        during = self.device.read_counters()["pos_lox_main"]
-        assert during > before, "counter did not advance during a move"
+        assert level() == 1
+        time.sleep(0.3)                      # 0.2 s burst finished
+        assert level() == 1
 
-        time.sleep(0.3)                      # burst finished
-        self.device.read_counters()
-        settled = self.device.read_counters()["pos_lox_main"]
-        after_idle = self.device.read_counters()["pos_lox_main"]
-        assert after_idle == settled, "counter kept advancing while idle"
+        self.device.write_actuator("lox_main", 0)
+        assert level() == 1                  # closing
+        time.sleep(0.3)
+        assert level() == 0
 
 
 class TestDifferentialPtSimulation:

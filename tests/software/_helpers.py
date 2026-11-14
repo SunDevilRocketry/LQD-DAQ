@@ -17,8 +17,7 @@ _HERE     = os.path.dirname(os.path.abspath(__file__))
 _REPO     = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _FIXTURES = os.path.join(_HERE, "fixtures")
 
-# Fully wired fixtures: the repo's manifests leave the step counts null
-# and the photogates inactive, so those paths would go untested.
+# Fully wired fixtures, because the repo's manifests leave the step counts null.
 FULL_CHANNELS     = os.path.join(_FIXTURES, "channels_full.yaml")
 FULL_ACTUATORS    = os.path.join(_FIXTURES, "actuators_full.yaml")
 UNWIRED_ACTUATORS = os.path.join(_FIXTURES, "actuators_unwired.yaml")

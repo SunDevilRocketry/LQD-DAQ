@@ -12,7 +12,8 @@ import yaml
 from daq.hardware import interface
 from daq.hardware.interface import LabJackT7, _dio_number
 from daq.manifest import (
-    ActuatorSpec, ChannelSpec, BINARY_DIO, PT_DIRECT, PULSE_STEPPER, TC_DIFFERENTIAL,
+    ActuatorSpec, ChannelSpec, BINARY_DIO, PHOTOGATE, PT_DIRECT, PULSE_STEPPER,
+    TC_DIFFERENTIAL,
     load_actuators, load_channels,
 )
 
@@ -116,20 +117,50 @@ class TestOptionalStepperEnable:
         assert [v for name, v in writes if name == "FIO4"] == [1, 0, 1]
 
 
+class TestDioEfRegisterNames:
+    """LJM rejects FIO3_EF_*; the feature registers are DIO3_EF_*."""
+
+    def test_stepper_uses_the_dio_number(self, writes):
+        device = LabJackT7([], [_stepper()])
+        device._handle = 1
+        device._configure_steppers()
+        device._start_pulse_burst(device._actuator_specs["lox_main"], 1)
+        device._safe_all_hardware()
+
+        ef = [name for name, _ in writes
+              if "_EF_" in name and not name.startswith("DIO_EF_CLOCK")]
+        assert ef and all(name.startswith("DIO3_EF_") for name in ef)
+
+    def test_photogates_read_their_bit_of_dio_state(self, monkeypatch, writes):
+        reads = []
+        monkeypatch.setattr(interface.ljm, "eReadName",
+                            lambda handle, name: reads.append(name) or 0b0100_0000)
+        device = LabJackT7([
+            ChannelSpec(id="lox", type=PHOTOGATE, unit="state", dio="FIO6"),
+            ChannelSpec(id="fuel", type=PHOTOGATE, unit="state", dio="FIO7"),
+        ], [])
+        device._handle = 1
+
+        assert device.read_photogates() == {"lox": 1, "fuel": 0}
+        assert reads == ["DIO_STATE"] and writes == []
+
+
 class TestColdJunction:
 
-    def test_reads_internal_sensor_with_screw_terminal_correction(self, monkeypatch):
+    def test_converts_streamed_ain14_after_a_keepalive_read(self, fake_ljm, monkeypatch):
         reads = []
-        def fake_read(handle, name):
-            reads.append(name)
-            return 298.15
-        monkeypatch.setattr(interface.ljm, "eReadName", fake_read)
+        monkeypatch.setattr(interface.ljm, "eReadName",
+                            lambda handle, name: reads.append(name) or 0)
+        device = LabJackT7(_pt_and_tc(), [])
+        device._handle = _FakeLJM.HANDLE
+        device.start_stream()
+        # A skipped sample (-9999) must not drag the mean.
+        fake_ljm.reads.append(([1.0, 0.01, 1.83, 2.0, 0.02, -9999.0], 0, 0))
+        device.stream_read()
 
-        device = LabJackT7([], [])
-        device._handle = 1
-        # 298.15 K = 25 C, minus LabJack's 3 C screw-terminal correction.
-        assert device.read_cjc_celsius() == pytest.approx(22.0)
-        assert reads == ["TEMPERATURE_DEVICE_K"]
+        # 1.83 V -> 298.142 K = 24.992 C, minus LabJack's 3 C screw-terminal correction.
+        assert device.read_cjc_celsius() == pytest.approx(21.992, abs=1e-3)
+        assert reads == ["FIO_STATE"]
 
     def test_configuring_shipped_channels_touches_no_extended_channel(self, writes):
         device = LabJackT7(load_channels(REPO_CHANNELS), [])
@@ -260,6 +291,7 @@ class _FakeLJM:
         return [(e[1], e[2]) for e in self.events if e[0] == "write"]
 
     def openS(self, device_type, connection_type, identifier):
+        self.opened_with = (device_type, connection_type, identifier)
         return self.HANDLE
 
     def getHandleInfo(self, handle):
@@ -323,8 +355,8 @@ class TestStreamStart:
         streamed = [c for c in channels if c.active and c.is_wired and c.is_streamed]
         pins = [c.ain_pos if c.type == TC_DIFFERENTIAL else c.ain for c in streamed]
         scans, n, addrs, hz = fake_ljm.stream_starts[-1]
-        assert addrs == [2 * int(pin[3:]) for pin in pins]
-        assert n == len(pins) and hz == 500 and scans == 25
+        assert addrs == [2 * int(pin[3:]) for pin in pins + ["AIN14"]]
+        assert n == len(pins) + 1 and hz == 500 and scans == 25
         assert device.sensor_tags == [c.id for c in streamed]
         assert "tc0" in device.sensor_tags and "pos_lox_main" not in device.sensor_tags
         assert device.is_streaming
@@ -388,7 +420,7 @@ class TestStreamRead:
         device = LabJackT7(_pt_and_tc(), [])
         device._handle = _FakeLJM.HANDLE
         device.start_stream()
-        fake_ljm.reads.append(([1.0, 0.01, 2.0, 0.02, 3.0, 0.03], 4, 10))
+        fake_ljm.reads.append(([1.0, 0.01, 1.8, 2.0, 0.02, 1.8, 3.0, 0.03, 1.8], 4, 10))
 
         batch = device.stream_read()
 
@@ -396,13 +428,14 @@ class TestStreamRead:
         assert batch["tc0"] == [0.01, 0.02, 0.03]
         assert batch["backlog_device"] == [4]
         assert batch["backlog_ljm"] == [10]
+        assert "AIN14" not in batch
 
     def test_scan_times_are_spaced_at_the_actual_rate_ending_now(self, fake_ljm):
         fake_ljm.max_hz = 300
         device = LabJackT7(_pt_and_tc(), [], stream_hz=500)
         device._handle = _FakeLJM.HANDLE
         device.start_stream()                       # negotiates 250 Hz
-        fake_ljm.reads.append(([0.0] * 8, 0, 0))   # 4 scans x 2 channels
+        fake_ljm.reads.append(([0.0] * 12, 0, 0))  # 4 scans x 3 channels
 
         before = device.stream_time_s
         times = device.stream_read()["scan_times"]
@@ -417,7 +450,12 @@ class TestStreamRead:
 class TestLifecycle:
 
     def _device(self):
-        return LabJackT7(load_channels(REPO_CHANNELS), load_actuators(REPO_ACTUATORS))
+        return LabJackT7(load_channels(REPO_CHANNELS), load_actuators(REPO_ACTUATORS),
+                         ip="192.168.1.207")
+
+    def test_open_uses_ethernet_at_the_configured_ip(self, fake_ljm):
+        self._device().open()
+        assert fake_ljm.opened_with == ("T7", "ETHERNET", "192.168.1.207")
 
     def test_open_safes_every_valve_before_arming_the_watchdog(self, fake_ljm):
         device = self._device()

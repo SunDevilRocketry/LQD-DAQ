@@ -16,9 +16,13 @@ paths:
 stream:
   target_hz: 500       # requested rate; 200 minimum (SysRD 2.5.4)
 
-# Injector mass flow and O/F (calculated), published under `derived`.
+# Static IP saved in the T7's flash [keep it on the router's subnet, outside its DHCP range].
+t7:
+  ip: "192.168.1.207"
+
+# Injector mass flow and O/F (calculated), sent under `derived`.
 # A null or inactive input makes that output null. orifice_count must match
-# the injector's element count. Cd values are Goondaq's, not measured here.
+# the injector's element count.
 derived:
   lox:
     dp_channel:            dpt0

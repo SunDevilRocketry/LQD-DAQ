@@ -1,7 +1,7 @@
 # channels.yaml: sensors and the T7 pin each is read on.
-# Pins follow docs/schematics/legacy_cart_2026-10-16.pdf; a null pin means
-# unwired.
-# Pressures report in Pa; calibration and thresholds stay authored in psi.
+# Pins follow docs/schematics/legacy_cart_2026-10-16.pdf
+# Null pin = unwired
+# Pressures report in Pa; however, calibration & thresholds stay authored in psi.
 
 channels:
   # -- PTs: Omega PX309-2KG5V, gauge. pt4-pt7 are spare slots. --
@@ -68,7 +68,7 @@ channels:
     cal_ref: dpt1
     notes: "fuel injector orifice dP; 0-0.4 MPa over 0-10 V per seller listing, UNVERIFIED"
 
-  # -- TC: Type T on the T7 screw terminals. Feeds LOX density (estimate). --
+  # -- Thermocouple (Type T): Feeds LOX density (estimate). --
   - id: tc0
     type: tc_differential
     unit: celsius
@@ -98,18 +98,16 @@ channels:
     ain: AIN13
     cal_ref: null
 
-  # -- Photogates (L0004): stepper travel counts, telemetry only. --
+  # -- Photogates (L0004): 0 = blocked (main closed), 1 = clear. --
   - id: pos_lox_main
-    type: photogate_counter
-    unit: counts
+    type: photogate
+    unit: state
     dio: FIO6
     cal_ref: null
-    active: false
-    notes: "L0004 photogate, tested working; inactive until stepper analysis uses it"
+    active: true
   - id: pos_fuel_main
-    type: photogate_counter
-    unit: counts
+    type: photogate
+    unit: state
     dio: FIO7
     cal_ref: null
-    active: false
-    notes: "L0004 photogate, tested working; inactive until stepper analysis uses it"
+    active: true
