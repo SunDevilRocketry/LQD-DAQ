@@ -889,6 +889,8 @@ class TestFireSequencing:
         assert logger.stop_calls == 0
         assert status["step"] == "beta"
         assert status["state"] == FIRE_PAUSED
+        # Clock freezes at the pause, not back at beta (T+0.06).
+        assert status["sequence_time_ms"] >= 150
 
     def test_stop_then_start_resumes_without_replaying_earlier_actions(self, tmp_path):
         engine = self._engine(tmp_path)
@@ -923,7 +925,7 @@ class TestFireSequencing:
 
         assert any("ABORT" in e or "[abort]" in e for e in engine.event_log)
         # Frozen, not reset; only a fresh fire() can resume.
-        assert engine._fire_position_s == pytest.approx(0.06, abs=0.02)
+        assert engine._fire_position_s >= 0.15
         assert engine._fire_invalidated is True
         assert engine._sequence_active is False
         assert engine._fire_state == FIRE_ABORTED

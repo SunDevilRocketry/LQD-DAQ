@@ -1733,8 +1733,11 @@ class Engine:
             self._fire_state      = FIRE_COMPLETED
 
     def _sequence_paused(self) -> None:
-        """End the sequence and freeze the fire clock at _fire_position_s."""
+        """End the sequence and freeze the fire clock where it stopped."""
         with self._lock:
+            if self._fire_t0 is not None:
+                # Freeze at the press, not the last action, so resume doesn't rewind the clock.
+                self._fire_position_s = time.perf_counter() - self._fire_t0
             self._sequence_active = False
             self._sequence_name   = ""
             self._sequence_t0     = None
