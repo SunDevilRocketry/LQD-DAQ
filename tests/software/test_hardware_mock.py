@@ -70,7 +70,7 @@ class TestMockLabJack:
         batch = self.device.stream_read()
         for tag in ("pt0", "pt1", "pt2"):
             for v in batch[tag]:
-                assert 0.0 < v < 5.0, f"{tag} voltage {v} out of range"
+                assert -0.01 < v < 5.0, f"{tag} voltage {v} out of range"
 
     def test_tc_voltages_are_small(self):
         # TC differential voltages should be millivolt-scale
@@ -84,14 +84,50 @@ class TestMockLabJack:
             avg = sum(batch[tag]) / len(batch[tag])
             assert abs(avg) < 0.1, f"{tag} resting voltage {avg} too large"
 
+    def _run_plant(self, seconds):
+        for _ in range(int(seconds * 100)):
+            self.device._step_plant(0.01)
+
+    def _psi(self, tag, psi_per_v=400.0):
+        values = self.device.stream_read()[tag]
+        return sum(values) / len(values) * psi_per_v
+
     def test_lc_voltages_increase_during_fire(self):
-        self.device.write_actuator("lox_main",  1)
-        self.device.write_actuator("fuel_main", 1)
-        # Allow the ramp to run past _LC_RAMP_S
-        for _ in range(8):
-            batch = self.device.stream_read()
+        for name in ("lox_press", "fuel_press", "lox_main", "fuel_main"):
+            self.device.write_actuator(name, 1)
+        self._run_plant(10)
+        batch = self.device.stream_read()
         avg = sum(batch["lc0"]) / len(batch["lc0"])
         assert avg > 0.5, f"lc0 didn't ramp up during fire: avg={avg}"
+
+    def test_press_fills_and_vent_empties_the_tank(self):
+        assert abs(self._psi("pt0")) < 5
+        self.device.write_actuator("lox_press", 1)
+        self._run_plant(10)
+        assert self._psi("pt0") == pytest.approx(250, abs=10)
+        assert abs(self._psi("pt1")) < 5                     # fuel side untouched
+        self.device.write_actuator("lox_press", 0)
+        self.device.write_actuator("tank_depress", 1)
+        self._run_plant(10)
+        assert abs(self._psi("pt0")) < 5
+
+    def test_purge_alone_gives_no_thrust(self):
+        self.device.write_actuator("lox_purge", 1)
+        self._run_plant(5)
+        assert self._psi("pt2") == pytest.approx(15, abs=5)
+        assert abs(self._psi("lc0", psi_per_v=440.92)) < 5
+
+    def test_chamber_needs_both_mains(self):
+        for name in ("lox_press", "fuel_press", "lox_main"):
+            self.device.write_actuator(name, 1)
+        self._run_plant(10)
+        assert abs(self._psi("pt2")) < 5
+        self.device.write_actuator("fuel_main", 1)
+        self._run_plant(5)
+        assert self._psi("pt2") == pytest.approx(0.6 * 225, abs=10)   # tanks sag 10% while flowing
+        self.device.write_actuator("lox_main", 0)
+        self._run_plant(5)
+        assert abs(self._psi("pt2")) < 5
 
     def test_scan_time_keeps_counting_after_a_restart(self):
         first = self.device.stream_read()["scan_times"][-1]
@@ -257,7 +293,7 @@ class TestDifferentialPtSimulation:
 
         for tag in ("dpt0", "dpt1"):
             psi = [v * _DPT_PSI_PER_V for v in batch[tag]]
-            assert all(0.0 < p < _DPT_FULL_SCALE_PSI for p in psi), (
+            assert all(-0.1 < p < _DPT_FULL_SCALE_PSI for p in psi), (
                 f"{tag} simulated outside a plausible orifice dP band: "
                 f"min={min(psi):.1f} max={max(psi):.1f} psi"
             )
@@ -268,7 +304,12 @@ class TestDifferentialPtSimulation:
         device.open()
         device.start_stream()
         try:
+            device.write_actuator("lox_press", 1)
+            device.write_actuator("lox_main", 1)
+            for _ in range(1000):
+                device._step_plant(0.01)
             batch = device.stream_read()
+            assert min(batch["dpt0"]) * _DPT_PSI_PER_V > 0.3   # flowing
         finally:
             device.stop_stream()
             device.close()

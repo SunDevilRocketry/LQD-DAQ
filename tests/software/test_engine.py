@@ -68,9 +68,11 @@ class TestEngine:
             assert channels[tag].value is not None, f"{tag} is None"
 
     def test_snapshot_pressures_in_engineering_range(self):
+        # Mock tanks idle at 0 psig and hold with every valve closed.
+        self.engine._device._psi.update(lox=200.0, fuel=200.0)
+        time.sleep(0.3)
         channels = self.engine.snapshot.channels
-        # Mock pt0 is ~200 psi at the default 400 psi/V.
-        for tag in ("pt0", "pt1", "pt2"):
+        for tag in ("pt0", "pt1"):
             v = channels[tag].value
             assert psi_to_pa(50) < v < psi_to_pa(500), f"{tag}={v}"
 
@@ -173,6 +175,8 @@ class TestEngine:
 
     def test_update_calibration_changes_snapshot(self):
         """Doubling pt0's slope should roughly double its reading."""
+        self.engine._device._psi["lox"] = 200.0   # held: no valve is open
+        time.sleep(0.3)
         before = self.engine.snapshot.channels["pt0"].value
         assert before is not None
 

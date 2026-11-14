@@ -31,20 +31,31 @@ from daq.manifest import (
 
 
 # -- Sensor Simulation Parameters -----------------------------
-# V = base + amplitude * sin(2pi * t / period) + noise
 
-# ~200 psi at 400 psi/V; each PT offset so the traces don't overlap.
+# Plant: each pressure moves toward a valve-set target, first order with tau.
+_PT_PSI_PER_V      = 400.0
+_DPT_PSI_PER_V     = 5.80151
+_TANK_PRESS_PSI    = 250.0
+_TANK_FLOW_SAG     = 0.9      # press open with the main flowing
+_TANK_PRESS_TAU_S  = 2.0
+_TANK_VENT_TAU_S   = 1.5
+_TANK_BLOWDOWN_TAU_S = 6.0    # main open, press closed
+_CHAMBER_RATIO     = 0.6      # Pc / lower tank pressure, both mains open
+_CHAMBER_PURGE_PSI = 15.0
+_CHAMBER_TAU_S     = 0.3
+_ORIFICE_DP_PSI    = 0.5      # at _TANK_PRESS_PSI, main open
+# pt index -> role; dpt index -> side. Matches the dashboard's PT roles.
+_TANK_SIDES = (
+    ("lox",  "lox_press",  "tank_depress", "lox_main"),
+    ("fuel", "fuel_press", "fuel_vent",    "fuel_main"),
+)
+
+# Spare PTs (pt3 on): base + sine drift + noise, offset so traces don't overlap.
 _PT_BASE_V     = 0.50
 _PT_OFFSET_V   = 0.04
 _PT_AMP_V      = 0.020
 _PT_PERIOD_S   = 12.0
 _PT_NOISE_V    = 0.002
-
-# ~0.6 psi at 5.80151 psi/V (0-0.4 MPa over 0-10 V).
-_DPT_BASE_V    = 0.10
-_DPT_OFFSET_V  = 0.02     # separates dpt0 from dpt1
-_DPT_AMP_V     = 0.015
-_DPT_PERIOD_S  = 9.0
 _DPT_NOISE_V   = 0.001
 
 # ~-177 C (Type T) against the mock's 25 C cold junction.
@@ -53,13 +64,11 @@ _TC_AMP_V      = 0.000050
 _TC_PERIOD_S   = 25.0
 _TC_NOISE_V    = 0.000005
 
-# Fire ramp to ~500 lbf at 440.92 lbf/V.
+# ~500 lbf per cell at full Pc, 440.92 lbf/V.
 _LC_NOISE_V       = 0.003
 _LC_FIRE_V        = 1.134
-_LC_RAMP_S        = 0.5
 _LC_OSC_V         = 0.1
 _LC_OSC_PERIOD_S  = 0.8
-_LC_FIRE_NOISE_V  = 0.005
 
 # Igniter sense node, calculated from the igniter schematic: no e-match
 # fitted (until testing), armed (~battery), firing.
@@ -127,8 +136,8 @@ class MockLabJack:
         self._streaming      = False
         self._stream_start: float = 0.0
         self._next_batch_time: float = 0.0
-        # Perf-counter instant both mains last became open, or None at rest.
-        self._fire_start: float | None = None
+        # Plant pressures, psig: tanks start loaded but unpressurised.
+        self._psi = {"lox": 0.0, "fuel": 0.0, "chamber": 0.0}
 
         # Fixed seed: reproducible noise.
         self._rng_state: int = 0xDEADBEEF
@@ -193,14 +202,13 @@ class MockLabJack:
         batch["backlog_device"] = [0]   # type: ignore[assignment]
         batch["backlog_ljm"]    = [0]   # type: ignore[assignment]
 
-        fire_elapsed = self._fire_elapsed()
-
         for i in range(self._scans_per_read):
             t = t_elapsed - (self._scans_per_read - 1 - i) / self._stream_hz
             batch["scan_times"].append(t)
+            self._step_plant(1.0 / self._stream_hz)
 
             for spec in self._stream_channels:
-                batch[spec.id].append(self._sample(spec, t, fire_elapsed))
+                batch[spec.id].append(self._sample(spec, t))
 
         return batch
 
@@ -251,7 +259,6 @@ class MockLabJack:
                 self._move_deadline[name] = (
                     time.perf_counter() + self._move_duration(spec, state)
                 )
-        self._refresh_fire_state()
         print(f"[MOCK] {name} -> {'OPEN' if state else 'CLOSED'}")
 
     def read_actuator(self, name: str) -> int:
@@ -271,7 +278,6 @@ class MockLabJack:
                 if spec.type == BINARY_DIO:
                     self._actuators[name] = 0
             self._move_deadline.clear()
-        self._refresh_fire_state()
 
     def actuator_states(self) -> dict[str, ActuatorReading]:
         """Returns a copy of all current mock actuator states."""
@@ -319,10 +325,36 @@ class MockLabJack:
     # Private Simulation Helpers
     # --------------------------------------------------------
 
-    def _sample(self, spec: ChannelSpec, t: float, fire_elapsed: float | None) -> float:
+    def _step_plant(self, dt: float) -> None:
+        """Move the tank and chamber pressures toward their valve-set targets."""
+        def approach(key: str, target: float, tau: float) -> None:
+            self._psi[key] += (target - self._psi[key]) * min(1.0, dt / tau)
+
+        on = lambda name: self._actuators.get(name) == 1
+        for side, press, vent, main in _TANK_SIDES:
+            if on(vent):
+                approach(side, 0.0, _TANK_VENT_TAU_S)
+            elif on(press):
+                sag = _TANK_FLOW_SAG if on(main) else 1.0
+                approach(side, _TANK_PRESS_PSI * sag, _TANK_PRESS_TAU_S)
+            elif on(main):
+                approach(side, 0.0, _TANK_BLOWDOWN_TAU_S)
+
+        if on("lox_main") and on("fuel_main"):
+            target = _CHAMBER_RATIO * min(self._psi["lox"], self._psi["fuel"])
+        elif on("lox_purge") or on("fuel_purge"):
+            target = _CHAMBER_PURGE_PSI
+        else:
+            target = 0.0
+        approach("chamber", target, _CHAMBER_TAU_S)
+
+    def _sample(self, spec: ChannelSpec, t: float) -> float:
         """Generate one raw voltage sample for a channel, by its manifest type."""
         if spec.type == PT_DIRECT:
             i = self._pt_index.get(spec.id, 0)
+            role = ("lox", "fuel", "chamber")[i] if i < 3 else None
+            if role:
+                return self._psi[role] / _PT_PSI_PER_V + self._noise() * _PT_NOISE_V
             return self._sine_sample(
                 t,
                 _PT_BASE_V + _PT_OFFSET_V * i,
@@ -331,20 +363,16 @@ class MockLabJack:
                 _PT_NOISE_V,
             )
         if spec.type == PT_DIFFERENTIAL:
-            i = self._dpt_index.get(spec.id, 0)
-            return self._sine_sample(
-                t,
-                _DPT_BASE_V + _DPT_OFFSET_V * i,
-                _DPT_AMP_V,
-                _DPT_PERIOD_S + i,
-                _DPT_NOISE_V,
-            )
+            side, _, _, main = _TANK_SIDES[min(self._dpt_index.get(spec.id, 0), 1)]
+            dp_psi = (_ORIFICE_DP_PSI * self._psi[side] / _TANK_PRESS_PSI
+                      if self._actuators.get(main) == 1 else 0.0)
+            return dp_psi / _DPT_PSI_PER_V + self._noise() * _DPT_NOISE_V
         if spec.type == TC_DIFFERENTIAL:
             return self._sine_sample(
                 t, _TC_BASE_V, _TC_AMP_V, _TC_PERIOD_S, _TC_NOISE_V
             )
         if spec.type == LC_DIRECT:
-            return self._lc_sample(fire_elapsed)
+            return self._lc_sample(t)
         if spec.type == VOLTAGE:
             return self._igniter_sense_sample()
         return 0.0
@@ -369,38 +397,18 @@ class MockLabJack:
         noise = self._noise() * noise_scale
         return base + drift + noise
 
-    def _lc_sample(self, fire_elapsed: float | None) -> float:
-        """Noise at rest; while firing, ramp over _LC_RAMP_S then oscillate."""
-        if fire_elapsed is None:
-            return self._noise() * _LC_NOISE_V
-
-        ramp        = min(1.0, fire_elapsed / _LC_RAMP_S)
-        thrust_v    = _LC_FIRE_V * ramp
-        oscillation = _LC_OSC_V * math.sin(2 * math.pi * fire_elapsed / _LC_OSC_PERIOD_S)
-        noise       = self._noise() * _LC_FIRE_NOISE_V
-        return thrust_v + oscillation + noise
+    def _lc_sample(self, t: float) -> float:
+        """Thrust follows chamber pressure, with combustion roughness while burning."""
+        # Purge gas alone gives no thrust.
+        full = _CHAMBER_RATIO * _TANK_PRESS_PSI - _CHAMBER_PURGE_PSI
+        level = max(0.0, self._psi["chamber"] - _CHAMBER_PURGE_PSI) / full
+        oscillation = _LC_OSC_V * level * math.sin(2 * math.pi * t / _LC_OSC_PERIOD_S)
+        return _LC_FIRE_V * level + oscillation + self._noise() * _LC_NOISE_V
 
     def _move_duration(self, spec: ActuatorSpec, state: int) -> float:
         """Move time: steps / pulse rate."""
         steps = spec.steps_open if state == 1 else spec.steps_close
         return steps / spec.pulse_freq_hz
-
-    def _refresh_fire_state(self) -> None:
-        """Mark the fire start (every stepper main commanded open) for the LC ramp."""
-        with self._lock:
-            firing = bool(self._steppers) and all(
-                self._actuators.get(spec.id, 0) == 1 for spec in self._steppers
-            )
-            if firing and self._fire_start is None:
-                self._fire_start = time.perf_counter()
-            elif not firing:
-                self._fire_start = None
-
-    def _fire_elapsed(self) -> float | None:
-        """Seconds since firing began, or None if not firing."""
-        with self._lock:
-            start = self._fire_start
-        return None if start is None else time.perf_counter() - start
 
     def _noise(self) -> float:
         """Roughly Gaussian noise in [-1, 1]: mean of 4 xorshift32 uniforms."""
